@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "command": "python",
+      "args": [
+        "C:\\path\\to\\mcp-server.py",
+        "--host", "192.168.1.1",
+        "--user", "admin",
+        "--password", "YOUR_PASSWORD",
+        "--port", "22"
+      ]
+    },
+    
+    "linux-server": {
+      "command": "python",
+      "args": [
+        "/path/to/mcp-server.py",
+        "--host", "my-server.example.com",
+        "--user", "myuser",
+        "--password", "SERVER_PASSWORD",
+        "--port", "2222"
+      ]
+    }
+  }
+}
