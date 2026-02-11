@@ -32,6 +32,8 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 
 ## Installation
 
+### Option 1: Manual (Python)
+
 1. Clone the repository:
    ```bash
    git clone https://github.com/d00mus/SSH-MCP.git
@@ -43,9 +45,43 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
    pip install -r requirements.txt
    ```
 
+### Option 2: Docker (Recommended)
+
+If you have Docker installed, you don't need to worry about Python or dependencies.
+
+1. Build the image:
+   ```bash
+   docker build -t mcp-ssh-server .
+   ```
+
+2. Use it in your configuration (see below).
+
 ## Configuration
 
-### Cursor IDE
+### Cursor IDE (Docker)
+
+If you built the Docker image, use this configuration:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "mcp-ssh-server",
+        "--host", "192.168.1.1",
+        "--user", "admin",
+        "--password", "YOUR_PASSWORD"
+      ]
+    }
+  }
+}
+```
+
+### Cursor IDE (Python)
 
 Add the following to your `.cursor/mcp.json`:
 

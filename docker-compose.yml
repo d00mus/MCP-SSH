@@ -1,0 +1,15 @@
+services:
+  mcp-ssh:
+    build: .
+    image: mcp-ssh-server
+    stdin_open: true
+    tty: true
+    command:
+      - "--host"
+      - "${SSH_HOST}"
+      - "--user"
+      - "${SSH_USER}"
+      - "--password"
+      - "${SSH_PASSWORD}"
+      - "--port"
+      - "${SSH_PORT:-22}"

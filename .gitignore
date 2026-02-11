@@ -16,3 +16,4 @@ config.json
 *.mcp_b64
 agent-tools/
 agent-transcripts/
+.idea/
