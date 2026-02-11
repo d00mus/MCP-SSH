@@ -91,6 +91,21 @@ def clamp_int(value: Any, default: int, min_value: int, max_value: int) -> int:
     return numeric
 
 
+def to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).lower().strip()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
 def iso_now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
@@ -648,26 +663,41 @@ class SSHSession:
             return False
 
         try:
+            # Clear buffer
             while self.channel.recv_ready():
                 self.channel.recv(BUFFER_SIZE)
 
+            # Try common commands to enter shell
+            for cmd in ["sh", "system", "shell"]:
+                self.channel.send(f"{cmd}\n")
+                time.sleep(0.3)
+                output = ""
+                start = time.time()
+                while time.time() - start < 2.0:
+                    if self.channel.recv_ready():
+                        chunk = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+                        output += chunk
+                        if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()):
+                            self.in_shell = True
+                            path = EXTRA_PATH if EXTRA_PATH else DEFAULT_PATH
+                            self.channel.send(f"export PATH={path}:$PATH 2>/dev/null\n")
+                            time.sleep(0.2)
+                            while self.channel.recv_ready():
+                                self.channel.recv(BUFFER_SIZE)
+                            self._log_session("SYS", {"event": "enter_shell_ok", "method": cmd})
+                            return True
+                    time.sleep(0.05)
+            
+            # Last resort: exec sh
             self.channel.send("exec sh\n")
+            time.sleep(0.5)
             output = ""
-            start = time.time()
-            while time.time() - start < 5.0:
-                if self.channel.recv_ready():
-                    chunk = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
-                    output += chunk
-                    if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()):
-                        self.in_shell = True
-                        path = EXTRA_PATH if EXTRA_PATH else DEFAULT_PATH
-                        self.channel.send(f"export PATH={path}:$PATH 2>/dev/null\n")
-                        time.sleep(0.2)
-                        while self.channel.recv_ready():
-                            self.channel.recv(BUFFER_SIZE)
-                        self._log_session("SYS", {"event": "enter_shell_ok"})
-                        return True
-                time.sleep(0.05)
+            if self.channel.recv_ready():
+                output = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+            if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()):
+                self.in_shell = True
+                self._log_session("SYS", {"event": "enter_shell_ok", "method": "exec sh"})
+                return True
 
             self._log_session("SYS", {"event": "enter_shell_failed", "output_tail": output[-200:]})
             return False
@@ -1705,7 +1735,7 @@ def session_from_args(session_id: Optional[int]) -> Optional[SSHSession]:
 def run_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     command = args.get("command", "")
     mode = args.get("mode", "sync")
-    shell = bool(args.get("shell", False))
+    shell = to_bool(args.get("shell", False))
     wait_timeout = args.get("wait_timeout", DEFAULT_WAIT_TIMEOUT)
     startup_wait = args.get("startup_wait", DEFAULT_STARTUP_WAIT)
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
@@ -1713,7 +1743,7 @@ def run_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     quiet_complete_timeout = args.get("quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
 
     session_id = args.get("session_id")
-    new_session = bool(args.get("new_session", False))
+    new_session = to_bool(args.get("new_session", False))
     session_name = args.get("session_name", "") or ""
 
     if new_session and session_id is not None:
@@ -1890,7 +1920,7 @@ def signal_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": "session not found"}
     action = args.get("action", "ctrl_c")
     text = args.get("text", "")
-    press_enter = bool(args.get("press_enter", True))
+    press_enter = to_bool(args.get("press_enter", True), True)
     return session.send_signal(action=action, text=text, press_enter=press_enter)
 
 
@@ -1900,13 +1930,13 @@ def run_pipeline_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     wait_timeout = args.get("wait_timeout", DEFAULT_WAIT_TIMEOUT)
     startup_wait = args.get("startup_wait", DEFAULT_STARTUP_WAIT)
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
-    include_stderr = bool(args.get("include_stderr", False))
-    append_stdout = bool(args.get("append_stdout", False))
+    include_stderr = to_bool(args.get("include_stderr", False))
+    append_stdout = to_bool(args.get("append_stdout", False))
     local_stdout_path = (args.get("local_stdout_path", "") or "").strip()
     local_stdin_path = (args.get("local_stdin_path", "") or "").strip()
 
     session_id = args.get("session_id")
-    new_session = bool(args.get("new_session", False))
+    new_session = to_bool(args.get("new_session", False))
     session_name = args.get("session_name", "") or ""
 
     if new_session and session_id is not None:
@@ -2104,8 +2134,8 @@ def file_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
 
     path = args.get("path", "")
     content = args.get("content", "")
-    as_base64 = bool(args.get("as_base64", False))
-    is_base64 = bool(args.get("is_base64", False))
+    as_base64 = to_bool(args.get("as_base64", False))
+    is_base64 = to_bool(args.get("is_base64", False))
     session_id = args.get("session_id")
 
     session = session_from_args(session_id)
@@ -2319,20 +2349,17 @@ def tools_list() -> Dict[str, Any]:
             "name": "run",
             "description": (
                 "Unified command execution. "
+                "CRITICAL: Set shell=true for Linux/Bash commands (ls, cat, grep, etc) or to use &&/|| operators. "
+                "Required to access full Linux shell on devices like Keenetic routers. "
                 "Default behavior: run in CURRENT session if session_id is not provided. "
-                "Supports sync/async/stream mode, anti-hang wait_timeout, optional hard_timeout, "
-                "and can create a new session in the same call (new_session=true). "
-                "If wait timeout triggers, returns partial output and still_running=true, while command continues. "
-                "If selected/current session is dead/missing, server auto-creates recovery session and returns recovery flags. "
-                "If current session is busy with active async work, server tries first idle alive session; "
-                "if none exist, it auto-creates a new one. "
-                "If explicit session_id is busy, returns busy error (no reroute). "
-                "Status values: running, completed, completed_nonzero, hard_timeout, failed, dead, recv_paused_by_memory_limit."
+                "Supports sync/async/stream mode, anti-hang wait_timeout, optional hard_timeout. "
+                "If wait timeout triggers, returns partial output and still_running=true. "
+                "Status: running, completed, completed_nonzero, hard_timeout, failed, dead."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Command to execute."},
+                    "command": {"type": "string", "description": "Command to execute. Use shell=true for Linux commands."},
                     "mode": {
                         "type": "string",
                         "description": "sync (default), async, or stream.",
@@ -2340,7 +2367,7 @@ def tools_list() -> Dict[str, Any]:
                     },
                     "shell": {
                         "type": "boolean",
-                        "description": "Use system shell context (Linux commands). Default false.",
+                        "description": "Set true for Linux/Bash commands (ls, grep, etc) or if using &&/||. Required for Keenetic shell access.",
                     },
                     "wait_timeout": {
                         "type": "number",
@@ -2380,15 +2407,8 @@ def tools_list() -> Dict[str, Any]:
             "name": "run_pipeline",
             "description": (
                 "Binary-safe cross-machine pipeline. "
-                "Default behavior: run in CURRENT session if session_id is not provided. "
-                "Runs remote command and redirects remote stdout to local file and/or local file to remote stdin. "
-                "Supports sync/async with anti-hang timeout. "
-                "Returns whether writing is complete (written_complete) or still running. "
-                "If selected/current session is dead/missing, auto-creates recovery session and reports it. "
-                "If current session is busy with active async work, server tries first idle alive session; "
-                "if none exist, it auto-creates a new one. "
-                "If explicit session_id is busy, returns busy error (no reroute). "
-                "Status values: running, completed, completed_nonzero, hard_timeout, failed, dead, recv_paused_by_memory_limit."
+                "Best for large files or binary data transfer. "
+                "Always uses system shell for execution."
             ),
             "inputSchema": {
                 "type": "object",
@@ -2441,8 +2461,14 @@ def tools_list() -> Dict[str, Any]:
                     "pipeline_id": {"type": "number", "description": "Optional specific pipeline id."},
                     "offset": {"type": "number", "description": "Preview offset for pagination."},
                     "max_chars": {"type": "number", "description": "Max preview chars to return."},
-                    "contains": {"type": "string", "description": "Optional substring filter."},
-                    "regex": {"type": "string", "description": "Optional regex filter."},
+                    "contains": {
+                        "type": "string",
+                        "description": "Optional substring filter. Use ONLY if remote 'grep' is unavailable; otherwise, prefer filtering on device (e.g. 'cat | grep') for efficiency.",
+                    },
+                    "regex": {
+                        "type": "string",
+                        "description": "Optional regex filter. Use ONLY if remote 'grep' is unavailable.",
+                    },
                     "tail_lines": {"type": "number", "description": "Optional keep only last N lines after filtering."},
                     "level": {"type": "string", "description": "Reserved/no-op now."},
                     "kind": {"type": "string", "description": "Reserved/no-op now."},
@@ -2467,8 +2493,14 @@ def tools_list() -> Dict[str, Any]:
                     },
                     "max_lines": {"type": "number", "description": "Max lines per read page."},
                     "max_chars": {"type": "number", "description": "Max chars per read page."},
-                    "contains": {"type": "string", "description": "Optional substring filter."},
-                    "regex": {"type": "string", "description": "Optional regex filter."},
+                    "contains": {
+                        "type": "string",
+                        "description": "Optional substring filter. Use ONLY if remote 'grep' is unavailable; otherwise, prefer filtering on device (e.g. 'cat | grep') for efficiency.",
+                    },
+                    "regex": {
+                        "type": "string",
+                        "description": "Optional regex filter. Use ONLY if remote 'grep' is unavailable.",
+                    },
                     "tail_lines": {"type": "number", "description": "Optional keep only last N lines after filtering."},
                     "level": {"type": "string", "description": "Reserved/no-op now."},
                     "kind": {"type": "string", "description": "Reserved/no-op now."},
@@ -2491,9 +2523,9 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "file",
             "description": (
-                "Unified file operation tool. "
-                "action=read|write|list|upload|download. "
-                "Tries SFTP first and falls back to shell when needed."
+                "Unified file operation tool (read, write, list, upload, download). "
+                "Works in any environment, including restricted shells. "
+                "Tries SFTP first, falls back to shell commands if needed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -2543,9 +2575,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             if tool_name == "session_list":
                 result = manager.list_sessions(
-                    include_name=bool(args.get("include_name", False)),
-                    include_last_command=bool(args.get("include_last_command", False)),
-                    include_active_ids=bool(args.get("include_active_ids", False)),
+                    include_name=to_bool(args.get("include_name", False)),
+                    include_last_command=to_bool(args.get("include_last_command", False)),
+                    include_active_ids=to_bool(args.get("include_active_ids", False)),
                 )
 
             elif tool_name == "session_close":
@@ -2565,10 +2597,10 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                         result = manager.update_session(
                             session_id=sid,
                             name=args.get("name") if has_name else None,
-                            make_current=bool(args.get("make_current")) if has_current else None,
+                            make_current=to_bool(args.get("make_current")) if has_current else None,
                         )
 
-            elif tool_name == "run":
+            elif tool_name == "run" or tool_name == "exec":
                 result = run_dispatch(args)
 
             elif tool_name == "run_pipeline":
