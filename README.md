@@ -1,77 +1,62 @@
 # SSH MCP Server
 
-A powerful and robust Model Context Protocol (MCP) server for managing remote devices and servers via SSH.
+A powerful and robust Model Context Protocol (MCP) server for managing remote devices and servers via SSH. 
 
-Designed for AI agents (like Cursor, Claude, etc.), this server provides a compact yet flexible set of tools to execute commands, manage persistent sessions, and transfer files reliably.
+Designed for AI agents (like Cursor, Claude, etc.), this server provides a compact yet flexible set of tools to execute commands, manage persistent sessions, and transfer files reliably. It is particularly well-suited for devices with restricted shells, like **Keenetic** routers.
 
-## Key Features
+## 🚀 Key Features
 
-- **Persistent Multi-session Management**: Similar to `tmux` or `screen`, keep multiple SSH sessions open and switch between them.
-- **Anti-Hang Architecture**: Integrated `wait_timeout` for all operations prevents the AI agent from freezing on long-running commands.
-- **Unified Execution Model**: A single `run` tool for synchronous, asynchronous, and streaming command execution.
-- **Binary-Safe Pipelines**: Redirect remote command output to local files or feed local files into remote processes (binary-safe, bypassing terminal encoding issues).
-- **Background Buffering**: The server continuously reads and caches output from all active sessions even when the agent is not polling.
-- **Auto-Recovery**: Automatically creates new sessions or recovers dead ones during command execution.
-- **Server-Side Filtering**: Filter large outputs (grep-like) on the server to save tokens and improve response speed.
-- **Memory Guard**: Global limit on buffered output to prevent resource exhaustion.
-- **Keenetic Aware**: Specialized logic for devices with restricted shells (like Keenetic routers), including automatic shell entry and prompt detection.
+- **Persistent Multi-session Management**: Keep multiple SSH sessions open and switch between them (like `tmux` for your AI).
+- **Anti-Hang Architecture**: Integrated `wait_timeout` prevents the AI agent from freezing on long-running commands.
+- **Unified Execution Model**: A single `run` tool handles synchronous, asynchronous, and streaming execution.
+- **Docker Ready**: Run without Python installation using a simple Docker container.
+- **Binary-Safe Pipelines**: Reliable file transfers bypassing terminal encoding issues.
+- **Background Buffering**: Continuous output caching even when the agent isn't polling.
+- **Keenetic Aware**: Specialized logic for entering Linux shell from restricted CLI and prompt detection.
 
-## Tools
+## 🛠 Tools
 
 | Tool | Description |
 |------|-------------|
-| `run` | Execute commands (sync/async/stream) with timeout and recovery logic. |
-| `read` | Read buffered output from a command with pagination and filtering. |
-| `signal` | Send `Ctrl+C` or arbitrary `stdin` to a running process. |
-| `file` | Unified file operations (read, write, list, upload, download) with fallback mechanisms. |
-| `run_pipeline` | Cross-machine binary-safe data transfer (remote stdout -> local file, local file -> remote stdin). |
-| `pipeline_status` | Monitor active pipeline progress and status. |
-| `session_list` | List all active sessions and their current status (`idle`, `busy`, `broken`). |
-| `session_update` | Rename a session or set it as current. |
-| `session_close` | Cleanly terminate and remove a session. |
+| `run` | Execute commands (sync/async/stream) with timeout and auto-recovery. |
+| `read` | Read buffered output with pagination and server-side filtering. |
+| `signal` | Send `Ctrl+C` or `stdin` to a running process. |
+| `file` | Unified file operations (read, write, list, upload, download) with shell fallback. |
+| `run_pipeline` | Binary-safe data transfer between local and remote. |
+| `session_list` | List active sessions and their status (`idle`, `busy`, `broken`). |
+| `session_update`| Rename session or set as current. |
+| `session_close` | Terminate and remove a session. |
 
-## Installation
+## 📦 Installation
 
-### Option 1: Manual (Python)
+### Option 1: Docker (Recommended)
+No Python needed. Just build the image once:
+```bash
+docker build -t mcp-ssh-server .
+```
 
-1. Clone the repository:
+### Option 2: Python (Manual)
+1. Clone the repo and install dependencies:
    ```bash
    git clone https://github.com/d00mus/SSH-MCP.git
    cd SSH-MCP
-   ```
-
-2. Install Python dependencies:
-   ```bash
    pip install -r requirements.txt
    ```
 
-### Option 2: Docker (Recommended)
+## ⚙️ Configuration
 
-If you have Docker installed, you don't need to worry about Python or dependencies.
+### Cursor IDE
 
-1. Build the image:
-   ```bash
-   docker build -t mcp-ssh-server .
-   ```
+Add this to your `.cursor/mcp.json`:
 
-2. Use it in your configuration (see below).
-
-## Configuration
-
-### Cursor IDE (Docker)
-
-If you built the Docker image, use this configuration:
-
+#### Using Docker (Best for Windows/Mac)
 ```json
 {
   "mcpServers": {
     "ssh-mcp": {
       "command": "docker",
       "args": [
-        "run",
-        "-i",
-        "--rm",
-        "mcp-ssh-server",
+        "run", "-i", "--rm", "mcp-ssh-server",
         "--host", "192.168.1.1",
         "--user", "admin",
         "--password", "YOUR_PASSWORD"
@@ -81,17 +66,14 @@ If you built the Docker image, use this configuration:
 }
 ```
 
-### Cursor IDE (Python)
-
-Add the following to your `.cursor/mcp.json`:
-
+#### Using Python
 ```json
 {
   "mcpServers": {
     "ssh-mcp": {
       "command": "python",
       "args": [
-        "/path/to/SSH-MCP/mcp-server.py",
+        "/absolute/path/to/mcp-server.py",
         "--host", "192.168.1.1",
         "--user", "admin",
         "--password", "YOUR_PASSWORD"
@@ -103,15 +85,19 @@ Add the following to your `.cursor/mcp.json`:
 
 ### Continue.dev
 
-Continue.dev uses a `config.yaml` based configuration. You can add the server to your global `config.yaml`:
+Add to your `config.yaml`:
 
+#### Using Docker
 ```yaml
 mcpServers:
   - name: ssh-mcp
     type: stdio
-    command: python
+    command: docker
     args:
-      - "/path/to/SSH-MCP/mcp-server.py"
+      - run
+      - -i
+      - --rm
+      - mcp-ssh-server
       - "--host"
       - "192.168.1.1"
       - "--user"
@@ -120,40 +106,39 @@ mcpServers:
       - "YOUR_PASSWORD"
 ```
 
-Alternatively, you can place a standard `mcp.json` file in your `.continue/mcpServers/` project directory, and Continue will automatically pick it up.
+#### Using Python
+```yaml
+mcpServers:
+  - name: ssh-mcp
+    type: stdio
+    command: python
+    args:
+      - "/absolute/path/to/mcp-server.py"
+      - "--host"
+      - "192.168.1.1"
+      - "--user"
+      - "admin"
+      - "--password"
+      - "YOUR_PASSWORD"
+```
 
-## CLI Arguments
+## ⌨️ CLI Arguments
 
 - `--host` (required): SSH host address.
 - `--user` (required): SSH username.
 - `--password` (required): SSH password.
 - `--port` (optional): SSH port (default: 22).
-- `--path` (optional): Additional `PATH` to export in the shell (useful for Entware/custom environments).
+- `--path` (optional): Additional `PATH` (e.g., `/opt/bin:/opt/sbin` for Entware).
 
-## Security Note
+## ⚠️ Security Note
 
-⚠️ **WARNING**: Passwords are passed as command-line arguments and may be visible in process lists. Ensure your environment is secure. Configuration files like `mcp.json` should never be committed to public repositories if they contain secrets.
+Passwords are passed as command-line arguments. In Docker mode, they are isolated within the container call, but still visible in your `mcp.json` or `config.yaml`. **Never commit your configuration files with secrets to public repositories!**
 
-## Advanced Usage
+## 💡 Pro Tips
 
-### Sync Execution with Auto-Recovery
-Simply calling `run(command="ls -la")` will use the current session, or automatically create one if none exists.
+- **Complex commands**: If you need pipes (`|`) or logic (`&&`, `||`), always tell the agent to use `shell: true`.
+- **Filtering**: Use `cat file | grep pattern` instead of the `read` tool filters for better performance.
+- **Large files**: Use `run_pipeline` for transferring files; it's much faster and safer than `cat`.
 
-### Long-running Commands
-1. Start with `run(command="tail -f /var/log/syslog", mode="stream")`.
-2. Read output periodically with `read()`.
-3. Stop with `signal(action="ctrl_c")`.
-
-### Large File Transfer
-Use `run_pipeline` for reliable binary transfers:
-```text
-run_pipeline(
-  command="cat /remote/large_file.iso", 
-  local_stdout_path="/local/path/file.iso", 
-  mode="async"
-)
-```
-
-## License
-
+## 📄 License
 MIT
