@@ -2823,19 +2823,24 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "run",
             "description": (
-                "Unified command execution. "
-                "CRITICAL: Set shell=true for Linux/Bash commands (ls, cat, grep, etc) or to use &&/|| operators. "
-                "Required to access full Linux shell on devices like Keenetic routers. "
-                "Returns compact happy-path payload by default. "
+                "Unified command execution with anti-hang timeout. "
+                "Returns compact happy-path payload; use last_command_details for full metadata if needed."
                 "Default behavior: run in CURRENT session if session_id is not provided. "
                 "Supports sync/async/stream mode, anti-hang wait_timeout, optional hard_timeout. "
                 "If wait timeout triggers, returns partial output and still_running=true. "
-                "Status: running, completed, completed_nonzero, hard_timeout, failed, dead."
+                "Status: running, completed, completed_nonzero, hard_timeout, failed, dead. "
+                "For restricted devices (like Keenetic routers): set shell=true (BOOLEAN FLAG) to auto-enter full Linux shell for 'ls', 'cat', pipes etc. "
+                "Set shell=false for native router CLI (NDM). "
+                "On standard Linux servers: shell=true enables shell features (pipes, redirections, &&). "
+                "DO NOT type the word 'shell' inside the command string."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Command to execute. Use shell=true for Linux commands."},
+                    "command": {
+                        "type": "string",
+                        "description": "The command string to execute (e.g., 'ls -la' or 'show version'). DO NOT include the word 'shell' here.",
+                    },
                     "mode": {
                         "type": "string",
                         "description": "sync (default), async, or stream.",
@@ -2843,7 +2848,7 @@ def tools_list() -> Dict[str, Any]:
                     },
                     "shell": {
                         "type": "boolean",
-                        "description": "Set true for Linux/Bash commands (ls, grep, etc) or if using &&/||. Required for Keenetic shell access.",
+                        "description": "Boolean flag. Set to TRUE for Linux shell features or to access system shell on restricted routers. Set to FALSE for native CLI.",
                     },
                     "wait_timeout": {
                         "type": "number",
@@ -3001,8 +3006,8 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "last_command_details",
             "description": (
-                "Return full verbose payload of the last tool call result (per session if possible). "
-                "Use only for debugging or ambiguous outcomes; do NOT call routinely in happy path."
+                "Returns full verbose metadata of the last tool call (including timeouts, selection reasons, full error objects, memory counters). "
+                "Call this ONLY if the default compact response is unclear or for deep debugging."
             ),
             "inputSchema": {
                 "type": "object",
@@ -3014,12 +3019,11 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "file",
             "description": (
-                "Unified file operation tool (list, read/download, write/upload, edit). "
-                "Works in any environment, including restricted shells. "
-                "Tries SFTP first, falls back to shell commands if needed. "
-                "read/download: with local_path -> save remote file locally (metadata only); without local_path -> inspect text content with optional line window and filters. "
-                "write/upload: use local_path for full files or inline content for small files. "
-                "edit: in-place text replace operations for existing remote text files."
+                "File management (list, read/download, write/upload, edit) with SFTP and shell fallbacks. "
+                "Automatically handles NDM/Linux shell transitions. Use full remote paths. "
+                "read/download: if local_path is set -> save file locally; otherwise -> return text snippet (inspect mode). "
+                "write/upload: from local_path or small inline content. "
+                "edit: safe in-place text replacement with backup and dry_run options."
             ),
             "inputSchema": {
                 "type": "object",
