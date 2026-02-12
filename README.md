@@ -9,6 +9,8 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 - **Persistent Multi-session Management**: Keep multiple SSH sessions open and switch between them (like `tmux` for your AI).
 - **Anti-Hang Architecture**: Integrated `wait_timeout` prevents the AI agent from freezing on long-running commands.
 - **Unified Execution Model**: A single `run` tool handles synchronous, asynchronous, and streaming execution.
+- **Lean-by-Default Responses**: Tools return compact happy-path payloads for lower token usage.
+- **On-Demand Verbose Debugging**: Use `last_command_details` only when execution context needs deep inspection.
 - **Docker Ready**: Run without Python installation using a simple Docker container.
 - **Binary-Safe Pipelines**: Reliable file transfers bypassing terminal encoding issues.
 - **Background Buffering**: Continuous output caching even when the agent isn't polling.
@@ -21,8 +23,9 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 | `run` | Execute commands (sync/async/stream) with timeout and auto-recovery. |
 | `read` | Read buffered output with pagination and server-side filtering. |
 | `signal` | Send `Ctrl+C` or `stdin` to a running process. |
-| `file` | Unified file operations (read, write, list, upload, download) with shell fallback. |
+| `file` | File list/inspect/transfer/edit tool: `read` with `local_path` downloads file, without it returns inspect snippet (line window + filters); `write/upload` uses local file or small inline `content`; `edit` applies in-place text replacements. |
 | `run_pipeline` | Binary-safe data transfer between local and remote. |
+| `last_command_details` | Full verbose result of the last tool call (debug only). |
 | `session_list` | List active sessions and their status (`idle`, `busy`, `broken`). |
 | `session_update`| Rename session or set as current. |
 | `session_close` | Terminate and remove a session. |
@@ -56,7 +59,10 @@ Add this to your `.cursor/mcp.json`:
     "ssh-mcp": {
       "command": "docker",
       "args": [
-        "run", "-i", "--rm", "mcp-ssh-server",
+        "run", "-i", "--rm",
+        "-v", "D:/path/to/project:/workspace",
+        "-w", "/workspace",
+        "mcp-ssh-server",
         "--host", "192.168.1.1",
         "--user", "admin",
         "--password", "YOUR_PASSWORD"
@@ -129,6 +135,29 @@ mcpServers:
 - `--password` (required): SSH password.
 - `--port` (optional): SSH port (default: 22).
 - `--path` (optional): Additional `PATH` (e.g., `/opt/bin:/opt/sbin` for Entware).
+- `--project-root` (optional): Local project root for cache/log placement (default: process `cwd`).
+- `--cache-dir` (optional): Override cache base path. Server writes to `<cache-dir>/<project-tag-hash>/...`.
+
+Environment variable:
+- `SSH_MCP_CACHE_DIR` (optional): Same behavior as `--cache-dir` when CLI arg is omitted.
+
+## 📦 Response Model
+
+Tools now return compact JSON by default. Typical happy-path fields are:
+- `run`: `success`, `session_id`, `run_id`, `status`, `still_running`, `output`, `output_complete`
+- `read`: `success`, `session_id`, `run_id`, `status`, `still_running`, `output`, `next_offset`, `output_complete`
+- `run_pipeline` / `pipeline_status`: `success`, `session_id`, `pipeline_id`, `status`, `still_running`, `written_complete`, `preview`, `next_offset`, `exit_status`
+
+If you need full metadata (timeouts, memory counters, session selection details, etc.), call `last_command_details` once for debugging and continue with normal compact flow.
+
+## 🧠 Local Cache Layout
+
+- Default (no override): `<project-root>/.ssh-cache/`
+- Override mode: `<cache-dir>/<project-tag-hash>/`
+- Session logs: `sessions/`
+- Run/Pipeline logs: `runs/`
+
+This keeps data isolated per project and avoids cross-project log mixing.
 
 ## ⚠️ Security Note
 

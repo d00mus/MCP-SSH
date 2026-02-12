@@ -26,7 +26,10 @@ Edit `.cursor/mcp.json`:
     "ssh-mcp": {
       "command": "docker",
       "args": [
-        "run", "-i", "--rm", "mcp-ssh-server",
+        "run", "-i", "--rm",
+        "-v", "D:/path/to/project:/workspace",
+        "-w", "/workspace",
+        "mcp-ssh-server",
         "--host", "192.168.1.1",
         "--user", "admin",
         "--password", "YOUR_PASSWORD"
@@ -87,3 +90,10 @@ Try asking your AI:
 1. **Shell Mode**: For any command with `|`, `&&`, `||`, or `if/else`, the agent must set `shell: true`.
 2. **Keenetic**: If you are using a Keenetic router, the server will automatically handle the transition from restricted CLI to Linux shell when `shell: true` is requested.
 3. **Passwords**: Ensure your password doesn't contain characters that might need shell escaping in your local environment.
+4. **Lean responses by default**: tools now return compact payloads. Use `last_command_details` only for debugging ambiguous command outcomes.
+5. **Cache location**: default is `<project-root>/.ssh-cache` (project root = process cwd). Override via `--cache-dir` or `SSH_MCP_CACHE_DIR`.
+6. **File tool workflow**:
+   - `file.read` with `local_path` downloads file (metadata only in response).
+   - `file.read` without `local_path` is inspect mode (line window + filters).
+   - `file.write/upload` uses `local_path` for full files, or inline `content` for small files.
+   - `file.edit` performs in-place text replacements for existing remote text files.

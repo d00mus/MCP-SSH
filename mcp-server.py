@@ -12,6 +12,7 @@ Goals:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,11 @@ DEFAULT_READ_MAX_LINES = 200
 DEFAULT_READ_MAX_CHARS = 20000
 MAX_READ_MAX_LINES = 5000
 MAX_READ_MAX_CHARS = 200000
+DEFAULT_FILE_INSPECT_MAX_BYTES = 200000
+MAX_FILE_INSPECT_MAX_BYTES = 2_000_000
+DEFAULT_FILE_EDIT_MAX_BYTES = 1_000_000
+MAX_FILE_EDIT_MAX_BYTES = 5_000_000
+MAX_INLINE_WRITE_BYTES = 200000
 DEFAULT_QUIET_COMPLETE_TIMEOUT = 1.5
 MAX_QUIET_COMPLETE_TIMEOUT = 30.0
 
@@ -55,6 +61,9 @@ SSH_USER: Optional[str] = None
 SSH_PASSWORD: Optional[str] = None
 SSH_PORT = 22
 EXTRA_PATH: Optional[str] = None
+PROJECT_ROOT: str = ""
+PROJECT_TAG: str = ""
+CACHE_DIRS: Dict[str, str] = {}
 
 
 # ========= Output cleanup =========
@@ -191,19 +200,37 @@ def json_line(path: str, payload: Dict[str, Any]) -> None:
         log_error(f"log write failed ({path}): {exc}")
 
 
-def make_cache_dirs(project_root: str) -> Dict[str, str]:
-    cache_root = os.path.join(project_root, ".ssh-cache")
+def make_cache_dirs(cache_root: str) -> Dict[str, str]:
     sessions_dir = os.path.join(cache_root, "sessions")
     runs_dir = os.path.join(cache_root, "runs")
-    index_dir = os.path.join(cache_root, "index")
     os.makedirs(sessions_dir, exist_ok=True)
     os.makedirs(runs_dir, exist_ok=True)
-    os.makedirs(index_dir, exist_ok=True)
     return {
         "cache_root": cache_root,
         "sessions_dir": sessions_dir,
         "runs_dir": runs_dir,
-        "index_dir": index_dir,
+    }
+
+
+def resolve_runtime_paths(
+    project_root_arg: Optional[str],
+    cache_dir_arg: Optional[str],
+) -> Dict[str, str]:
+    project_root = os.path.abspath(project_root_arg or os.getcwd())
+    project_tag = safe_name(os.path.basename(project_root))
+    project_hash = hashlib.sha1(project_root.encode("utf-8")).hexdigest()[:8]
+    project_ns = f"{project_tag}-{project_hash}"
+
+    cache_override = cache_dir_arg or os.environ.get("SSH_MCP_CACHE_DIR")
+    if cache_override:
+        cache_root = os.path.join(os.path.abspath(cache_override), project_ns)
+    else:
+        cache_root = os.path.join(project_root, ".ssh-cache")
+
+    return {
+        "project_root": project_root,
+        "project_tag": project_tag,
+        "cache_root": cache_root,
     }
 
 
@@ -1522,10 +1549,65 @@ class SessionManager:
         self.current_session_id: Optional[int] = None
         self.next_session_id = 1
         self.lock = threading.Lock()
+        self.last_tool_result_by_session: Dict[int, Dict[str, Any]] = {}
+        self.last_tool_result_global: Optional[Dict[str, Any]] = None
 
         self.health_thread_stop = False
         self.health_thread = threading.Thread(target=self._health_loop, daemon=True)
         self.health_thread.start()
+
+    def record_tool_result(self, tool_name: str, args: Dict[str, Any], result: Dict[str, Any]) -> None:
+        snapshot = {
+            "timestamp": iso_now(),
+            "tool": tool_name,
+            "args": dict(args),
+            "result": dict(result),
+        }
+        session_id = result.get("session_id")
+        if session_id is None:
+            raw_session_id = args.get("session_id")
+            if raw_session_id is not None:
+                try:
+                    session_id = int(raw_session_id)
+                except Exception:
+                    session_id = None
+        if session_id is not None:
+            snapshot["session_id"] = session_id
+
+        with self.lock:
+            self.last_tool_result_global = snapshot
+            if session_id is not None:
+                self.last_tool_result_by_session[session_id] = snapshot
+
+    def get_last_tool_result(self, session_id: Optional[int]) -> Dict[str, Any]:
+        with self.lock:
+            sid = session_id if session_id is not None else self.current_session_id
+            if sid is not None and sid in self.last_tool_result_by_session:
+                snapshot = dict(self.last_tool_result_by_session[sid])
+                return {
+                    "success": True,
+                    "session_id": sid,
+                    "tool": snapshot.get("tool"),
+                    "timestamp": snapshot.get("timestamp"),
+                    "args": snapshot.get("args", {}),
+                    "result": snapshot.get("result", {}),
+                }
+
+            if self.last_tool_result_global:
+                snapshot = dict(self.last_tool_result_global)
+                return {
+                    "success": True,
+                    "session_id": snapshot.get("session_id"),
+                    "tool": snapshot.get("tool"),
+                    "timestamp": snapshot.get("timestamp"),
+                    "args": snapshot.get("args", {}),
+                    "result": snapshot.get("result", {}),
+                }
+
+            return {
+                "success": False,
+                "error": "No recorded command result yet. Run any tool first.",
+            }
 
     def _health_loop(self) -> None:
         while not self.health_thread_stop:
@@ -1707,17 +1789,95 @@ class SessionManager:
             session.close()
 
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-PROJECT_TAG = safe_name(os.path.basename(PROJECT_ROOT))
-CACHE_DIRS = make_cache_dirs(PROJECT_ROOT)
-manager = SessionManager(CACHE_DIRS, PROJECT_TAG)
+manager: Optional[SessionManager] = None
+
+LEAN_RESPONSE_KEYS: Dict[str, tuple[str, ...]] = {
+    "run": ("success", "session_id", "run_id", "status", "still_running", "output", "output_complete"),
+    "exec": ("success", "session_id", "run_id", "status", "still_running", "output", "output_complete"),
+    "read": ("success", "session_id", "run_id", "status", "still_running", "output", "next_offset", "output_complete"),
+    "run_pipeline": (
+        "success",
+        "session_id",
+        "pipeline_id",
+        "status",
+        "still_running",
+        "written_complete",
+        "preview",
+        "next_offset",
+        "exit_status",
+        "output_complete",
+    ),
+    "pipeline_status": (
+        "success",
+        "session_id",
+        "pipeline_id",
+        "status",
+        "still_running",
+        "written_complete",
+        "preview",
+        "next_offset",
+        "exit_status",
+        "output_complete",
+    ),
+    "session_list": ("success", "sessions", "current_session"),
+    "session_close": ("success", "message", "current_session"),
+    "session_update": ("success", "session_id", "name", "current_session", "message"),
+    "signal": ("success", "session_id", "message"),
+    "file": (
+        "success",
+        "action",
+        "mode",
+        "path",
+        "local_path",
+        "source",
+        "method",
+        "files",
+        "listing",
+        "size",
+        "sha256",
+        "content",
+        "filtered",
+        "matched_lines",
+        "scanned_chars",
+        "line_start",
+        "line_end",
+        "total_lines",
+        "truncated",
+        "changed",
+        "replacements",
+        "dry_run",
+        "backup_path",
+        "old_sha256",
+        "new_sha256",
+    ),
+    "last_command_details": ("success", "session_id", "tool", "timestamp", "args", "result"),
+}
+
+
+def project_error_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    projected = {"success": False, "error": result.get("error", "unknown error")}
+    for key in ("session_id", "run_id", "pipeline_id", "busy_type", "busy_id"):
+        if key in result:
+            projected[key] = result[key]
+    return projected
+
+
+def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"success": False, "error": "tool returned non-object result"}
+    if not result.get("success", False):
+        return project_error_result(result)
+
+    keys = LEAN_RESPONSE_KEYS.get(tool_name)
+    if keys is None:
+        return result
+    return {key: result[key] for key in keys if key in result}
 
 
 def format_tool_result(result: Dict[str, Any]) -> Dict[str, Any]:
-    if result.get("success", True):
-        text = json.dumps(result, ensure_ascii=False, indent=2)
+    text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    if result.get("success", False):
         return {"content": [{"type": "text", "text": text}]}
-    text = f"Error: {result.get('error', 'unknown error')}"
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
@@ -1726,6 +1886,8 @@ def make_response(req_id: Any, result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def session_from_args(session_id: Optional[int]) -> Optional[SSHSession]:
+    if manager is None:
+        return None
     session = manager.get_session(session_id)
     if session:
         return session
@@ -1922,6 +2084,18 @@ def signal_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     text = args.get("text", "")
     press_enter = to_bool(args.get("press_enter", True), True)
     return session.send_signal(action=action, text=text, press_enter=press_enter)
+
+
+def last_command_details_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
+    if manager is None:
+        return {"success": False, "error": "session manager is not initialized"}
+    session_id = args.get("session_id")
+    if session_id is not None:
+        try:
+            session_id = int(session_id)
+        except Exception:
+            return {"success": False, "error": "session_id must be number"}
+    return manager.get_last_tool_result(session_id=session_id)
 
 
 def run_pipeline_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2127,14 +2301,185 @@ def _sync_shell(session: SSHSession, command: str, timeout: float = 30.0) -> Dic
     return result
 
 
+def _sha256_hex(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _extract_between_markers(text: str, start_marker: str, end_marker: str) -> Optional[str]:
+    lines = (text or "").splitlines()
+    start_idx = -1
+    end_idx = -1
+    for idx, line in enumerate(lines):
+        clean = line.strip()
+        # We look for the marker as a standalone line to avoid matching it within the echoed command
+        if start_idx < 0 and clean == start_marker:
+            start_idx = idx + 1
+            continue
+        if start_idx >= 0 and clean == end_marker:
+            end_idx = idx
+            break
+    if start_idx < 0 or end_idx < start_idx:
+        return None
+    return "\n".join(lines[start_idx:end_idx]).strip()
+
+
+def _read_remote_file_bytes(
+    session: SSHSession,
+    path: str,
+    max_bytes: Optional[int],
+) -> Dict[str, Any]:
+    sftp = session.open_sftp()
+    if sftp is not None:
+        try:
+            with sftp.file(path, "rb") as handle:
+                if max_bytes is None:
+                    data = handle.read()
+                    truncated = False
+                else:
+                    data = handle.read(max_bytes + 1)
+                    truncated = len(data) > max_bytes
+                    if truncated:
+                        data = data[:max_bytes]
+            return {
+                "success": True,
+                "method": "sftp",
+                "data": data,
+                "truncated": truncated,
+            }
+        except Exception as exc:
+            log_error(f"sftp read failed, fallback shell: {exc}")
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    stamp = f"{int(time.time() * 1000)}_{os.getpid()}"
+    marker_start = f"MCP_BEGIN_{stamp}"
+    marker_end = f"MCP_END_{stamp}"
+    marker_error = f"MCP_ERR_{stamp}"
+
+    if max_bytes is None:
+        shell_command = (
+            f"if [ -r '{path}' ]; then "
+            f"echo '{marker_start}'; base64 '{path}'; echo '{marker_end}'; "
+            f"else echo '{marker_error}'; fi"
+        )
+    else:
+        shell_command = (
+            f"if [ -r '{path}' ]; then "
+            f"echo '{marker_start}'; head -c {max_bytes + 1} '{path}' | base64; echo '{marker_end}'; "
+            f"else echo '{marker_error}'; fi"
+        )
+
+    shell_result = _sync_shell(session, shell_command, timeout=30.0)
+    if not shell_result.get("success", False):
+        return shell_result
+    
+    raw_output = shell_result.get("output", "")
+    extracted = _extract_between_markers(raw_output, marker_start, marker_end)
+    
+    if extracted is None:
+        # If not found, check if it was an error or just a parsing failure
+        # We check for error marker as a standalone line
+        error_lines = raw_output.splitlines()
+        if any(line.strip() == marker_error for line in error_lines):
+            return {"success": False, "error": f"remote file is not readable or missing: {path}", "session_id": session.id}
+        return {"success": False, "error": "failed to parse shell read payload (markers not found)", "session_id": session.id}
+
+    try:
+        payload_bytes = base64.b64decode(extracted, validate=False)
+    except Exception as exc:
+        return {"success": False, "error": f"failed to decode shell base64 payload: {exc}", "session_id": session.id}
+
+    truncated = False
+    if max_bytes is not None and len(payload_bytes) > max_bytes:
+        payload_bytes = payload_bytes[:max_bytes]
+        truncated = True
+
+    return {
+        "success": True,
+        "method": "shell",
+        "data": payload_bytes,
+        "truncated": truncated,
+    }
+
+
+def _write_remote_file_bytes(
+    session: SSHSession,
+    path: str,
+    payload_bytes: bytes,
+) -> Dict[str, Any]:
+    sftp = session.open_sftp()
+    if sftp is not None:
+        try:
+            with sftp.file(path, "wb") as handle:
+                handle.write(payload_bytes)
+            return {"success": True, "method": "sftp"}
+        except Exception as exc:
+            log_error(f"sftp write failed, fallback shell: {exc}")
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    b64_payload = base64.b64encode(payload_bytes).decode("ascii")
+    tmp_path = f"{path}.mcp_b64_{int(time.time() * 1000)}"
+    chunk_size = 800
+    chunks = [b64_payload[i : i + chunk_size] for i in range(0, len(b64_payload), chunk_size)]
+    if not chunks:
+        chunks = [""]
+
+    first = _sync_shell(session, f"echo '{chunks[0]}' > '{tmp_path}'", timeout=30.0)
+    if not first.get("success", False):
+        return first
+
+    for chunk in chunks[1:]:
+        step = _sync_shell(session, f"echo '{chunk}' >> '{tmp_path}'", timeout=30.0)
+        if not step.get("success", False):
+            return step
+
+    finish = _sync_shell(session, f"base64 -d '{tmp_path}' > '{path}' && rm '{tmp_path}'", timeout=30.0)
+    if not finish.get("success", False):
+        return finish
+    return {"success": True, "method": "shell"}
+
+
+def _slice_text_by_lines(text: str, offset_line: Optional[int], limit_lines: int) -> Dict[str, Any]:
+    lines = text.splitlines()
+    total_lines = len(lines)
+    if total_lines == 0:
+        return {"text": "", "line_start": 1, "line_end": 0, "total_lines": 0}
+
+    start_line = 1 if offset_line is None else offset_line
+    if start_line < 0:
+        start_line = total_lines + start_line + 1
+    if start_line < 1:
+        start_line = 1
+
+    line_limit = clamp_int(limit_lines, DEFAULT_READ_MAX_LINES, 1, MAX_READ_MAX_LINES)
+    if start_line > total_lines:
+        return {"text": "", "line_start": start_line, "line_end": start_line - 1, "total_lines": total_lines}
+
+    end_line = min(total_lines, start_line + line_limit - 1)
+    window_text = "\n".join(lines[start_line - 1 : end_line])
+    return {
+        "text": window_text,
+        "line_start": start_line,
+        "line_end": end_line,
+        "total_lines": total_lines,
+    }
+
+
 def file_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     action = (args.get("action") or "").strip().lower()
-    if action not in {"read", "write", "list", "upload", "download"}:
-        return {"success": False, "error": "action must be one of: read, write, list, upload, download"}
+    if action not in {"read", "write", "list", "upload", "download", "edit"}:
+        return {"success": False, "error": "action must be one of: read, write, list, upload, download, edit"}
 
-    path = args.get("path", "")
-    content = args.get("content", "")
-    as_base64 = to_bool(args.get("as_base64", False))
+    path = (args.get("path", "") or "").strip()
+    local_path = (args.get("local_path", "") or "").strip()
+    content = args.get("content")
     is_base64 = to_bool(args.get("is_base64", False))
     session_id = args.get("session_id")
 
@@ -2188,105 +2533,235 @@ def file_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         if not path:
             return {"success": False, "error": "path is required for read"}
 
-        sftp = session.open_sftp()
-        if sftp is not None:
-            try:
-                with sftp.file(path, "rb") as handle:
-                    data = handle.read()
-                if as_base64:
-                    return {
-                        "success": True,
-                        "action": "read",
-                        "path": path,
-                        "method": "sftp",
-                        "encoding": "base64",
-                        "content": base64.b64encode(data).decode("ascii"),
-                        "size": len(data),
-                    }
-                return {
-                    "success": True,
-                    "action": "read",
-                    "path": path,
-                    "method": "sftp",
-                    "encoding": "utf-8",
-                    "content": data.decode("utf-8", errors="replace"),
-                    "size": len(data),
-                }
-            except Exception as exc:
-                log_error(f"sftp read failed, fallback shell: {exc}")
-            finally:
-                try:
-                    sftp.close()
-                except Exception:
-                    pass
+        if local_path:
+            parent = os.path.dirname(local_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
 
-        shell_command = f"base64 '{path}'" if as_base64 else f"cat '{path}'"
-        shell_result = _sync_shell(session, shell_command, timeout=30.0)
-        if not shell_result.get("success", False):
-            return shell_result
-        return {
-            "success": True,
-            "action": "read",
-            "path": path,
-            "method": "shell",
-            "encoding": "base64" if as_base64 else "utf-8",
-            "content": shell_result.get("output", ""),
-        }
-
-    # write
-    if not path:
-        return {"success": False, "error": "path is required for write"}
-    if content is None:
-        return {"success": False, "error": "content is required for write"}
-
-    payload_bytes = base64.b64decode(content) if is_base64 else str(content).encode("utf-8")
-
-    sftp = session.open_sftp()
-    if sftp is not None:
-        try:
-            with sftp.file(path, "wb") as handle:
+            read_result = _read_remote_file_bytes(session, path, max_bytes=None)
+            if not read_result.get("success", False):
+                return read_result
+            payload_bytes = read_result["data"]
+            with open(local_path, "wb") as handle:
                 handle.write(payload_bytes)
             return {
                 "success": True,
-                "action": "write",
+                "action": "read",
+                "mode": "download",
                 "path": path,
-                "method": "sftp",
+                "local_path": local_path,
+                "method": read_result["method"],
                 "size": len(payload_bytes),
+                "sha256": _sha256_hex(payload_bytes),
             }
-        except Exception as exc:
-            log_error(f"sftp write failed, fallback shell: {exc}")
-        finally:
+
+        offset_line = args.get("offset_line")
+        if offset_line is not None:
             try:
-                sftp.close()
+                offset_line = int(offset_line)
             except Exception:
-                pass
+                return {"success": False, "error": "offset_line must be number"}
 
-    b64_payload = base64.b64encode(payload_bytes).decode("ascii")
-    tmp_path = f"{path}.mcp_b64"
-    chunk_size = 800
-    chunks = [b64_payload[i : i + chunk_size] for i in range(0, len(b64_payload), chunk_size)]
-    if not chunks:
-        chunks = [""]
+        limit_lines = args.get("limit_lines", DEFAULT_READ_MAX_LINES)
+        try:
+            limit_lines = int(limit_lines)
+        except Exception:
+            return {"success": False, "error": "limit_lines must be number"}
 
-    first = _sync_shell(session, f"echo '{chunks[0]}' > '{tmp_path}'", timeout=30.0)
-    if not first.get("success", False):
-        return first
+        max_chars = clamp_int(args.get("max_chars", DEFAULT_READ_MAX_CHARS), DEFAULT_READ_MAX_CHARS, 100, MAX_READ_MAX_CHARS)
+        max_bytes = clamp_int(
+            args.get("max_bytes", DEFAULT_FILE_INSPECT_MAX_BYTES),
+            DEFAULT_FILE_INSPECT_MAX_BYTES,
+            1024,
+            MAX_FILE_INSPECT_MAX_BYTES,
+        )
+        contains = args.get("contains")
+        regex = args.get("regex")
+        tail_lines = args.get("tail_lines")
 
-    for chunk in chunks[1:]:
-        step = _sync_shell(session, f"echo '{chunk}' >> '{tmp_path}'", timeout=30.0)
-        if not step.get("success", False):
-            return step
+        read_result = _read_remote_file_bytes(session, path, max_bytes=max_bytes)
+        if not read_result.get("success", False):
+            return read_result
 
-    finish = _sync_shell(session, f"base64 -d '{tmp_path}' > '{path}' && rm '{tmp_path}'", timeout=30.0)
-    if not finish.get("success", False):
-        return finish
+        text = read_result["data"].decode("utf-8", errors="replace")
+        window = _slice_text_by_lines(text, offset_line=offset_line, limit_lines=limit_lines)
+        filtered = apply_text_filters(window["text"], contains=contains, regex=regex, tail_lines=tail_lines)
+        if not filtered.get("success", False):
+            return {"success": False, "error": filtered.get("error", "filtering error"), "session_id": session.id}
+
+        inspect_text = filtered["output"]
+        char_limited = False
+        if len(inspect_text) > max_chars:
+            inspect_text = inspect_text[:max_chars]
+            char_limited = True
+
+        return {
+            "success": True,
+            "action": "read",
+            "mode": "inspect",
+            "path": path,
+            "method": read_result["method"],
+            "content": inspect_text,
+            "filtered": filtered["filtered"],
+            "matched_lines": filtered["matched_lines"],
+            "scanned_chars": filtered["scanned_chars"],
+            "line_start": window["line_start"],
+            "line_end": window["line_end"],
+            "total_lines": window["total_lines"],
+            "truncated": bool(read_result.get("truncated", False) or char_limited),
+        }
+
+    # write/upload
+    if action == "edit":
+        if not path:
+            return {"success": False, "error": "path is required for edit"}
+        edits = args.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return {"success": False, "error": "edits must be a non-empty array"}
+
+        dry_run = to_bool(args.get("dry_run", False))
+        create_backup = to_bool(args.get("create_backup", False))
+        edit_max_bytes = clamp_int(
+            args.get("max_bytes", DEFAULT_FILE_EDIT_MAX_BYTES),
+            DEFAULT_FILE_EDIT_MAX_BYTES,
+            1024,
+            MAX_FILE_EDIT_MAX_BYTES,
+        )
+
+        read_result = _read_remote_file_bytes(session, path, max_bytes=edit_max_bytes)
+        if not read_result.get("success", False):
+            return read_result
+        if read_result.get("truncated", False):
+            return {
+                "success": False,
+                "error": (
+                    f"file is larger than edit max_bytes ({edit_max_bytes}). "
+                    "Increase max_bytes or use command-based editing."
+                ),
+                "path": path,
+                "session_id": session.id,
+            }
+
+        original_bytes = read_result["data"]
+        original_text = original_bytes.decode("utf-8", errors="replace")
+        updated_text = original_text
+        total_replacements = 0
+
+        for idx, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                return {"success": False, "error": f"edit at index {idx} must be an object"}
+
+            old_text = edit.get("old_text")
+            if old_text is None:
+                return {"success": False, "error": f"edit at index {idx} must include old_text"}
+            old_text = str(old_text)
+            if old_text == "":
+                return {"success": False, "error": f"edit at index {idx} has empty old_text"}
+
+            new_text = str(edit.get("new_text", ""))
+            replace_all = to_bool(edit.get("replace_all", False))
+            occurrences = updated_text.count(old_text)
+            if occurrences == 0:
+                return {"success": False, "error": f"old_text not found for edit at index {idx}"}
+            if not replace_all and occurrences != 1:
+                return {
+                    "success": False,
+                    "error": (
+                        f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences. "
+                        "Set replace_all=true or provide a more specific old_text."
+                    ),
+                }
+
+            if replace_all:
+                updated_text = updated_text.replace(old_text, new_text)
+                total_replacements += occurrences
+            else:
+                updated_text = updated_text.replace(old_text, new_text, 1)
+                total_replacements += 1
+
+        updated_bytes = updated_text.encode("utf-8")
+        changed = updated_bytes != original_bytes
+        old_sha256 = _sha256_hex(original_bytes)
+        new_sha256 = _sha256_hex(updated_bytes)
+
+        result_payload = {
+            "success": True,
+            "action": "edit",
+            "mode": "edit",
+            "path": path,
+            "changed": changed,
+            "replacements": total_replacements,
+            "dry_run": dry_run,
+            "old_sha256": old_sha256,
+            "new_sha256": new_sha256,
+            "size": len(updated_bytes),
+        }
+
+        if dry_run or not changed:
+            result_payload["method"] = read_result["method"]
+            return result_payload
+
+        if create_backup:
+            backup_path = f"{path}.mcp.bak"
+            backup_result = _write_remote_file_bytes(session, backup_path, original_bytes)
+            if not backup_result.get("success", False):
+                return {
+                    "success": False,
+                    "error": f"failed to create backup at {backup_path}: {backup_result.get('error', 'unknown error')}",
+                    "path": path,
+                    "session_id": session.id,
+                }
+            result_payload["backup_path"] = backup_path
+
+        write_result = _write_remote_file_bytes(session, path, updated_bytes)
+        if not write_result.get("success", False):
+            return write_result
+        result_payload["method"] = write_result["method"]
+        return result_payload
+
+    if not path:
+        return {"success": False, "error": "path is required for write"}
+    payload_bytes: bytes
+    source: str
+    if local_path:
+        if not os.path.isfile(local_path):
+            return {"success": False, "error": f"local_path not found: {local_path}"}
+        with open(local_path, "rb") as handle:
+            payload_bytes = handle.read()
+        source = "local_path"
+    else:
+        if content is None:
+            return {
+                "success": False,
+                "error": "for write/upload provide local_path or inline content",
+            }
+        try:
+            payload_bytes = base64.b64decode(str(content)) if is_base64 else str(content).encode("utf-8")
+        except Exception as exc:
+            return {"success": False, "error": f"failed to decode inline content: {exc}"}
+        if len(payload_bytes) > MAX_INLINE_WRITE_BYTES:
+            return {
+                "success": False,
+                "error": (
+                    f"inline content too large ({len(payload_bytes)} bytes). "
+                    f"Use local_path for files larger than {MAX_INLINE_WRITE_BYTES} bytes."
+                ),
+            }
+        source = "inline_content"
+
+    write_result = _write_remote_file_bytes(session, path, payload_bytes)
+    if not write_result.get("success", False):
+        return write_result
 
     return {
         "success": True,
         "action": "write",
         "path": path,
-        "method": "shell",
+        "local_path": local_path,
+        "source": source,
+        "method": write_result["method"],
         "size": len(payload_bytes),
+        "sha256": _sha256_hex(payload_bytes),
     }
 
 
@@ -2351,6 +2826,7 @@ def tools_list() -> Dict[str, Any]:
                 "Unified command execution. "
                 "CRITICAL: Set shell=true for Linux/Bash commands (ls, cat, grep, etc) or to use &&/|| operators. "
                 "Required to access full Linux shell on devices like Keenetic routers. "
+                "Returns compact happy-path payload by default. "
                 "Default behavior: run in CURRENT session if session_id is not provided. "
                 "Supports sync/async/stream mode, anti-hang wait_timeout, optional hard_timeout. "
                 "If wait timeout triggers, returns partial output and still_running=true. "
@@ -2452,6 +2928,7 @@ def tools_list() -> Dict[str, Any]:
             "description": (
                 "Check status of run_pipeline and read text preview. "
                 "Use until written_complete=true. "
+                "Returns compact payload; use last_command_details only for deep debugging. "
                 "Supports server-side filters for token savings."
             ),
             "inputSchema": {
@@ -2480,6 +2957,7 @@ def tools_list() -> Dict[str, Any]:
             "description": (
                 "Read buffered output for a run (or current active/last run). "
                 "Supports offset pagination and returns next_offset. "
+                "Returns compact payload; use last_command_details only for deep debugging. "
                 "Supports server-side filters for token savings."
             ),
             "inputSchema": {
@@ -2521,20 +2999,91 @@ def tools_list() -> Dict[str, Any]:
             },
         },
         {
-            "name": "file",
+            "name": "last_command_details",
             "description": (
-                "Unified file operation tool (read, write, list, upload, download). "
-                "Works in any environment, including restricted shells. "
-                "Tries SFTP first, falls back to shell commands if needed."
+                "Return full verbose payload of the last tool call result (per session if possible). "
+                "Use only for debugging or ambiguous outcomes; do NOT call routinely in happy path."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["read", "write", "list", "upload", "download"]},
+                    "session_id": session_id_param,
+                },
+            },
+        },
+        {
+            "name": "file",
+            "description": (
+                "Unified file operation tool (list, read/download, write/upload, edit). "
+                "Works in any environment, including restricted shells. "
+                "Tries SFTP first, falls back to shell commands if needed. "
+                "read/download: with local_path -> save remote file locally (metadata only); without local_path -> inspect text content with optional line window and filters. "
+                "write/upload: use local_path for full files or inline content for small files. "
+                "edit: in-place text replace operations for existing remote text files."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["read", "write", "list", "upload", "download", "edit"]},
                     "path": {"type": "string", "description": "Remote path."},
-                    "content": {"type": "string", "description": "Text content for write/upload."},
-                    "as_base64": {"type": "boolean", "description": "read/download: return base64."},
-                    "is_base64": {"type": "boolean", "description": "write/upload: input content is base64."},
+                    "local_path": {
+                        "type": "string",
+                        "description": (
+                            "Local file path for side-effect transfer. "
+                            "For read/download: destination local path. "
+                            "For write/upload: source local path."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "Optional inline content for small write/upload operations when local_path is not provided."
+                        ),
+                    },
+                    "is_base64": {
+                        "type": "boolean",
+                        "description": "Optional. If true, inline content is base64-decoded before write/upload.",
+                    },
+                    "offset_line": {
+                        "type": "number",
+                        "description": "Optional line offset for read inspect mode. 1-based; negative values count from file end.",
+                    },
+                    "limit_lines": {
+                        "type": "number",
+                        "description": "Optional max lines for read inspect mode window.",
+                    },
+                    "max_chars": {
+                        "type": "number",
+                        "description": "Optional max characters in read inspect response.",
+                    },
+                    "max_bytes": {
+                        "type": "number",
+                        "description": "Optional max bytes to read from remote file for inspect/edit safeguards.",
+                    },
+                    "contains": {
+                        "type": "string",
+                        "description": "Optional substring filter for read inspect mode.",
+                    },
+                    "regex": {
+                        "type": "string",
+                        "description": "Optional regex filter for read inspect mode.",
+                    },
+                    "tail_lines": {
+                        "type": "number",
+                        "description": "Optional keep only last N lines in read inspect mode.",
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "For edit action: list of text replacements. Each item: old_text, new_text, optional replace_all.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "For edit action: preview metadata without writing remote file.",
+                    },
+                    "create_backup": {
+                        "type": "boolean",
+                        "description": "For edit action: save original file to <path>.mcp.bak before write.",
+                    },
                     "session_id": session_id_param,
                 },
                 "required": ["action"],
@@ -2545,6 +3094,8 @@ def tools_list() -> Dict[str, Any]:
 
 
 def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if manager is None:
+        return make_response(request.get("id", 1), {"success": False, "error": "session manager is not initialized"})
     method = request.get("method")
     params = request.get("params", {})
     req_id = request.get("id", 1)
@@ -2615,6 +3166,9 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             elif tool_name == "signal":
                 result = signal_dispatch(args)
 
+            elif tool_name == "last_command_details":
+                result = last_command_details_dispatch(args)
+
             elif tool_name == "file":
                 result = file_dispatch(args)
 
@@ -2625,7 +3179,10 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
                 }
 
-            return make_response(req_id, result)
+            if tool_name != "last_command_details":
+                manager.record_tool_result(tool_name=str(tool_name), args=args, result=result)
+            projected = project_tool_result(tool_name=str(tool_name), result=result)
+            return make_response(req_id, projected)
         except Exception as exc:
             log_error(f"tool execution error ({tool_name}): {exc}")
             return make_response(req_id, {"success": False, "error": str(exc)})
@@ -2639,6 +3196,7 @@ def handle_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def main() -> None:
     global SSH_HOST, SSH_USER, SSH_PASSWORD, SSH_PORT, EXTRA_PATH
+    global PROJECT_ROOT, PROJECT_TAG, CACHE_DIRS, manager
 
     parser = argparse.ArgumentParser(
         description="SSH MCP Server (compact tools, anti-hang timeout, background output buffering)"
@@ -2648,6 +3206,17 @@ def main() -> None:
     parser.add_argument("--password", required=True, help="SSH password")
     parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument("--path", help="Additional PATH to export in shell")
+    parser.add_argument(
+        "--project-root",
+        help="Project root for local state (default: current working directory at server start)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        help=(
+            "Optional cache root override. "
+            "If set, server uses <cache-dir>/<project-tag-hash>/... to avoid mixing projects."
+        ),
+    )
     args = parser.parse_args()
 
     SSH_HOST = args.host
@@ -2656,9 +3225,15 @@ def main() -> None:
     SSH_PORT = args.port
     EXTRA_PATH = args.path
 
+    runtime_paths = resolve_runtime_paths(project_root_arg=args.project_root, cache_dir_arg=args.cache_dir)
+    PROJECT_ROOT = runtime_paths["project_root"]
+    PROJECT_TAG = runtime_paths["project_tag"]
+    CACHE_DIRS = make_cache_dirs(runtime_paths["cache_root"])
+    manager = SessionManager(CACHE_DIRS, PROJECT_TAG)
+
     log_error(
         f"SSH MCP started for {SSH_HOST}:{SSH_PORT}. "
-        f"cache={CACHE_DIRS['cache_root']}"
+        f"project_root={PROJECT_ROOT} cache={CACHE_DIRS['cache_root']}"
     )
 
     for line in sys.stdin:
@@ -2675,7 +3250,8 @@ def main() -> None:
             log_error(f"unexpected error: {exc}")
 
     log_error("shutting down...")
-    manager.close_all()
+    if manager is not None:
+        manager.close_all()
 
 
 if __name__ == "__main__":

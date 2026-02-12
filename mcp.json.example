@@ -4,10 +4,12 @@
       "command": "python",
       "args": [
         "C:\\path\\to\\mcp-server.py",
+        "--project-root", "D:\\dev\\keenetic_github",
         "--host", "192.168.1.1",
         "--user", "admin",
         "--password", "YOUR_PASSWORD",
-        "--port", "22"
+        "--port", "22",
+        "--cache-dir", "D:\\mcp-cache"
       ]
     },
     
@@ -15,10 +17,12 @@
       "command": "python",
       "args": [
         "/path/to/mcp-server.py",
+        "--project-root", "/workspace/my-project",
         "--host", "my-server.example.com",
         "--user", "myuser",
         "--password", "SERVER_PASSWORD",
-        "--port", "2222"
+        "--port", "2222",
+        "--cache-dir", "/var/tmp/mcp-cache"
       ]
     }
   }
