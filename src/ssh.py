@@ -784,6 +784,7 @@ class SSHSession:
         return {
             "success": True,
             "session_id": self.id,
+            "session_name": self.name,
             "run_id": run_id,
             "status": status,
             "error": run.error if status == "failed" else "",
@@ -860,6 +861,7 @@ class SSHSession:
         return {
             "success": True,
             "session_id": self.id,
+            "session_name": self.name,
             "run_id": selected.run_id,
             "status": status,
             "error": selected.error if status == "failed" else "",
@@ -1207,6 +1209,7 @@ class SSHSession:
         return {
             "success": True,
             "session_id": self.id,
+            "session_name": self.name,
             "pipeline_id": pipeline_id,
             "status": status,
             "error": pipeline.error if status == "failed" else "",
@@ -1267,6 +1270,7 @@ class SSHSession:
         return {
             "success": True,
             "session_id": self.id,
+            "session_name": self.name,
             "pipeline_id": selected.pipeline_id,
             "status": status,
             "error": selected.error if status == "failed" else "",

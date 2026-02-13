@@ -16,20 +16,32 @@ from src.config import (
 )
 
 def _extract_between_markers(text: str, start_marker: str, end_marker: str) -> Optional[str]:
-    lines = (text or "").splitlines()
-    start_idx = -1
-    end_idx = -1
-    for idx, line in enumerate(lines):
-        clean = line.strip()
-        if start_idx < 0 and clean == start_marker:
-            start_idx = idx + 1
-            continue
-        if start_idx >= 0 and clean == end_marker:
-            end_idx = idx
-            break
-    if start_idx < 0 or end_idx < start_idx:
+    if not text:
         return None
-    return "\n".join(lines[start_idx:end_idx]).strip()
+    
+    start_pos = text.find(start_marker)
+    if start_pos < 0:
+        return None
+    
+    # Content starts after the marker and any immediate newline
+    content_start = start_pos + len(start_marker)
+    if content_start < len(text) and text[content_start] == "\n":
+        content_start += 1
+    elif content_start < len(text) and text[content_start:content_start+2] == "\r\n":
+        content_start += 2
+        
+    end_pos = text.find(end_marker, content_start)
+    if end_pos < 0:
+        return None
+        
+    # Content ends before the marker and any trailing newline/carriage return
+    content_end = end_pos
+    if content_end > content_start and text[content_end-1] == "\n":
+        content_end -= 1
+        if content_end > content_start and text[content_end-1] == "\r":
+            content_end -= 1
+            
+    return text[content_start:content_end]
 
 def _sync_shell(session: SSHSession, command: str, timeout: float = 30.0) -> Dict[str, Any]:
     # Internal helper for synchronous shell calls (for file ops)
@@ -103,13 +115,13 @@ def _read_remote_file_bytes(
     if extracted is None:
         error_lines = raw_output.splitlines()
         if any(line.strip() == marker_error for line in error_lines):
-            return {"success": False, "error": f"remote file is not readable or missing: {path}", "session_id": session.id}
-        return {"success": False, "error": "failed to parse shell read payload (markers not found)", "session_id": session.id}
+            return {"success": False, "error": f"remote file is not readable or missing: {path}", "session_id": session.id, "session_name": session.name}
+        return {"success": False, "error": "failed to parse shell read payload (markers not found)", "session_id": session.id, "session_name": session.name}
 
     try:
         payload_bytes = base64.b64decode(extracted, validate=False)
     except Exception as exc:
-        return {"success": False, "error": f"failed to decode shell base64 payload: {exc}", "session_id": session.id}
+        return {"success": False, "error": f"failed to decode shell base64 payload: {exc}", "session_id": session.id, "session_name": session.name}
 
     truncated = False
     if max_bytes is not None and len(payload_bytes) > max_bytes:
@@ -158,7 +170,7 @@ def _write_remote_file_bytes(
         if not step.get("success", False):
             return step
 
-    finish = _sync_shell(session, f"base64 -d '{tmp_path}' > '{path}' && rm '{tmp_path}'", timeout=30.0)
+    finish = _sync_shell(session, f"mkdir -p \"$(dirname '{path}')\" && base64 -d '{tmp_path}' > '{path}' && sync && rm '{tmp_path}'", timeout=30.0)
     if not finish.get("success", False):
         return finish
     return {"success": True, "method": "shell"}
@@ -221,7 +233,7 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
                         "is_dir": bool(entry.st_mode & 0o40000),
                         "mtime": entry.st_mtime,
                     })
-                return {"success": True, "action": "list", "path": target, "method": "sftp", "files": rows, "session_id": session.id, "status": "completed"}
+                return {"success": True, "action": "list", "path": target, "method": "sftp", "files": rows, "session_id": session.id, "session_name": session.name, "status": "completed"}
             except Exception as exc:
                 log_error(f"sftp list failed, fallback shell: {exc}")
             finally:
@@ -238,6 +250,7 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             "method": "shell",
             "listing": shell_result.get("output", ""),
             "session_id": session.id,
+            "session_name": session.name,
             "status": "completed"
         }
 
@@ -283,7 +296,7 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         window = _slice_text_by_lines(text, offset_line=offset_line, limit_lines=limit_lines)
         filtered = apply_text_filters(window["text"], contains=contains, regex=regex, tail_lines=tail_lines)
         if not filtered.get("success", False):
-            return {"success": False, "error": filtered.get("error", "filtering error"), "session_id": session.id}
+            return {"success": False, "error": filtered.get("error", "filtering error"), "session_id": session.id, "session_name": session.name}
 
         inspect_text = filtered["output"]
         char_limited = False
@@ -306,6 +319,7 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             "total_lines": window["total_lines"],
             "truncated": bool(read_result.get("truncated", False) or char_limited),
             "session_id": session.id,
+            "session_name": session.name,
             "status": "completed"
         }
 
@@ -323,9 +337,10 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         read_result = _read_remote_file_bytes(session, path, max_bytes=edit_max_bytes)
         if not read_result.get("success", False): return read_result
         if read_result.get("truncated", False):
-            return {"success": False, "error": f"file is larger than edit max_bytes ({edit_max_bytes})", "path": path, "session_id": session.id}
+            return {"success": False, "error": f"file is larger than edit max_bytes ({edit_max_bytes})", "path": path, "session_id": session.id, "session_name": session.name}
 
         original_bytes = read_result["data"]
+        # Normalize line endings for comparison if needed, but try exact match first
         original_text = original_bytes.decode("utf-8", errors="replace")
         updated_text = original_text
         total_replacements = 0
@@ -335,8 +350,22 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             if not old_text: return {"success": False, "error": f"edit at index {idx} has missing or empty old_text"}
             new_text = str(edit.get("new_text", ""))
             replace_all = to_bool(edit.get("replace_all", False))
+            
+            # Try exact match first
             occurrences = updated_text.count(old_text)
-            if occurrences == 0: return {"success": False, "error": f"old_text not found for edit at index {idx}"}
+            
+            # If no match, try normalizing both to \n and matching
+            if occurrences == 0:
+                normalized_updated = updated_text.replace("\r\n", "\n")
+                normalized_old = old_text.replace("\r\n", "\n")
+                if normalized_updated.count(normalized_old) > 0:
+                    # If normalized match found, use the normalized version for this and subsequent edits
+                    updated_text = normalized_updated
+                    old_text = normalized_old
+                    new_text = new_text.replace("\r\n", "\n")
+                    occurrences = updated_text.count(old_text)
+
+            if occurrences == 0: return {"success": False, "error": f"old_text not found for edit at index {idx}. Hint: check for exact whitespace/line endings."}
             if not replace_all and occurrences != 1:
                 return {"success": False, "error": f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences"}
 
@@ -364,7 +393,7 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             backup_path = f"{path}.mcp.bak"
             backup_result = _write_remote_file_bytes(session, backup_path, original_bytes)
             if not backup_result.get("success", False):
-                return {"success": False, "error": f"failed to create backup at {backup_path}", "path": path, "session_id": session.id}
+                return {"success": False, "error": f"failed to create backup at {backup_path}", "path": path, "session_id": session.id, "session_name": session.name}
             result_payload["backup_path"] = backup_path
 
         write_result = _write_remote_file_bytes(session, path, updated_bytes)

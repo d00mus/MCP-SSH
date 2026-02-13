@@ -14,7 +14,7 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 - **Docker Ready**: Run without Python installation using a simple Docker container.
 - **Binary-Safe Pipelines**: Reliable file transfers bypassing terminal encoding issues.
 - **Background Buffering**: Continuous output caching even when the agent isn't polling.
-- **Keenetic Aware**: Specialized logic for entering Linux shell from restricted CLI and prompt detection.
+- **Keenetic/Netcraze Aware**: Specialized logic for entering Linux shell from restricted CLI and prompt detection.
 
 ## 🛠 Tools
 

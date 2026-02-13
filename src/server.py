@@ -68,6 +68,8 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     # 2. IDs
     if session_id is not None:
         projected["session_id"] = session_id
+        if "session_name" in result:
+            projected["session_name"] = result["session_name"]
     if "run_id" in result:
         projected["run_id"] = result["run_id"]
     if "pipeline_id" in result:
