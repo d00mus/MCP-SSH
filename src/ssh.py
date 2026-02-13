@@ -514,6 +514,41 @@ class SSHSession:
         self.reader_threads[run.run_id] = thread
         thread.start()
 
+    def _exit_shell(self) -> bool:
+        if not self.in_shell:
+            return True
+        if not self.channel:
+            return False
+        try:
+            # Clear buffer
+            while self.channel.recv_ready():
+                self.channel.recv(BUFFER_SIZE)
+            
+            self.channel.send("exit\n")
+            time.sleep(0.3)
+            output = ""
+            start = time.time()
+            # Wait for native CLI prompt (usually ends with > or #)
+            while time.time() - start < 2.0:
+                if self.channel.recv_ready():
+                    chunk = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+                    output += chunk
+                    # Simple heuristic for native CLI prompt
+                    if re.search(r"[>#]\s*$", output.rstrip()):
+                        self.in_shell = False
+                        self._log_session("SYS", {"event": "exit_shell_ok"})
+                        return True
+                time.sleep(0.05)
+            
+            # If no prompt detected, assume we exited or just force it
+            self.in_shell = False
+            self._log_session("SYS", {"event": "exit_shell_timeout_assumed_ok"})
+            return True
+        except Exception as exc:
+            self._log_session("SYS", {"event": "exit_shell_error", "error": str(exc)})
+            self.in_shell = False # Reset anyway
+            return False
+
     def _reader_loop(self, run: RunState) -> None:
         self._log_run(run, "SYS", {"event": "reader_started"})
         hard_deadline = (run.started_at + run.hard_timeout) if run.hard_timeout > 0 else None
@@ -611,6 +646,7 @@ class SSHSession:
         hard_timeout: float,
         completion_hint: str,
         quiet_complete_timeout: float,
+        max_chars: Optional[int] = None,
     ) -> Dict[str, Any]:
         error = self.ensure_alive()
         if error:
@@ -667,6 +703,15 @@ class SSHSession:
                 return {
                     "success": False,
                     "error": "Failed to enter system shell. Try run(..., shell=true) again or reconnect session.",
+                    "session_id": self.id,
+                }
+        elif not shell and self.in_shell:
+            # shell=false requested, but we are in shell.
+            # On some devices (like Keenetic), we must exit shell to use native CLI commands.
+            if not self._exit_shell():
+                return {
+                    "success": False,
+                    "error": "Failed to exit system shell back to native CLI. Try run(..., shell=false) again.",
                     "session_id": self.id,
                 }
 
@@ -758,7 +803,8 @@ class SSHSession:
         else:
             completed_within_wait = run.done_event.wait(startup_wait)
 
-        snapshot = run.read_slice(offset=run.buffer_base_offset, max_lines=MAX_READ_MAX_LINES, max_chars=MAX_READ_MAX_CHARS)
+        snapshot_max_chars = max_chars if max_chars is not None else MAX_READ_MAX_CHARS
+        snapshot = run.read_slice(offset=run.buffer_base_offset, max_lines=MAX_READ_MAX_LINES, max_chars=snapshot_max_chars)
 
         timed_out = (mode == "sync") and (not completed_within_wait) and (not run.quiet_event.is_set())
         output_complete = run.done_event.is_set()
@@ -1143,6 +1189,15 @@ class SSHSession:
                 "session_id": self.id,
                 "run_id": busy.get("id"),
             }
+
+        # Pipeline always uses system shell
+        if not self.in_shell:
+            if not self._enter_shell():
+                return {
+                    "success": False,
+                    "error": "Failed to enter system shell for pipeline. Try reconnecting session.",
+                    "session_id": self.id,
+                }
 
         pipeline_id = self.pipeline_counter
         self.pipeline_counter += 1

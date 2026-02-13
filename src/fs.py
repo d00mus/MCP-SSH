@@ -9,7 +9,7 @@ from src.utils import (
 )
 from src.config import (
     BUFFER_SIZE, DEFAULT_READ_MAX_LINES, MAX_READ_MAX_LINES,
-    DEFAULT_READ_MAX_CHARS, MAX_READ_MAX_CHARS,
+    DEFAULT_READ_MAX_CHARS, MAX_READ_MAX_CHARS, MAX_BUFFER_CHARS,
     DEFAULT_FILE_INSPECT_MAX_BYTES, MAX_FILE_INSPECT_MAX_BYTES,
     DEFAULT_FILE_EDIT_MAX_BYTES, MAX_FILE_EDIT_MAX_BYTES,
     MAX_INLINE_WRITE_BYTES
@@ -19,12 +19,26 @@ def _extract_between_markers(text: str, start_marker: str, end_marker: str) -> O
     if not text:
         return None
     
+    import re
+    # Try standalone lines first (most robust against echoed commands)
+    pattern = rf"^{re.escape(start_marker)}\s*$(.*?)^{re.escape(end_marker)}\s*$"
+    match = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+    
+    # Try just markers anywhere (fallback)
+    pattern_any = rf"{re.escape(start_marker)}(.*?){re.escape(end_marker)}"
+    match_any = re.search(pattern_any, text, re.DOTALL)
+    if match_any:
+        return match_any.group(1).strip()
+    
+    # Fallback for very simple cases or if markers are not on standalone lines
     start_pos = text.find(start_marker)
     if start_pos < 0:
         return None
     
-    # Content starts after the marker and any immediate newline
     content_start = start_pos + len(start_marker)
+    # Skip potential newline after marker
     if content_start < len(text) and text[content_start] == "\n":
         content_start += 1
     elif content_start < len(text) and text[content_start:content_start+2] == "\r\n":
@@ -34,8 +48,8 @@ def _extract_between_markers(text: str, start_marker: str, end_marker: str) -> O
     if end_pos < 0:
         return None
         
-    # Content ends before the marker and any trailing newline/carriage return
     content_end = end_pos
+    # Trim potential trailing newline before marker
     if content_end > content_start and text[content_end-1] == "\n":
         content_end -= 1
         if content_end > content_start and text[content_end-1] == "\r":
@@ -43,7 +57,7 @@ def _extract_between_markers(text: str, start_marker: str, end_marker: str) -> O
             
     return text[content_start:content_end]
 
-def _sync_shell(session: SSHSession, command: str, timeout: float = 30.0) -> Dict[str, Any]:
+def _sync_shell(session: SSHSession, command: str, timeout: float = 30.0, max_chars: Optional[int] = None) -> Dict[str, Any]:
     # Internal helper for synchronous shell calls (for file ops)
     return session.run_command(
         command=command,
@@ -53,7 +67,8 @@ def _sync_shell(session: SSHSession, command: str, timeout: float = 30.0) -> Dic
         startup_wait=2.0,
         hard_timeout=timeout + 10.0,
         completion_hint="prompt",
-        quiet_complete_timeout=2.0
+        quiet_complete_timeout=2.0,
+        max_chars=max_chars
     )
 
 def _read_remote_file_bytes(
@@ -105,7 +120,7 @@ def _read_remote_file_bytes(
             f"else echo '{marker_error}'; fi"
         )
 
-    shell_result = _sync_shell(session, shell_command, timeout=30.0)
+    shell_result = _sync_shell(session, shell_command, timeout=30.0, max_chars=MAX_BUFFER_CHARS)
     if not shell_result.get("success", False):
         return shell_result
     
@@ -113,13 +128,16 @@ def _read_remote_file_bytes(
     extracted = _extract_between_markers(raw_output, marker_start, marker_end)
     
     if extracted is None:
-        error_lines = raw_output.splitlines()
-        if any(line.strip() == marker_error for line in error_lines):
+        import re
+        if re.search(rf"^{re.escape(marker_error)}\s*$", raw_output, re.MULTILINE):
             return {"success": False, "error": f"remote file is not readable or missing: {path}", "session_id": session.id, "session_name": session.name}
         return {"success": False, "error": "failed to parse shell read payload (markers not found)", "session_id": session.id, "session_name": session.name}
 
     try:
-        payload_bytes = base64.b64decode(extracted, validate=False)
+        # Clean up ALL characters that are not valid base64 characters (whitespace, CR, ANSI codes, etc.)
+        import re
+        cleaned_payload = re.sub(r'[^A-Za-z0-9+/=]', '', extracted)
+        payload_bytes = base64.b64decode(cleaned_payload, validate=False)
     except Exception as exc:
         return {"success": False, "error": f"failed to decode shell base64 payload: {exc}", "session_id": session.id, "session_name": session.name}
 

@@ -173,7 +173,8 @@ def tools_list() -> Dict[str, Any]:
             "description": (
                 "Binary-safe cross-machine pipeline. Transfers RAW data (may include ANSI codes). "
                 "Always uses system shell. Supports environment variables (%TEMP%, $HOME) and tilde (~) in local paths. "
-                "Returns a pipeline_id for monitoring with pipeline_status."
+                "Returns a pipeline_id for monitoring with pipeline_status. "
+                "NOTE: On restricted devices like Keenetic, Linux commands may need 'shell ' prefix (e.g., 'shell ls /tmp')."
             ),
             "inputSchema": {
                 "type": "object",
