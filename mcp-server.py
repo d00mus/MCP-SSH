@@ -50,7 +50,7 @@ MAX_FILE_INSPECT_MAX_BYTES = 2_000_000
 DEFAULT_FILE_EDIT_MAX_BYTES = 1_000_000
 MAX_FILE_EDIT_MAX_BYTES = 5_000_000
 MAX_INLINE_WRITE_BYTES = 200000
-DEFAULT_QUIET_COMPLETE_TIMEOUT = 1.5
+DEFAULT_QUIET_COMPLETE_TIMEOUT = 2.5
 MAX_QUIET_COMPLETE_TIMEOUT = 30.0
 
 DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/bin:/opt/sbin"
@@ -117,6 +117,15 @@ def to_bool(value: Any, default: bool = False) -> bool:
 
 def iso_now() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
+
+
+def resolve_local_path(path: str) -> str:
+    if not path:
+        return ""
+    # Expand %TEMP%, $HOME, etc.
+    expanded = os.path.expanduser(os.path.expandvars(path.strip()))
+    # Make it absolute
+    return os.path.abspath(expanded)
 
 
 def safe_name(text: str) -> str:
@@ -234,29 +243,34 @@ def resolve_runtime_paths(
     }
 
 
-def has_prompt(output: str) -> bool:
+def find_prompt(output: str) -> Optional[str]:
     if not output:
-        return False
-    tail = output[-200:] if len(output) > 200 else output
-    lines = tail.rstrip().split("\n")
-    last_line = lines[-1].strip() if lines else ""
-    if not last_line:
-        return False
-
+        return None
+    # Take more context for prompt detection, especially with ANSI codes
+    tail = output[-500:] if len(output) > 500 else output
+    # Remove ANSI escape sequences
+    clean_tail = ANSI_ESCAPE.sub("", tail)
+    
     prompt_patterns = [
         # Keenetic NDMS
-        r"^\([^)]+\)\s*>\s*$",
-        r"^>\s*$",
+        r"(\([^)]+\)\s*>\s*)$",
+        r"(>\s*)$",
         # BusyBox / shell
-        r"^[/~][^\s]*\s*#\s*$",
-        r"^[/~][^\s]*\s*\$\s*$",
-        r"^root@[^:]+:[^#$]+[#$]\s*$",
-        r"^[#$]\s*$",
+        r"([/~][^\s]*\s*#\s*)$",
+        r"([/~][^\s]*\s*\$\s*)$",
+        r"([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.*[#$]\s*)$",
+        r"([#$]\s*)$",
     ]
+    
     for pattern in prompt_patterns:
-        if re.search(pattern, last_line):
-            return True
-    return False
+        match = re.search(pattern, clean_tail.rstrip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def has_prompt(output: str) -> bool:
+    return find_prompt(output) is not None
 
 
 @dataclass
@@ -290,6 +304,8 @@ class RunState:
     completion_method: str = ""
     stdin_writes: int = 0
     last_stdin_at: Optional[float] = None
+    quiet_event: threading.Event = field(default_factory=threading.Event)
+    prompt_line: str = ""
 
     def append_output(self, chunk: str) -> None:
         if not chunk:
@@ -787,10 +803,12 @@ class SSHSession:
                     self._log_run(run, "OUT", {"chunk": chunk})
 
                     # Command completion in interactive shell is prompt appearance.
-                    if has_prompt(run.output_buffer):
+                    prompt = find_prompt(run.output_buffer)
+                    if prompt:
                         run.prompt_detected = True
+                        run.prompt_line = prompt
                         completion_method = "interrupted" if run.interrupt_sent else "prompt_detected"
-                        reason = "prompt after interrupt" if run.interrupt_sent else "prompt detected"
+                        reason = f"prompt detected: {prompt}"
                         run.mark_done("completed", reason=reason, completion_method=completion_method)
                         break
                 else:
@@ -800,10 +818,12 @@ class SSHSession:
                         stdin_recent = False
                         if run.last_stdin_at is not None:
                             stdin_recent = (time.time() - run.last_stdin_at) < quiet_timeout
+                        
                         if hint in {"quiet", "either"} and run.total_received_chars > 0 and not stdin_recent:
                             if (time.time() - run.last_data_at) >= quiet_timeout:
-                                run.mark_done("completed", reason="quiet timeout", completion_method="quiet_timeout")
-                                break
+                                if not run.quiet_event.is_set():
+                                    run.quiet_event.set()
+                                    self._log_run(run, "SYS", {"event": "quiet_point_reached", "timeout": quiet_timeout})
                     time.sleep(0.05)
         except Exception as exc:
             run.mark_done("failed", reason="reader exception", error=str(exc), completion_method="failed")
@@ -895,11 +915,15 @@ class SSHSession:
 
         # Flush pending channel data before new command.
         if self.channel:
-            while self.channel.recv_ready():
-                try:
-                    self.channel.recv(BUFFER_SIZE)
-                except Exception:
-                    break
+            old_timeout = self.channel.gettimeout()
+            self.channel.settimeout(0.1)
+            try:
+                while True:
+                    if not self.channel.recv(BUFFER_SIZE):
+                        break
+            except Exception:
+                pass
+            self.channel.settimeout(old_timeout)
 
         run_id = self.run_counter
         self.run_counter += 1
@@ -966,16 +990,42 @@ class SSHSession:
         self._start_reader_thread(run)
 
         if mode == "sync":
-            wait_for = wait_timeout
+            # Wait for either REAL completion (prompt) OR quiet timeout (no data for N seconds)
+            # using a loop with small sleeps to react to both events.
+            start_wait = time.time()
+            completed_within_wait = False
+            while time.time() - start_wait < wait_timeout:
+                if run.done_event.wait(0.1):
+                    completed_within_wait = True
+                    break
+                if run.quiet_event.is_set():
+                    # We reached quiet point, but not prompt.
+                    # We return partial output, but keep still_running=True.
+                    break
         else:
-            wait_for = startup_wait
+            completed_within_wait = run.done_event.wait(startup_wait)
 
-        completed_within_wait = run.done_event.wait(wait_for)
         snapshot = run.read_slice(offset=run.buffer_base_offset, max_lines=MAX_READ_MAX_LINES, max_chars=MAX_READ_MAX_CHARS)
 
-        timed_out = (mode == "sync") and (not completed_within_wait)
-        output_complete = completed_within_wait and run.done_event.is_set()
+        timed_out = (mode == "sync") and (not completed_within_wait) and (not run.quiet_event.is_set())
+        output_complete = run.done_event.is_set()
         still_running = not run.done_event.is_set()
+
+        completion_status = "unknown"
+        if run.done_event.is_set():
+            if run.completion_method in {"prompt_detected", "interrupted"}:
+                completion_status = "prompt"
+            elif run.completion_method == "hard_timeout":
+                completion_status = "hard_timeout"
+            elif run.completion_method == "dead":
+                completion_status = "session_dead"
+            else:
+                completion_status = run.status
+        else:
+            if run.quiet_event.is_set():
+                completion_status = "quiet_timeout"
+            else:
+                completion_status = "wait_timeout"
 
         return {
             "success": True,
@@ -985,6 +1035,8 @@ class SSHSession:
             "timed_out": timed_out,
             "output_complete": output_complete,
             "still_running": still_running,
+            "quiet_point": run.quiet_event.is_set(),
+            "completion_status": completion_status,
             "status": run.status,
             "finish_reason": run.finish_reason,
             "completion_method": run.completion_method,
@@ -1003,7 +1055,7 @@ class SSHSession:
             "memory_limit_chars": MAX_TOTAL_BUFFER_CHARS,
             "memory_total_chars": manager.total_buffer_chars(),
             "message": (
-                "Command is still running. This is partial output; call read later."
+                "Command is still running (quiet point reached or wait_timeout). Use read/signal."
                 if still_running
                 else "Command completed."
             ),
@@ -1036,6 +1088,23 @@ class SSHSession:
             }
 
         snapshot = selected.read_slice(offset=offset, max_lines=max_lines, max_chars=max_chars)
+        
+        completion_status = "unknown"
+        if selected.done_event.is_set():
+            if selected.completion_method == "prompt_detected":
+                completion_status = "prompt"
+            elif selected.completion_method == "hard_timeout":
+                completion_status = "hard_timeout"
+            elif selected.completion_method == "dead":
+                completion_status = "session_dead"
+            else:
+                completion_status = selected.status
+        else:
+            if selected.quiet_event.is_set():
+                completion_status = "quiet_timeout"
+            else:
+                completion_status = "wait_timeout"
+
         return {
             "success": True,
             "session_id": self.id,
@@ -1043,6 +1112,8 @@ class SSHSession:
             "status": snapshot["status"],
             "still_running": snapshot["still_running"],
             "output_complete": snapshot["output_complete"],
+            "quiet_point": selected.quiet_event.is_set(),
+            "completion_status": completion_status,
             "finish_reason": snapshot["finish_reason"],
             "error": snapshot["error"],
             "offset_start": snapshot["offset_start"],
@@ -1792,9 +1863,9 @@ class SessionManager:
 manager: Optional[SessionManager] = None
 
 LEAN_RESPONSE_KEYS: Dict[str, tuple[str, ...]] = {
-    "run": ("success", "session_id", "run_id", "status", "still_running", "output", "output_complete"),
+    "run": ("success", "session_id", "run_id", "status", "still_running", "quiet_point", "completion_status", "output", "output_complete"),
     "exec": ("success", "session_id", "run_id", "status", "still_running", "output", "output_complete"),
-    "read": ("success", "session_id", "run_id", "status", "still_running", "output", "next_offset", "output_complete"),
+    "read": ("success", "session_id", "run_id", "status", "still_running", "quiet_point", "completion_status", "output", "next_offset", "output_complete"),
     "run_pipeline": (
         "success",
         "session_id",
@@ -2106,8 +2177,8 @@ def run_pipeline_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
     include_stderr = to_bool(args.get("include_stderr", False))
     append_stdout = to_bool(args.get("append_stdout", False))
-    local_stdout_path = (args.get("local_stdout_path", "") or "").strip()
-    local_stdin_path = (args.get("local_stdin_path", "") or "").strip()
+    local_stdout_path = resolve_local_path(args.get("local_stdout_path", "") or "")
+    local_stdin_path = resolve_local_path(args.get("local_stdin_path", "") or "")
 
     session_id = args.get("session_id")
     new_session = to_bool(args.get("new_session", False))
@@ -2478,7 +2549,7 @@ def file_dispatch(args: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": False, "error": "action must be one of: read, write, list, upload, download, edit"}
 
     path = (args.get("path", "") or "").strip()
-    local_path = (args.get("local_path", "") or "").strip()
+    local_path = resolve_local_path(args.get("local_path", "") or "")
     content = args.get("content")
     is_base64 = to_bool(args.get("is_base64", False))
     session_id = args.get("session_id")
@@ -2824,14 +2895,14 @@ def tools_list() -> Dict[str, Any]:
             "name": "run",
             "description": (
                 "Unified command execution with anti-hang timeout. "
-                "Returns compact happy-path payload; use last_command_details for full metadata if needed."
+                "Returns compact happy-path payload; use last_command_details for full metadata if needed. "
                 "Default behavior: run in CURRENT session if session_id is not provided. "
                 "Supports sync/async/stream mode, anti-hang wait_timeout, optional hard_timeout. "
                 "If wait timeout triggers, returns partial output and still_running=true. "
                 "Status: running, completed, completed_nonzero, hard_timeout, failed, dead. "
                 "For restricted devices (like Keenetic routers): set shell=true (BOOLEAN FLAG) to auto-enter full Linux shell for 'ls', 'cat', pipes etc. "
-                "Set shell=false for native router CLI (NDM). "
-                "On standard Linux servers: shell=true enables shell features (pipes, redirections, &&). "
+                "Set shell=false for native router CLI (NDM). Note: NDM CLI is syntax-strict (e.g., use 'show interface', not 'interfaces'); use '?' or 'help' for NDM hints. "
+                "On standard Linux servers: shell=true enables shell features (pipes, redirections, &&). In shell mode, use 'busybox --help' or 'ls /bin' to discover available commands. "
                 "DO NOT type the word 'shell' inside the command string."
             ),
             "inputSchema": {
@@ -2889,7 +2960,8 @@ def tools_list() -> Dict[str, Any]:
             "description": (
                 "Binary-safe cross-machine pipeline. "
                 "Best for large files or binary data transfer. "
-                "Always uses system shell for execution."
+                "Always uses system shell for execution. "
+                "Transfers RAW data (may include ANSI escape codes or shell banners)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -2907,11 +2979,11 @@ def tools_list() -> Dict[str, Any]:
                     "hard_timeout": {"type": "number", "description": "Optional hard stop timeout in seconds."},
                     "local_stdout_path": {
                         "type": "string",
-                        "description": "Local file path to write remote stdout bytes (binary-safe).",
+                        "description": "Local file path to write remote stdout bytes (binary-safe). Supports environment variables (e.g. %TEMP%, $HOME) and tilde (~).",
                     },
                     "local_stdin_path": {
                         "type": "string",
-                        "description": "Local file path to feed as remote stdin bytes (binary-safe).",
+                        "description": "Local file path to feed as remote stdin bytes (binary-safe). Supports environment variables (e.g. %TEMP%, $HOME) and tilde (~).",
                     },
                     "append_stdout": {
                         "type": "boolean",
@@ -3021,6 +3093,7 @@ def tools_list() -> Dict[str, Any]:
             "description": (
                 "File management (list, read/download, write/upload, edit) with SFTP and shell fallbacks. "
                 "Automatically handles NDM/Linux shell transitions. Use full remote paths. "
+                "Note: remote filesystem may have symlinks (e.g. /var -> /tmp) or read-only partitions. "
                 "read/download: if local_path is set -> save file locally; otherwise -> return text snippet (inspect mode). "
                 "write/upload: from local_path or small inline content. "
                 "edit: safe in-place text replacement with backup and dry_run options."
@@ -3033,7 +3106,7 @@ def tools_list() -> Dict[str, Any]:
                     "local_path": {
                         "type": "string",
                         "description": (
-                            "Local file path for side-effect transfer. "
+                            "Local file path for side-effect transfer. Supports environment variables (e.g. %TEMP%, $HOME) and tilde (~). "
                             "For read/download: destination local path. "
                             "For write/upload: source local path."
                         ),
