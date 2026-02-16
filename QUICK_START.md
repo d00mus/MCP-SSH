@@ -87,13 +87,12 @@ Try asking your AI:
 
 ## 💡 Important Tips
 
-1. **Shell Mode**: For any command with `|`, `&&`, `||`, or `if/else`, the agent must set `shell: true`.
-2. **Keenetic**: If you are using a Keenetic router, the server will automatically handle the transition from restricted CLI to Linux shell when `shell: true` is requested.
-3. **Passwords**: Ensure your password doesn't contain characters that might need shell escaping in your local environment.
-4. **Lean responses by default**: tools now return compact payloads. Use `last_command_details` only for debugging ambiguous command outcomes.
+1. **Optimized for Efficiency**: This server is specifically tuned for low token usage and works great with local LLMs. Responses are lean; use `last_command_details` only if something goes wrong.
+2. **Shell Mode**: For any command with `|`, `&&`, `||`, or `if/else`, the agent must set `shell: true`.
+3. **Keenetic**: If you are using a Keenetic router, the server will automatically handle the transition from restricted CLI to Linux shell when `shell: true` is requested.
+4. **Auto-Recovery**: You don't need to manage sessions manually. The `run` tool will auto-create or recover sessions if needed, minimizing tool-call overhead.
 5. **Cache location**: default is `<project-root>/.ssh-cache` (project root = process cwd). Override via `--cache-dir` or `SSH_MCP_CACHE_DIR`.
 6. **File tool workflow**:
-   - `file.read` with `local_path` downloads file (metadata only in response).
-   - `file.read` without `local_path` is inspect mode (line window + filters).
-   - `file.write/upload` uses `local_path` for full files, or inline `content` for small files.
-   - `file.edit` performs in-place text replacements for existing remote text files.
+   - `file.read` with `local_path` downloads file.
+   - `file.read` without `local_path` is for inspection.
+   - `file.edit` performs in-place text replacements—ideal for quick fixes without re-uploading.

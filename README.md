@@ -6,10 +6,12 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 
 ## 🚀 Key Features
 
+- **Optimized for Weak & Local Models**: Designed to work reliably with smaller or local LLMs by providing clear, unambiguous tool structures and compact responses.
+- **Token-Saving Architecture**: "Ultra-Lean" payloads by default minimize token consumption, extending the effective context window of your AI agent.
+- **Agent-Friendly Toolset**: Minimized tool-call overhead—session auto-recovery, automatic shell detection (e.g., for Keenetic), and anti-hang timeouts are all handled internally.
 - **Persistent Multi-session Management**: Keep multiple SSH sessions open and switch between them (like `tmux` for your AI).
 - **Anti-Hang Architecture**: Integrated `wait_timeout` prevents the AI agent from freezing on long-running commands.
 - **Unified Execution Model**: A single `run` tool handles synchronous, asynchronous, and streaming execution.
-- **Lean-by-Default Responses**: Tools return compact happy-path payloads for lower token usage.
 - **On-Demand Verbose Debugging**: Use `last_command_details` only when execution context needs deep inspection.
 - **Docker Ready**: Run without Python installation using a simple Docker container.
 - **Binary-Safe Pipelines**: Reliable file transfers bypassing terminal encoding issues.
@@ -144,9 +146,9 @@ Environment variable:
 ## 📦 Response Model
 
 Tools now return compact JSON by default. Typical happy-path fields are:
-- `run`: `success`, `session_id`, `run_id`, `status`, `still_running`, `output`, `output_complete`
-- `read`: `success`, `session_id`, `run_id`, `status`, `still_running`, `output`, `next_offset`, `output_complete`
-- `run_pipeline` / `pipeline_status`: `success`, `session_id`, `pipeline_id`, `status`, `still_running`, `written_complete`, `preview`, `next_offset`, `exit_status`
+- `run` / `read`: `output`, `session_id`, `run_id`, `status` (plus `next_offset` for `read`)
+- `run_pipeline` / `pipeline_status`: `output` (preview), `session_id`, `pipeline_id`, `status`, `next_offset`, `bytes_written`, `bytes_sent`
+- `file`: `output` (content or listing), `session_id`, `status`, plus action-specific fields like `size` or `message`.
 
 If you need full metadata (timeouts, memory counters, session selection details, etc.), call `last_command_details` once for debugging and continue with normal compact flow.
 
@@ -165,9 +167,11 @@ Passwords are passed as command-line arguments. In Docker mode, they are isolate
 
 ## 💡 Pro Tips
 
+- **Local Models**: If you use local models (like Qwen 3 or Devstral 2), this server's compact responses significantly improve their reliability by reducing context noise.
 - **Complex commands**: If you need pipes (`|`) or logic (`&&`, `||`), always tell the agent to use `shell: true`.
 - **Filtering**: Use `cat file | grep pattern` instead of the `read` tool filters for better performance.
 - **Large files**: Use `run_pipeline` for transferring files; it's much faster and safer than `cat`.
+- **Minimize Calls**: Don't worry about sessions; the `run` tool will auto-create or recover them if you don't provide a `session_id`.
 
 ## 📄 License
 MIT
