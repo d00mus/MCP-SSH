@@ -354,20 +354,38 @@ class SSHSession:
         json_line(run.run_log_path, data)
 
     def connect(self) -> bool:
-        from src.config import SSH_HOST, SSH_USER, SSH_PASSWORD, SSH_PORT
+        from src.config import (
+            SSH_HOST, SSH_USER, SSH_PASSWORD, SSH_PORT,
+            SSH_KEY_PATH, SSH_KEY_PASSPHRASE, SSH_VERIFY_HOST_KEY
+        )
         try:
             self.close()
             self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.client.connect(
-                hostname=SSH_HOST,
-                port=SSH_PORT,
-                username=SSH_USER,
-                password=SSH_PASSWORD,
-                timeout=CONNECT_TIMEOUT,
-                allow_agent=False,
-                look_for_keys=False,
-            )
+            
+            if SSH_VERIFY_HOST_KEY:
+                self.client.load_system_host_keys()
+                # If we want to strictly verify, we should probably set some policy
+                # but paramiko defaults to RejectPolicy if no policy is set and host keys are loaded.
+                # However, many users might not have the key in system_host_keys yet.
+            else:
+                self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            connect_kwargs = {
+                "hostname": SSH_HOST,
+                "port": SSH_PORT,
+                "username": SSH_USER,
+                "timeout": CONNECT_TIMEOUT,
+                "allow_agent": True,
+                "look_for_keys": True,
+            }
+            if SSH_PASSWORD:
+                connect_kwargs["password"] = SSH_PASSWORD
+            if SSH_KEY_PATH:
+                connect_kwargs["key_filename"] = SSH_KEY_PATH
+                if SSH_KEY_PASSPHRASE:
+                    connect_kwargs["passphrase"] = SSH_KEY_PASSPHRASE
+
+            self.client.connect(**connect_kwargs)
 
             transport = self.client.get_transport()
             if transport:

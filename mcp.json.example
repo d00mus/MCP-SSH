@@ -13,7 +13,22 @@
       ]
     },
     
-    "linux-server": {
+    "linux-server-key": {
+      "command": "python",
+      "args": [
+        "/path/to/mcp-server.py",
+        "--project-root", "/workspace/my-project",
+        "--host", "my-server.example.com",
+        "--user", "myuser",
+        "--key", "/home/myuser/.ssh/id_rsa",
+        "--passphrase", "OPTIONAL_KEY_PASSPHRASE",
+        "--verify-host",
+        "--port", "2222",
+        "--cache-dir", "/var/tmp/mcp-cache"
+      ]
+    },
+    
+    "linux-server-password": {
       "command": "python",
       "args": [
         "/path/to/mcp-server.py",

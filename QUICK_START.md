@@ -28,11 +28,13 @@ Edit `.cursor/mcp.json`:
       "args": [
         "run", "-i", "--rm",
         "-v", "D:/path/to/project:/workspace",
+        "-v", "C:/Users/me/.ssh:/home/mcp/.ssh:ro",
         "-w", "/workspace",
         "mcp-ssh-server",
-        "--host", "192.168.1.1",
-        "--user", "admin",
-        "--password", "YOUR_PASSWORD"
+        "--host", "my-server.example.com",
+        "--user", "myuser",
+        "--key", "/home/mcp/.ssh/id_rsa",
+        "--verify-host"
       ]
     }
   }
@@ -49,7 +51,8 @@ Edit `.cursor/mcp.json`:
         "D:/path/to/mcp-server.py",
         "--host", "192.168.1.1",
         "--user", "admin",
-        "--password", "YOUR_PASSWORD"
+        "--key", "C:/Users/me/.ssh/id_rsa",
+        "--verify-host"
       ]
     }
   }

@@ -20,17 +20,26 @@ def main() -> None:
     )
     parser.add_argument("--host", required=True, help="SSH host")
     parser.add_argument("--user", required=True, help="SSH username")
-    parser.add_argument("--password", required=True, help="SSH password")
+    parser.add_argument("--password", help="SSH password")
+    parser.add_argument("--key", help="Path to SSH private key")
+    parser.add_argument("--passphrase", help="Passphrase for SSH private key")
+    parser.add_argument("--verify-host", action="store_true", help="Verify SSH host key (default: False)")
     parser.add_argument("--port", type=int, default=22, help="SSH port")
     parser.add_argument("--path", help="Additional PATH to export in shell")
     parser.add_argument("--project-root", help="Project root for local state")
     parser.add_argument("--cache-dir", help="Optional cache root override")
     args = parser.parse_args()
 
+    if not args.password and not args.key:
+        parser.error("Either --password or --key must be provided")
+
     config.SSH_HOST = args.host
     config.SSH_USER = args.user
     config.SSH_PASSWORD = args.password
     config.SSH_PORT = args.port
+    config.SSH_KEY_PATH = args.key
+    config.SSH_KEY_PASSPHRASE = args.passphrase
+    config.SSH_VERIFY_HOST_KEY = args.verify_host
     config.EXTRA_PATH = args.path
 
     runtime_paths = resolve_runtime_paths(project_root_arg=args.project_root, cache_dir_arg=args.cache_dir)

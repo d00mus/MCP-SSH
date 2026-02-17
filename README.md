@@ -69,6 +69,20 @@ Add this to your `.cursor/mcp.json`:
         "--user", "admin",
         "--password", "YOUR_PASSWORD"
       ]
+    },
+    "linux-server-key": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "D:/path/to/project:/workspace",
+        "-v", "C:/Users/me/.ssh:/home/mcp/.ssh:ro",
+        "-w", "/workspace",
+        "mcp-ssh-server",
+        "--host", "my-server.example.com",
+        "--user", "myuser",
+        "--key", "/home/mcp/.ssh/id_rsa",
+        "--verify-host"
+      ]
     }
   }
 }
@@ -134,7 +148,10 @@ mcpServers:
 
 - `--host` (required): SSH host address.
 - `--user` (required): SSH username.
-- `--password` (required): SSH password.
+- `--password` (optional): SSH password. Either `--password` or `--key` must be provided.
+- `--key` (optional): Path to SSH private key.
+- `--passphrase` (optional): Passphrase for the SSH private key.
+- `--verify-host` (optional): Enable SSH host key verification (default: `False`).
 - `--port` (optional): SSH port (default: 22).
 - `--path` (optional): Additional `PATH` (e.g., `/opt/bin:/opt/sbin` for Entware).
 - `--project-root` (optional): Local project root for cache/log placement (default: process `cwd`).
@@ -163,7 +180,7 @@ This keeps data isolated per project and avoids cross-project log mixing.
 
 ## ⚠️ Security Note
 
-Passwords are passed as command-line arguments. In Docker mode, they are isolated within the container call, but still visible in your `mcp.json` or `config.yaml`. **Never commit your configuration files with secrets to public repositories!**
+Secrets (passwords, key paths, or passphrases) are passed as command-line arguments. In Docker mode, they are isolated within the container call, but still visible in your `mcp.json` or `config.yaml`. **Never commit your configuration files with secrets to public repositories!** For best security, use SSH keys with a volume mount in Docker.
 
 ## 💡 Pro Tips
 
