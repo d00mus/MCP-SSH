@@ -41,7 +41,7 @@ Edit `.cursor/mcp.json`:
 }
 ```
 
-**Python:**
+**Python (Secure):**
 ```json
 {
   "mcpServers": {
@@ -50,10 +50,12 @@ Edit `.cursor/mcp.json`:
       "args": [
         "D:/path/to/mcp-server.py",
         "--host", "192.168.1.1",
-        "--user", "admin",
-        "--key", "C:/Users/me/.ssh/id_rsa",
-        "--verify-host"
-      ]
+        "--user", "admin"
+      ],
+      "env": {
+        "SSH_KEY_PATH": "C:/Users/me/.ssh/id_rsa",
+        "SSH_VERIFY_HOST_KEY": "true"
+      }
     }
   }
 }

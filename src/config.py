@@ -1,3 +1,4 @@
+import os
 import re
 from typing import Optional, Dict
 
@@ -30,20 +31,37 @@ MAX_QUIET_COMPLETE_TIMEOUT = 30.0
 
 DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/bin:/opt/sbin"
 
-# ========= Runtime connection config (to be set in main) =========
-SSH_HOST: Optional[str] = None
-SSH_USER: Optional[str] = None
-SSH_PASSWORD: Optional[str] = None
-SSH_PORT = 22
-SSH_KEY_PATH: Optional[str] = None
-SSH_KEY_PASSPHRASE: Optional[str] = None
-SSH_VERIFY_HOST_KEY: bool = False
-EXTRA_PATH: Optional[str] = None
-PROJECT_ROOT: str = ""
-PROJECT_TAG: str = ""
-CACHE_DIRS: Dict[str, str] = {}
-
 # ========= Output cleanup =========
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 PROMPT_ONLY_LINE = re.compile(r"^\s*(\([^)]*\)\s*[>#]?|[>#])\s*$")
+
+# ========= Runtime Configuration =========
+class ServerConfig:
+    def __init__(self):
+        self.SSH_HOST: Optional[str] = None
+        self.SSH_USER: Optional[str] = None
+        self.SSH_PASSWORD: Optional[str] = None
+        self.SSH_PORT: int = 22
+        self.SSH_KEY_PATH: Optional[str] = None
+        self.SSH_KEY_PASSPHRASE: Optional[str] = None
+        self.SSH_VERIFY_HOST_KEY: bool = True  # Changed default to True for security
+        self.EXTRA_PATH: Optional[str] = None
+        self.PROJECT_ROOT: str = ""
+        self.PROJECT_TAG: str = ""
+        self.CACHE_DIRS: Dict[str, str] = {}
+
+    def load_from_env(self):
+        self.SSH_HOST = os.environ.get("SSH_HOST", self.SSH_HOST)
+        self.SSH_USER = os.environ.get("SSH_USER", self.SSH_USER)
+        self.SSH_PASSWORD = os.environ.get("SSH_PASSWORD", self.SSH_PASSWORD)
+        self.SSH_PORT = int(os.environ.get("SSH_PORT", self.SSH_PORT))
+        self.SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", self.SSH_KEY_PATH)
+        self.SSH_KEY_PASSPHRASE = os.environ.get("SSH_KEY_PASSPHRASE", self.SSH_KEY_PASSPHRASE)
+        
+        verify_host_env = os.environ.get("SSH_VERIFY_HOST_KEY")
+        if verify_host_env is not None:
+             self.SSH_VERIFY_HOST_KEY = verify_host_env.lower() in ("true", "1", "yes")
+
+# Global instance
+config = ServerConfig()

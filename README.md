@@ -16,7 +16,8 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 - **Docker Ready**: Run without Python installation using a simple Docker container.
 - **Binary-Safe Pipelines**: Reliable file transfers bypassing terminal encoding issues.
 - **Background Buffering**: Continuous output caching even when the agent isn't polling.
-- **Keenetic/Netcraze Aware**: Specialized logic for entering Linux shell from restricted CLI and prompt detection.
+- **Keenetic/Netcraze Aware**: Specialized logic for entering Linux shell from restricted CLI, prompt detection, and automatic pagination handling.
+- **Secure & Sandboxed**: Path access is strictly confined to the project root, and credentials can be securely passed via environment variables.
 
 ## 🛠 Tools
 
@@ -88,7 +89,7 @@ Add this to your `.cursor/mcp.json`:
 }
 ```
 
-#### Using Python
+#### Using Python (Secure Env Vars)
 ```json
 {
   "mcpServers": {
@@ -97,9 +98,11 @@ Add this to your `.cursor/mcp.json`:
       "args": [
         "/absolute/path/to/mcp-server.py",
         "--host", "192.168.1.1",
-        "--user", "admin",
-        "--password", "YOUR_PASSWORD"
-      ]
+        "--user", "admin"
+      ],
+      "env": {
+        "SSH_PASSWORD": "YOUR_PASSWORD"
+      }
     }
   }
 }
@@ -144,21 +147,22 @@ mcpServers:
       - "YOUR_PASSWORD"
 ```
 
-## ⌨️ CLI Arguments
+## ⌨️ CLI Arguments & Environment Variables
 
-- `--host` (required): SSH host address.
-- `--user` (required): SSH username.
-- `--password` (optional): SSH password. Either `--password` or `--key` must be provided.
-- `--key` (optional): Path to SSH private key.
-- `--passphrase` (optional): Passphrase for the SSH private key.
-- `--verify-host` (optional): Enable SSH host key verification (default: `False`).
-- `--port` (optional): SSH port (default: 22).
-- `--path` (optional): Additional `PATH` (e.g., `/opt/bin:/opt/sbin` for Entware).
-- `--project-root` (optional): Local project root for cache/log placement (default: process `cwd`).
-- `--cache-dir` (optional): Override cache base path. Server writes to `<cache-dir>/<project-tag-hash>/...`.
+Most configuration can be set via CLI arguments or Environment Variables. Env vars are recommended for secrets.
 
-Environment variable:
-- `SSH_MCP_CACHE_DIR` (optional): Same behavior as `--cache-dir` when CLI arg is omitted.
+| CLI Argument | Environment Variable | Description |
+|--------------|----------------------|-------------|
+| `--host` | `SSH_HOST` | SSH host address. |
+| `--user` | `SSH_USER` | SSH username. |
+| `--password` | `SSH_PASSWORD` | SSH password. |
+| `--key` | `SSH_KEY_PATH` | Path to SSH private key. |
+| `--passphrase` | `SSH_KEY_PASSPHRASE` | Passphrase for the SSH private key. |
+| `--verify-host` | `SSH_VERIFY_HOST_KEY` | Enable SSH host key verification (default: `True`). Use `--no-verify-host` to disable. |
+| `--port` | `SSH_PORT` | SSH port (default: 22). |
+| `--path` | `EXTRA_PATH` | Additional `PATH` (e.g., `/opt/bin:/opt/sbin` for Entware). |
+| `--project-root` | `PROJECT_ROOT` | Local project root for cache/log placement (default: process `cwd`). |
+| `--cache-dir` | `SSH_MCP_CACHE_DIR` | Override cache base path. |
 
 ## 📦 Response Model
 
@@ -180,7 +184,13 @@ This keeps data isolated per project and avoids cross-project log mixing.
 
 ## ⚠️ Security Note
 
-Secrets (passwords, key paths, or passphrases) are passed as command-line arguments. In Docker mode, they are isolated within the container call, but still visible in your `mcp.json` or `config.yaml`. **Never commit your configuration files with secrets to public repositories!** For best security, use SSH keys with a volume mount in Docker.
+Secrets (passwords, key paths, or passphrases) should be passed via **Environment Variables** (`SSH_PASSWORD`, `SSH_KEY_PASSPHRASE`) whenever possible to avoid them appearing in process listings (`ps aux`). While CLI arguments are supported for backward compatibility, they are less secure.
+
+In Docker mode, use volume mounts for SSH keys and environment variables for passwords. **Never commit your configuration files with secrets to public repositories!**
+
+## 🛡️ Sandboxing
+
+File operations (`file` tool) and path resolution are strictly sandboxed to the `project-root`. Accessing files outside this directory (e.g., via `../../`) is blocked by default.
 
 ## 💡 Pro Tips
 

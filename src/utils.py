@@ -7,7 +7,7 @@ import hashlib
 from datetime import datetime
 from typing import Any, Dict, Optional, List
 from src.config import (
-    ANSI_ESCAPE, CONTROL_CHARS, PROMPT_ONLY_LINE, MAX_READ_MAX_LINES
+    ANSI_ESCAPE, CONTROL_CHARS, PROMPT_ONLY_LINE, MAX_READ_MAX_LINES, config
 )
 
 def log_error(message: str) -> None:
@@ -56,7 +56,23 @@ def resolve_local_path(path: str) -> str:
     if not path:
         return ""
     expanded = os.path.expanduser(os.path.expandvars(path.strip()))
-    return os.path.abspath(expanded)
+    absolute_path = os.path.abspath(expanded)
+    
+    # Sandboxing check
+    project_root = os.path.abspath(config.PROJECT_ROOT) if config.PROJECT_ROOT else ""
+    if project_root:
+        # Check if the resolved path starts with the project root
+        common_prefix = os.path.commonpath([project_root, absolute_path])
+        if common_prefix != project_root:
+            # Allow temp directory as a special exception if needed, or strict sandbox?
+            # For now, let's just log a warning and return empty to simulate "not found/blocked"
+            # or raise an error. Returning empty string is safer to fail gracefully.
+            # But the user might want explicit failure. 
+            # Let's enforce it strictly.
+            log_error(f"Security: Path '{path}' resolves to '{absolute_path}' which is outside project root '{project_root}'. Access denied.")
+            return ""
+            
+    return absolute_path
 
 def safe_name(text: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", text.strip())
@@ -120,20 +136,40 @@ def resolve_runtime_paths(
 def find_prompt(output: str) -> Optional[str]:
     if not output:
         return None
-    tail = output[-500:] if len(output) > 500 else output
+    
+    # 1. Clean ANSI from a larger chunk (e.g., last 2000 chars)
+    # This prevents ANSI codes from hiding the prompt or splitting it
+    chunk_size = 2000
+    tail = output[-chunk_size:] if len(output) > chunk_size else output
+    
+    # Remove ANSI codes *first*
     clean_tail = ANSI_ESCAPE.sub("", tail)
+    
+    # 2. Lookback window
+    # We want to match prompts at the end of the clean text.
+    # The prompt might be "user@host:~$ " or just "> "
+    
     prompt_patterns = [
-        r"(\([^)]+\)\s*>\s*)$",
-        r"(>\s*)$",
-        r"([/~][^\s]*\s*#\s*)$",
-        r"([/~][^\s]*\s*\$\s*)$",
-        r"([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.*[#$]\s*)$",
-        r"([#$]\s*)$",
+        r"(\([^)]+\)\s*>\s*)$", # (config)>
+        r"(>\s*)$",             # >
+        r"([/~][^\s]*\s*#\s*)$", # /path #
+        r"([/~][^\s]*\s*\$\s*)$", # /path $
+        r"([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.*[#$]\s*)$", # user@host:path$
+        r"([#$]\s*)$",           # # or $
     ]
+    
+    clean_tail_stripped = clean_tail.rstrip()
+    if not clean_tail_stripped:
+         # If stripping removes everything, it might be just whitespace after a prompt? 
+         # Or empty. Let's try matching on the non-stripped tail if it ends with space
+         pass
+
+    # Check against stripped end first
     for pattern in prompt_patterns:
-        match = re.search(pattern, clean_tail.rstrip())
+        match = re.search(pattern, clean_tail_stripped)
         if match:
             return match.group(1)
+            
     return None
 
 def has_prompt(output: str) -> bool:
