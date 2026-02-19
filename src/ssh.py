@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional, List
 import paramiko
+import codecs
 
 from src.config import (
     CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, BUFFER_SIZE, HEALTH_CHECK_INTERVAL,
@@ -238,11 +239,13 @@ class PipelineState:
     preview_buffer: str = ""
     preview_base_offset: int = 0
     shared_preview_cursor: int = 0
+    
+    decoder: Any = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")(errors="replace"))
 
     def append_remote_bytes(self, chunk: bytes) -> None:
         if not chunk:
             return
-        preview = chunk.decode("utf-8", errors="replace")
+        preview = self.decoder.decode(chunk)
         with self.lock:
             self.bytes_written += len(chunk)
             self.last_data_at = time.time()
@@ -545,9 +548,11 @@ class SSHSession:
                 time.sleep(0.3)
                 output = ""
                 start = time.time()
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 while time.time() - start < 2.0:
                     if self.channel.recv_ready():
-                        chunk = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+                        chunk_bytes = self.channel.recv(BUFFER_SIZE)
+                        chunk = decoder.decode(chunk_bytes)
                         output += chunk
                         if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()):
                             self.in_shell = True
@@ -563,8 +568,9 @@ class SSHSession:
             self.channel.send("exec sh\n")
             time.sleep(0.5)
             output = ""
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             if self.channel.recv_ready():
-                output = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+                output = decoder.decode(self.channel.recv(BUFFER_SIZE))
             if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()):
                 self.in_shell = True
                 self._log_session("SYS", {"event": "enter_shell_ok", "method": "exec sh"})
@@ -599,9 +605,10 @@ class SSHSession:
                 time.sleep(0.3)
                 output = ""
                 start = time.time()
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 while time.time() - start < 2.0:
                     if self.channel.recv_ready():
-                        chunk = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+                        chunk = decoder.decode(self.channel.recv(BUFFER_SIZE))
                         output += chunk
                         if re.search(r"(\(.*\))?>\s*$", output.rstrip()) or re.search(r"^[>#]\s*$", output.strip()):
                             self.in_shell = False
@@ -620,6 +627,7 @@ class SSHSession:
     def _reader_loop(self, run: RunState) -> None:
         self._log_run(run, "SYS", {"event": "reader_started"})
         hard_deadline = (run.started_at + run.hard_timeout) if run.hard_timeout > 0 else None
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         try:
             while not run.done_event.is_set():
@@ -642,7 +650,8 @@ class SSHSession:
                         run.set_recv_paused(False)
 
                 if self.channel and self.channel.recv_ready():
-                    chunk = self.channel.recv(BUFFER_SIZE).decode("utf-8", errors="replace")
+                    chunk_bytes = self.channel.recv(BUFFER_SIZE)
+                    chunk = decoder.decode(chunk_bytes)
                     run.append_output(chunk)
                     self._log_run(run, "OUT", {"chunk": chunk})
 
@@ -679,6 +688,31 @@ class SSHSession:
                 if self.active_run_id == run.run_id:
                     self.active_run_id = None
                 self.last_run_id = run.run_id
+
+    def _cleanup_old_runs(self) -> None:
+        with self.lock:
+            # Cleanup runs
+            run_ids = sorted(self.runs.keys())
+            if len(run_ids) > 10:
+                for rid in run_ids[:-10]:
+                    r = self.runs[rid]
+                    if rid != self.active_run_id and r.done_event.is_set():
+                        # To free up memory completely
+                        with r.lock:
+                            r.output_buffer = ""
+                        del self.runs[rid]
+                        self.reader_threads.pop(rid, None)
+            
+            # Cleanup pipelines
+            pipe_ids = sorted(self.pipelines.keys())
+            if len(pipe_ids) > 10:
+                for pid in pipe_ids[:-10]:
+                    p = self.pipelines[pid]
+                    if pid != self.active_pipeline_id and p.done_event.is_set():
+                        with p.lock:
+                            p.preview_buffer = ""
+                        del self.pipelines[pid]
+                        self.pipeline_threads.pop(pid, None)
 
     def run_command(
         self,
@@ -724,6 +758,7 @@ class SSHSession:
 
         run_id = self.run_counter
         self.run_counter += 1
+        self._cleanup_old_runs()
         run = RunState(
             run_id=run_id, session_id=self.id, command=command, mode=mode,
             started_at=time.time(), wait_timeout=wait_timeout, startup_wait=startup_wait,
@@ -890,6 +925,7 @@ class SSHSession:
             if not self._enter_shell(): return {"success": False, "error": "Failed to enter shell", "session_id": self.id}
         pipeline_id = self.pipeline_counter
         self.pipeline_counter += 1
+        self._cleanup_old_runs()
         p = PipelineState(
             pipeline_id=pipeline_id, session_id=self.id, command=command, mode=mode, started_at=time.time(),
             wait_timeout=wait_timeout, startup_wait=startup_wait, hard_timeout=hard_timeout,

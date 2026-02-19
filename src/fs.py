@@ -372,27 +372,34 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             # Try exact match first
             occurrences = updated_text.count(old_text)
             
-            # If no match, try normalizing both to \n and matching
-            if occurrences == 0:
-                normalized_updated = updated_text.replace("\r\n", "\n")
-                normalized_old = old_text.replace("\r\n", "\n")
-                if normalized_updated.count(normalized_old) > 0:
-                    # If normalized match found, use the normalized version for this and subsequent edits
-                    updated_text = normalized_updated
-                    old_text = normalized_old
-                    new_text = new_text.replace("\r\n", "\n")
-                    occurrences = updated_text.count(old_text)
+            if occurrences > 0:
+                if not replace_all and occurrences != 1:
+                    return {"success": False, "error": f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences"}
+                if replace_all:
+                    updated_text = updated_text.replace(old_text, new_text)
+                    total_replacements += occurrences
+                else:
+                    updated_text = updated_text.replace(old_text, new_text, 1)
+                    total_replacements += 1
+                continue
+            
+            # If no exact match, try flexible newline matching without destroying CRLF in the whole file
+            import re
+            escaped_old = re.escape(old_text.replace("\r\n", "\n"))
+            pattern_str = escaped_old.replace(r"\n", r"\r?\n")
+            
+            pattern = re.compile(pattern_str)
+            matches = list(pattern.finditer(updated_text))
+            occurrences = len(matches)
 
-            if occurrences == 0: return {"success": False, "error": f"old_text not found for edit at index {idx}. Hint: check for exact whitespace/line endings."}
+            if occurrences == 0:
+                return {"success": False, "error": f"old_text not found for edit at index {idx}. Hint: check for exact whitespace/line endings."}
+            
             if not replace_all and occurrences != 1:
                 return {"success": False, "error": f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences"}
 
-            if replace_all:
-                updated_text = updated_text.replace(old_text, new_text)
-                total_replacements += occurrences
-            else:
-                updated_text = updated_text.replace(old_text, new_text, 1)
-                total_replacements += 1
+            updated_text = pattern.sub(lambda m: new_text, updated_text, count=0 if replace_all else 1)
+            total_replacements += occurrences
 
         updated_bytes = updated_text.encode("utf-8")
         changed = updated_bytes != original_bytes
