@@ -150,7 +150,8 @@ def tools_list() -> Dict[str, Any]:
                 "Possible statuses: 'completed' (done), 'running' (wait_timeout reached, data flowing), "
                 "'stalled' (quiet_timeout reached, no new data), 'failed' (error), 'dead' (session closed). "
                 "For restricted devices (Keenetic): set shell=true for Linux shell, shell=false for NDM CLI. "
-                "On Linux: shell=true enables pipes/redirections."
+                "On Linux: shell=true enables pipes/redirections. "
+                "NOTE: use_pty=false or run_pipeline is recommended if you need strict separation of stdout and stderr."
             ),
             "inputSchema": {
                 "type": "object",
@@ -161,6 +162,8 @@ def tools_list() -> Dict[str, Any]:
                     "wait_timeout": {"type": "number", "description": "Max seconds to wait for output in this call."},
                     "startup_wait": {"type": "number", "description": "For async/stream: short initial wait before returning."},
                     "hard_timeout": {"type": "number", "description": "Optional max command lifetime. 0 disables."},
+                    "background": {"type": "boolean", "description": "If true, immediately unblocks the session after launching, ignoring wait_timeout."},
+                    "use_pty": {"type": "boolean", "description": "Default true. Set false to disable PTY and strictly separate stdout/stderr."},
                     "session_id": session_id_param,
                     "new_session": {"type": "boolean", "description": "Create a new session and run there immediately."},
                     "session_name": {"type": "string", "description": "Optional name for new/recovery session."},
@@ -282,6 +285,8 @@ def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     wait_timeout = args.get("wait_timeout", DEFAULT_WAIT_TIMEOUT)
     startup_wait = args.get("startup_wait", DEFAULT_STARTUP_WAIT)
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
+    background = to_bool(args.get("background", False))
+    use_pty = to_bool(args.get("use_pty", True))
     completion_hint = args.get("completion_hint", "either")
     quiet_complete_timeout = args.get("quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
 
@@ -369,7 +374,8 @@ def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     result = session.run_command(
         command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
         startup_wait=startup_wait, hard_timeout=hard_timeout,
-        completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout
+        completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
+        background=background, use_pty=use_pty
     )
     if result.get("success"):
         result["session_created"] = session_created

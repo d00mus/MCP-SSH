@@ -107,6 +107,11 @@ class RunState:
     last_stdin_at: Optional[float] = None
     quiet_event: threading.Event = field(default_factory=threading.Event)
     prompt_line: str = ""
+    
+    exec_channel: Optional[Any] = None
+    exec_stdout: Optional[Any] = None
+    exec_stderr: Optional[Any] = None
+    exit_status: Optional[int] = None
 
     def append_output(self, chunk: str) -> None:
         if not chunk:
@@ -526,11 +531,29 @@ class SSHSession:
             self._mark_dead(f"health check failed: {exc}")
             return False
 
+    def reconnect(self) -> bool:
+        self._log_session("SYS", {"event": "reconnecting"})
+        with self.lock:
+            self.is_dead = False
+            self.death_reason = ""
+            self.in_shell = False
+            if self.active_run_id is not None:
+                r = self.runs.get(self.active_run_id)
+                if r:
+                    r.mark_done("failed", reason="session reconnected", completion_method="reconnect")
+                self.active_run_id = None
+            if self.active_pipeline_id is not None:
+                p = self.pipelines.get(self.active_pipeline_id)
+                if p:
+                    p.mark_done("failed", reason="session reconnected", completion_method="reconnect")
+                self.active_pipeline_id = None
+        return self.connect()
+
     def ensure_alive(self) -> Optional[str]:
-        if self.is_dead:
-            return f"Session {self.id} is DEAD: {self.death_reason}. Close it with session_close."
-        if not self.check_health():
-            return f"Session {self.id} is DEAD: {self.death_reason}. Close it with session_close."
+        if self.is_dead or not self.check_health():
+            log_error(f"Session {self.id} is dead. Attempting to reconnect...")
+            if not self.reconnect():
+                return f"Session {self.id} is DEAD: {self.death_reason}. Close it with session_close."
         return None
 
     def _enter_shell(self) -> bool:
@@ -588,6 +611,11 @@ class SSHSession:
 
     def _start_reader_thread(self, run: RunState):
         thread = threading.Thread(target=self._reader_loop, args=(run,), daemon=True)
+        self.reader_threads[run.run_id] = thread
+        thread.start()
+
+    def _start_exec_reader_thread(self, run: RunState):
+        thread = threading.Thread(target=self._exec_reader_loop, args=(run,), daemon=True)
         self.reader_threads[run.run_id] = thread
         thread.start()
 
@@ -689,6 +717,69 @@ class SSHSession:
                     self.active_run_id = None
                 self.last_run_id = run.run_id
 
+    def _exec_reader_loop(self, run: RunState) -> None:
+        self._log_run(run, "SYS", {"event": "exec_reader_started"})
+        hard_deadline = (run.started_at + run.hard_timeout) if run.hard_timeout > 0 else None
+        decoder_out = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        decoder_err = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+        try:
+            channel = run.exec_channel
+            while not run.done_event.is_set():
+                if self.is_dead:
+                    run.mark_done("dead", reason=self.death_reason, error=self.death_reason, completion_method="dead")
+                    break
+
+                if hard_deadline is not None and time.time() >= hard_deadline:
+                    run.interrupt_sent = True
+                    try: channel.close()
+                    except: pass
+                    run.mark_done("hard_timeout", reason="hard timeout reached", completion_method="hard_timeout")
+                    break
+
+                if _buffer_checker and not _buffer_checker(BUFFER_SIZE):
+                    run.set_recv_paused(True, "memory_limit")
+                    time.sleep(0.1)
+                    continue
+                else:
+                    if run.recv_paused:
+                        run.set_recv_paused(False)
+
+                has_data = False
+                if channel and channel.recv_ready():
+                    chunk_bytes = channel.recv(BUFFER_SIZE)
+                    chunk = decoder_out.decode(chunk_bytes)
+                    run.append_output(chunk)
+                    self._log_run(run, "OUT", {"chunk": chunk})
+                    has_data = True
+
+                if channel and channel.recv_stderr_ready():
+                    chunk_bytes = channel.recv_stderr(BUFFER_SIZE)
+                    chunk = decoder_err.decode(chunk_bytes)
+                    run.append_output(chunk)
+                    self._log_run(run, "ERR", {"chunk": chunk})
+                    has_data = True
+
+                if channel and channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    run.exit_status = channel.recv_exit_status()
+                    run.mark_done("completed" if run.exit_status == 0 else "completed_nonzero", reason=f"exit status {run.exit_status}", completion_method="exit_status")
+                    break
+
+                if not has_data:
+                    if run.mode == "sync":
+                        quiet_timeout = getattr(run, "quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
+                        if run.total_received_chars > 0 and (time.time() - run.last_data_at) >= quiet_timeout:
+                            if not run.quiet_event.is_set():
+                                run.quiet_event.set()
+                    time.sleep(0.05)
+        except Exception as exc:
+            run.mark_done("failed", reason="reader exception", error=str(exc), completion_method="failed")
+        finally:
+            with self.lock:
+                if self.active_run_id == run.run_id:
+                    self.active_run_id = None
+                self.last_run_id = run.run_id
+
     def _cleanup_old_runs(self) -> None:
         with self.lock:
             # Cleanup runs
@@ -725,6 +816,8 @@ class SSHSession:
         completion_hint: str,
         quiet_complete_timeout: float,
         max_chars: Optional[int] = None,
+        background: bool = False,
+        use_pty: bool = True,
     ) -> Dict[str, Any]:
         error = self.ensure_alive()
         if error:
@@ -740,21 +833,22 @@ class SSHSession:
         if busy.get("busy"):
             return {"success": False, "error": f"Session {self.id} is busy", "session_id": self.id}
 
-        if shell and not self.in_shell:
-            if not self._enter_shell():
-                return {"success": False, "error": "Failed to enter system shell", "session_id": self.id}
-        elif not shell and self.in_shell:
-            if not self._exit_shell():
-                return {"success": False, "error": "Failed to exit system shell", "session_id": self.id}
+        if use_pty:
+            if shell and not self.in_shell:
+                if not self._enter_shell():
+                    return {"success": False, "error": "Failed to enter system shell", "session_id": self.id}
+            elif not shell and self.in_shell:
+                if not self._exit_shell():
+                    return {"success": False, "error": "Failed to exit system shell", "session_id": self.id}
 
-        if self.channel:
-            old_t = self.channel.gettimeout()
-            self.channel.settimeout(0.1)
-            try:
-                while self.channel.recv_ready():
-                    self.channel.recv(BUFFER_SIZE)
-            except: pass
-            self.channel.settimeout(old_t)
+            if self.channel:
+                old_t = self.channel.gettimeout()
+                self.channel.settimeout(0.1)
+                try:
+                    while self.channel.recv_ready():
+                        self.channel.recv(BUFFER_SIZE)
+                except: pass
+                self.channel.settimeout(old_t)
 
         run_id = self.run_counter
         self.run_counter += 1
@@ -777,13 +871,23 @@ class SSHSession:
         self.last_command_time = datetime.now()
 
         try:
-            if not self.channel: return {"success": False, "error": "No channel", "session_id": self.id}
-            self.channel.send(command + "\n")
+            if use_pty:
+                if not self.channel: return {"success": False, "error": "No channel", "session_id": self.id}
+                self.channel.send(command + "\n")
+                self._start_reader_thread(run)
+            else:
+                if not self.client: return {"success": False, "error": "No client", "session_id": self.id}
+                _, run.exec_stdout, run.exec_stderr = self.client.exec_command(command, get_pty=False)
+                run.exec_channel = run.exec_stdout.channel
+                self._start_exec_reader_thread(run)
         except Exception as exc:
             run.mark_done("failed", error=str(exc))
             return {"success": False, "error": str(exc), "session_id": self.id}
 
-        self._start_reader_thread(run)
+        if background:
+            with self.lock:
+                if self.active_run_id == run_id:
+                    self.active_run_id = None
 
         if mode == "sync":
             start_wait = time.time()
@@ -963,17 +1067,32 @@ class SSHSession:
     def send_signal(self, action: str, text: str = "", press_enter: bool = True) -> Dict[str, Any]:
         error = self.ensure_alive()
         if error: return {"success": False, "error": error, "session_id": self.id}
-        if action == "ctrl_c":
-            self._send_ctrl_c_raw()
-            with self.lock:
-                r = self.runs.get(self.active_run_id) if self.active_run_id else None
-                if r: r.interrupt_sent = True
-            return {"success": True, "session_id": self.id, "message": "Ctrl+C sent"}
-        data = text + ("\n" if press_enter else "")
-        if not self.channel: return {"success": False, "error": "No channel", "session_id": self.id}
-        self.channel.send(data)
+        
+        target_channel = self.channel
         with self.lock:
             r = self.runs.get(self.active_run_id) if self.active_run_id else None
+            if r and r.exec_channel:
+                target_channel = r.exec_channel
+                
+        if action == "ctrl_c":
+            if target_channel and not target_channel.closed:
+                # For exec_channel, ctrl+c might not be passed cleanly, but we can try to close it
+                if target_channel == self.channel:
+                    self._send_ctrl_c_raw()
+                else:
+                    try: target_channel.close()
+                    except: pass
+            with self.lock:
+                if r: 
+                    r.interrupt_sent = True
+                    r.mark_done("completed", reason="interrupted by ctrl_c", completion_method="interrupted")
+                self.active_run_id = None
+            return {"success": True, "session_id": self.id, "message": "Ctrl+C sent, session unlocked"}
+        
+        data = text + ("\n" if press_enter else "")
+        if not target_channel: return {"success": False, "error": "No channel", "session_id": self.id}
+        target_channel.send(data)
+        with self.lock:
             if r and not r.done_event.is_set(): r.register_stdin()
         return {"success": True, "session_id": self.id, "message": "stdin sent"}
 

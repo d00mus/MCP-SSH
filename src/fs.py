@@ -172,26 +172,21 @@ def _write_remote_file_bytes(
             except Exception:
                 pass
 
-    b64_payload = base64.b64encode(payload_bytes).decode("ascii")
-    tmp_path = f"{path}.mcp_b64_{int(time.time() * 1000)}"
-    chunk_size = 800
-    chunks = [b64_payload[i : i + chunk_size] for i in range(0, len(b64_payload), chunk_size)]
-    if not chunks:
-        chunks = [""]
-
-    first = _sync_shell(session, f"echo '{chunks[0]}' > '{tmp_path}'", timeout=30.0)
-    if not first.get("success", False):
-        return first
-
-    for chunk in chunks[1:]:
-        step = _sync_shell(session, f"echo '{chunk}' >> '{tmp_path}'", timeout=30.0)
-        if not step.get("success", False):
-            return step
-
-    finish = _sync_shell(session, f"mkdir -p \"$(dirname '{path}')\" && base64 -d '{tmp_path}' > '{path}' && sync && rm '{tmp_path}'", timeout=30.0)
-    if not finish.get("success", False):
-        return finish
-    return {"success": True, "method": "shell"}
+    try:
+        _sync_shell(session, f"mkdir -p \"$(dirname '{path}')\"", timeout=10.0)
+        
+        stdin, stdout, stderr = session.client.exec_command(f"cat > '{path}'")
+        stdin.write(payload_bytes)
+        stdin.channel.shutdown_write()
+        
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code == 0:
+            return {"success": True, "method": "shell_cat"}
+        else:
+            err = stderr.read().decode('utf-8', errors='replace')
+            return {"success": False, "error": f"shell cat write failed with exit code {exit_code}: {err}", "session_id": session.id}
+    except Exception as exc:
+        return {"success": False, "error": f"shell cat write failed: {exc}", "session_id": session.id}
 
 def _slice_text_by_lines(text: str, offset_line: Optional[int], limit_lines: int) -> Dict[str, Any]:
     lines = text.splitlines()
