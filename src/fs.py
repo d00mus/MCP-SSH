@@ -102,56 +102,94 @@ def _read_remote_file_bytes(
             except Exception:
                 pass
 
-    stamp = f"{int(time.time() * 1000)}_{os.getpid()}"
-    marker_start = f"MCP_BEGIN_{stamp}"
-    marker_end = f"MCP_END_{stamp}"
-    marker_error = f"MCP_ERR_{stamp}"
-
-    if max_bytes is None:
-        shell_command = (
-            f"if [ -r '{path}' ]; then "
-            f"echo '{marker_start}'; base64 '{path}'; echo '{marker_end}'; "
-            f"else echo '{marker_error}'; fi"
-        )
-    else:
-        shell_command = (
-            f"if [ -r '{path}' ]; then "
-            f"echo '{marker_start}'; head -c {max_bytes + 1} '{path}' | base64; echo '{marker_end}'; "
-            f"else echo '{marker_error}'; fi"
-        )
-
-    shell_result = _sync_shell(session, shell_command, timeout=30.0, max_chars=MAX_BUFFER_CHARS)
-    if not shell_result.get("success", False):
-        return shell_result
-    
-    raw_output = shell_result.get("output", "")
-    extracted = _extract_between_markers(raw_output, marker_start, marker_end)
-    
-    if extracted is None:
-        import re
-        if re.search(rf"^{re.escape(marker_error)}\s*$", raw_output, re.MULTILINE):
-            return {"success": False, "error": f"remote file is not readable or missing: {path}", "session_id": session.id, "session_name": session.name}
-        return {"success": False, "error": "failed to parse shell read payload (markers not found)", "session_id": session.id, "session_name": session.name}
-
     try:
-        # Clean up ALL characters that are not valid base64 characters (whitespace, CR, ANSI codes, etc.)
-        import re
-        cleaned_payload = re.sub(r'[^A-Za-z0-9+/=]', '', extracted)
-        payload_bytes = base64.b64decode(cleaned_payload, validate=False)
-    except Exception as exc:
-        return {"success": False, "error": f"failed to decode shell base64 payload: {exc}", "session_id": session.id, "session_name": session.name}
+        if not session.client:
+            return {"success": False, "error": "SSH client is not connected", "session_id": session.id}
+            
+        if max_bytes is None:
+            cmd = f"cat '{path}'"
+        else:
+            cmd = f"head -c {max_bytes + 1} '{path}'"
+            
+        stdin, stdout, stderr = session.client.exec_command(cmd)
+        data = stdout.read()
+        err = stderr.read().decode('utf-8', errors='replace')
+        exit_code = stdout.channel.recv_exit_status()
+        
+        # Check if exec_command failed because the shell commands themselves are missing (e.g. NDMS CLI on port 22)
+        if "no such command" in err or "no such command" in data.decode('utf-8', errors='replace').lower() or "Command::Base error" in err or "Command::Base error" in data.decode('utf-8', errors='replace'):
+            raise NotImplementedError("exec_command not supported, falling back to sync_shell")
+            
+        if exit_code == 0 or data:
+            truncated = False
+            if max_bytes is not None and len(data) > max_bytes:
+                data = data[:max_bytes]
+                truncated = True
+            return {
+                "success": True,
+                "method": "exec_cat",
+                "data": data,
+                "truncated": truncated,
+                "session_id": session.id,
+                "session_name": session.name,
+                "status": "completed"
+            }
+        else:
+            return {"success": False, "error": f"remote file is not readable or missing: {path}. Error: {err}", "session_id": session.id, "session_name": session.name}
+    except (Exception, NotImplementedError) as exc:
+        log_error(f"exec cat read failed, falling back to sync_shell base64: {exc}")
+        stamp = f"{int(time.time() * 1000)}_{os.getpid()}"
+        marker_start = f"MCP_BEGIN_{stamp}"
+        marker_end = f"MCP_END_{stamp}"
+        marker_error = f"MCP_ERR_{stamp}"
 
-    truncated = False
-    if max_bytes is not None and len(payload_bytes) > max_bytes:
-        payload_bytes = payload_bytes[:max_bytes]
-        truncated = True
+        if max_bytes is None:
+            shell_command = (
+                f"if [ -r '{path}' ]; then "
+                f"echo '{marker_start}'; base64 '{path}'; echo '{marker_end}'; "
+                f"else echo '{marker_error}'; fi"
+            )
+        else:
+            shell_command = (
+                f"if [ -r '{path}' ]; then "
+                f"echo '{marker_start}'; head -c {max_bytes + 1} '{path}' | base64; echo '{marker_end}'; "
+                f"else echo '{marker_error}'; fi"
+            )
 
-    return {
-        "success": True,
-        "method": "shell",
-        "data": payload_bytes,
-        "truncated": truncated,
-    }
+        shell_result = _sync_shell(session, shell_command, timeout=30.0, max_chars=MAX_BUFFER_CHARS)
+        if not shell_result.get("success", False):
+            return shell_result
+        
+        raw_output = shell_result.get("output", "")
+        extracted = _extract_between_markers(raw_output, marker_start, marker_end)
+        
+        if extracted is None:
+            import re
+            if re.search(rf"^{re.escape(marker_error)}\s*$", raw_output, re.MULTILINE):
+                return {"success": False, "error": f"remote file is not readable or missing: {path}", "session_id": session.id, "session_name": session.name}
+            return {"success": False, "error": f"failed to parse shell read payload: {raw_output[-300:]}", "session_id": session.id, "session_name": session.name}
+
+        try:
+            import re
+            cleaned_payload = re.sub(r'[^A-Za-z0-9+/=]', '', extracted)
+            payload_bytes = base64.b64decode(cleaned_payload, validate=False)
+        except Exception as e:
+            return {"success": False, "error": f"failed to decode base64: {e}", "session_id": session.id}
+
+        truncated = False
+        if max_bytes is not None and len(payload_bytes) > max_bytes:
+            payload_bytes = payload_bytes[:max_bytes]
+            truncated = True
+
+        return {
+            "success": True,
+            "method": "shell_base64",
+            "data": payload_bytes,
+            "truncated": truncated,
+            "session_id": session.id,
+            "session_name": session.name,
+            "status": "completed"
+        }
 
 def _write_remote_file_bytes(
     session: SSHSession,
@@ -173,20 +211,53 @@ def _write_remote_file_bytes(
                 pass
 
     try:
-        _sync_shell(session, f"mkdir -p \"$(dirname '{path}')\"", timeout=10.0)
+        if not session.client:
+            return {"success": False, "error": "SSH client is not connected", "session_id": session.id}
+            
+        # Create directory using non-interactive exec_command
+        dir_cmd = f"mkdir -p \"$(dirname '{path}')\""
+        stdin_dir, stdout_dir, stderr_dir = session.client.exec_command(dir_cmd)
+        stdout_dir.channel.recv_exit_status() # wait for completion
         
+        # Write file using non-interactive exec_command
         stdin, stdout, stderr = session.client.exec_command(f"cat > '{path}'")
         stdin.write(payload_bytes)
         stdin.channel.shutdown_write()
         
         exit_code = stdout.channel.recv_exit_status()
+        err = stderr.read().decode('utf-8', errors='replace')
+        
+        # Check if exec_command failed because the shell commands themselves are missing (e.g. NDMS CLI on port 22)
+        if "no such command" in err or "Command::Base error" in err:
+            raise NotImplementedError("exec_command not supported, falling back to sync_shell")
+            
         if exit_code == 0:
-            return {"success": True, "method": "shell_cat"}
+            return {"success": True, "method": "exec_cat"}
         else:
-            err = stderr.read().decode('utf-8', errors='replace')
-            return {"success": False, "error": f"shell cat write failed with exit code {exit_code}: {err}", "session_id": session.id}
-    except Exception as exc:
-        return {"success": False, "error": f"shell cat write failed: {exc}", "session_id": session.id}
+            return {"success": False, "error": f"exec cat write failed with exit code {exit_code}: {err}", "session_id": session.id}
+    except (Exception, NotImplementedError) as exc:
+        log_error(f"exec cat write failed, falling back to sync_shell echo/cat: {exc}")
+        _sync_shell(session, f"mkdir -p \"$(dirname '{path}')\"", timeout=10.0)
+        
+        b64_content = base64.b64encode(payload_bytes).decode('utf-8')
+        stamp = f"{int(time.time() * 1000)}_{os.getpid()}"
+        tmp_path = f"/tmp/mcp_upload_{stamp}"
+        
+        _sync_shell(session, f"echo -n '' > {tmp_path}", timeout=5.0)
+        chunks = [b64_content[i:i+1000] for i in range(0, len(b64_content), 1000)]
+        for chunk in chunks:
+            _sync_shell(session, f"echo -n '{chunk}' >> {tmp_path}", timeout=5.0)
+            
+        decode_res = _sync_shell(session, f"base64 -d {tmp_path} > '{path}' && rm -f {tmp_path}", timeout=10.0)
+        if decode_res.get("success", False):
+            return {"success": True, "method": "shell_base64_write"}
+        else:
+            _sync_shell(session, f"rm -f {tmp_path}", timeout=5.0)
+            escaped_content = payload_bytes.decode('utf-8', errors='ignore').replace("'", "'\\''")
+            write_res = _sync_shell(session, f"cat << 'EOF' > '{path}'\n{escaped_content}\nEOF", timeout=15.0)
+            if write_res.get("success", False):
+                return {"success": True, "method": "shell_cat_heredoc"}
+            return {"success": False, "error": f"Interactive shell write failed", "session_id": session.id}
 
 def _slice_text_by_lines(text: str, offset_line: Optional[int], limit_lines: int) -> Dict[str, Any]:
     lines = text.splitlines()
@@ -229,6 +300,16 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         session = manager.ensure_session()
     if not session:
         return {"success": False, "error": "no session available"}
+
+    alive_error = session.ensure_alive()
+    if alive_error:
+        # If it failed to reconnect, try to recover by opening a new session
+        created = manager.open_session(name=session.name or "auto-recovery-file", make_current=True)
+        if not created.get("success", False):
+            return {"success": False, "error": f"Session is dead and recovery failed: {alive_error}"}
+        session = manager.get_session(created["session_id"])
+        if not session:
+            return {"success": False, "error": "Failed to retrieve recovered session"}
 
     if action == "upload": action = "write"
     if action == "download": action = "read"

@@ -351,6 +351,7 @@ class SSHSession:
         self.death_reason = ""
         self.death_time: Optional[datetime] = None
         self.in_shell = False
+        self.state_lost = False
 
         self.last_command = ""
         self.last_command_time: Optional[datetime] = None
@@ -537,6 +538,7 @@ class SSHSession:
             self.is_dead = False
             self.death_reason = ""
             self.in_shell = False
+            self.state_lost = True
             if self.active_run_id is not None:
                 r = self.runs.get(self.active_run_id)
                 if r:
@@ -566,7 +568,26 @@ class SSHSession:
             while self.channel.recv_ready():
                 self.channel.recv(BUFFER_SIZE)
 
-            for cmd in ["sh", "system", "shell"]:
+            # Non-invasive check: send newline and see if we are already in a standard shell
+            self.channel.send("\n")
+            time.sleep(0.2)
+            if self.channel.recv_ready():
+                output = ""
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while self.channel.recv_ready():
+                    output += decoder.decode(self.channel.recv(BUFFER_SIZE))
+                if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()) or re.search(r"^[#$]\s*$", output.strip()):
+                    self.in_shell = True
+                    path = config.EXTRA_PATH if config.EXTRA_PATH else DEFAULT_PATH
+                    self.channel.send(f"export PATH={path}:$PATH 2>/dev/null\n")
+                    time.sleep(0.2)
+                    while self.channel.recv_ready():
+                        self.channel.recv(BUFFER_SIZE)
+                    self._log_session("SYS", {"event": "already_in_shell_detected"})
+                    return True
+
+            # If not already in shell, try to enter it
+            for cmd in ["shell", "exec sh"]:
                 self.channel.send(f"{cmd}\n")
                 time.sleep(0.3)
                 output = ""
@@ -587,17 +608,6 @@ class SSHSession:
                             self._log_session("SYS", {"event": "enter_shell_ok", "method": cmd})
                             return True
                     time.sleep(0.05)
-            
-            self.channel.send("exec sh\n")
-            time.sleep(0.5)
-            output = ""
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            if self.channel.recv_ready():
-                output = decoder.decode(self.channel.recv(BUFFER_SIZE))
-            if "BusyBox" in output or re.search(r"[#$]\s*$", output.rstrip()):
-                self.in_shell = True
-                self._log_session("SYS", {"event": "enter_shell_ok", "method": "exec sh"})
-                return True
 
             self._log_session("SYS", {"event": "enter_shell_failed", "output_tail": output[-200:]})
             return False
@@ -832,6 +842,20 @@ class SSHSession:
         busy = self.busy_info()
         if busy.get("busy"):
             return {"success": False, "error": f"Session {self.id} is busy", "session_id": self.id}
+
+        if use_pty and self.state_lost:
+            self.state_lost = False  # Reset flag on acknowledgment
+            return {
+                "success": False,
+                "error": (
+                    f"Warning: Connection for session {self.id} was lost and auto-recovered! "
+                    "Your interactive shell state (working directory, env variables, etc.) has been reset. "
+                    f"To prevent errors or damage, your command '{command}' was NOT executed. "
+                    "Please run your environment setup commands again (e.g. 'cd <dir>') and then repeat your command."
+                ),
+                "session_id": self.id,
+                "status": "failed"
+            }
 
         if use_pty:
             if shell and not self.in_shell:
@@ -1087,6 +1111,11 @@ class SSHSession:
                     r.interrupt_sent = True
                     r.mark_done("completed", reason="interrupted by ctrl_c", completion_method="interrupted")
                 self.active_run_id = None
+                if self.active_pipeline_id is not None:
+                    p = self.pipelines.get(self.active_pipeline_id)
+                    if p:
+                        p.mark_done("failed", reason="interrupted by ctrl_c", completion_method="interrupted")
+                    self.active_pipeline_id = None
             return {"success": True, "session_id": self.id, "message": "Ctrl+C sent, session unlocked"}
         
         data = text + ("\n" if press_enter else "")
