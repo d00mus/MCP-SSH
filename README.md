@@ -17,6 +17,12 @@ Designed for AI agents (like Cursor, Claude, etc.), this server provides a compa
 - **Binary-Safe Pipelines**: Reliable file transfers bypassing terminal encoding issues.
 - **Background Buffering**: Continuous output caching even when the agent isn't polling.
 - **Keenetic/Netcraze Aware**: Specialized logic for entering Linux shell from restricted CLI, prompt detection, and automatic pagination handling.
+- **Remote Sandbox & Command Blacklist**: Prevent destructive AI commands from executing on remote hosts.
+- **Zero-RAM Command History Restoration**: Commands are saved to disk and transparently restored when reading, avoiding memory bloat.
+- **Loud Exit Status Warning**: Automatically wraps non-zero exit codes in highly visible warnings so models don't ignore command failures.
+- **Hangs Protection**: Automatically interrupts interactive prompts (like `Password:` or `[Y/n]`) and returns helpful non-interactive guidance.
+- **Smart File Editing with Diagnostics**: Shows line-numbered snippets during edit conflicts and suggests similar lines for edit typos.
+- **Middle Truncation & Binary Safety**: Retains head and tail of large files during truncation and hides binary data to save tokens.
 - **Secure & Sandboxed**: Path access is strictly confined to the project root, and credentials can be securely passed via environment variables.
 
 ## 🛠 Tools
@@ -163,6 +169,8 @@ Most configuration can be set via CLI arguments or Environment Variables. Env va
 | `--path` | `EXTRA_PATH` | Additional `PATH` (e.g., `/opt/bin:/opt/sbin` for Entware). |
 | `--project-root` | `PROJECT_ROOT` | Local project root for cache/log placement (default: process `cwd`). |
 | `--cache-dir` | `SSH_MCP_CACHE_DIR` | Override cache base path. |
+| `--read-only` | `SSH_READ_ONLY` | Enable read-only sandbox mode (default: `False`). Blocks filesystem modification. |
+| `--command-blacklist` | `SSH_COMMAND_BLACKLIST` | Comma-separated list of prohibited terminal command patterns (e.g., `reboot,poweroff`). |
 
 ## 📦 Response Model
 
@@ -188,9 +196,35 @@ Secrets (passwords, key paths, or passphrases) should be passed via **Environmen
 
 In Docker mode, use volume mounts for SSH keys and environment variables for passwords. **Never commit your configuration files with secrets to public repositories!**
 
-## 🛡️ Sandboxing
+## 🛡️ Sandboxing & Safety
 
-File operations (`file` tool) and path resolution are strictly sandboxed to the `project-root`. Accessing files outside this directory (e.g., via `../../`) is blocked by default.
+1. **Local Sandboxing**: File operations (`file` tool) and path resolution are strictly sandboxed to the local `project-root`. Accessing files outside this directory (e.g., via `../../`) is blocked by default.
+2. **Remote Sandboxing (`--read-only` or `SSH_READ_ONLY=true`)**: Blocks all file-writing actions (`write`, `edit`, `upload`) and terminal commands capable of modifying the remote system (e.g. `rm`, `mv`, `mkdir`, output redirections `>`, `>>`, package managers, reboot actions).
+3. **Command Blacklist (`--command-blacklist` or `SSH_COMMAND_BLACKLIST`)**: Explicitly blocks any terminal commands containing blacklisted patterns (e.g., `reboot`, `poweroff`, `dd`) on the remote server to prevent accidental disasters.
+
+### Examples
+
+Add to `.cursor/mcp.json` to enable full read-only safety with a command blacklist:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp-vnext": {
+      "command": "python",
+      "args": [
+        "d:/dev/keenetic_github/mcp-server.py",
+        "--host", "192.168.1.1",
+        "--user", "admin",
+        "--read-only",
+        "--command-blacklist", "reboot,poweroff,dd,format,mkfs"
+      ],
+      "env": {
+        "SSH_PASSWORD": "YOUR_PASSWORD"
+      }
+    }
+  }
+}
+```
 
 ## 💡 Pro Tips
 

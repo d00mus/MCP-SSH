@@ -53,6 +53,8 @@ def main() -> None:
     parser.add_argument("--path", help="Additional PATH to export in shell")
     parser.add_argument("--project-root", help="Project root for local state")
     parser.add_argument("--cache-dir", help="Optional cache root override")
+    parser.add_argument("--read-only", action="store_true", help="Enable read-only sandbox mode")
+    parser.add_argument("--command-blacklist", help="Comma-separated list of prohibited commands")
     
     args = parser.parse_args()
 
@@ -64,6 +66,9 @@ def main() -> None:
     if args.passphrase: config.SSH_KEY_PASSPHRASE = args.passphrase
     if args.port: config.SSH_PORT = args.port
     if args.path: config.EXTRA_PATH = args.path
+    if args.read_only: config.READ_ONLY = True
+    if args.command_blacklist:
+        config.COMMAND_BLACKLIST = [c.strip() for c in args.command_blacklist.split(",") if c.strip()]
     
     # Handle verify host logic
     if args.no_verify_host:

@@ -12,7 +12,7 @@ from src.config import (
     DEFAULT_READ_MAX_CHARS, MAX_READ_MAX_CHARS, MAX_BUFFER_CHARS,
     DEFAULT_FILE_INSPECT_MAX_BYTES, MAX_FILE_INSPECT_MAX_BYTES,
     DEFAULT_FILE_EDIT_MAX_BYTES, MAX_FILE_EDIT_MAX_BYTES,
-    MAX_INLINE_WRITE_BYTES
+    MAX_INLINE_WRITE_BYTES, config
 )
 
 def _extract_between_markers(text: str, start_marker: str, end_marker: str) -> Optional[str]:
@@ -289,6 +289,9 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     if action not in {"read", "write", "list", "upload", "download", "edit"}:
         return {"success": False, "error": "action must be one of: read, write, list, upload, download, edit"}
 
+    if config.READ_ONLY and action in {"write", "edit", "upload"}:
+        return {"success": False, "error": f"Security: action '{action}' is blocked in read-only sandbox mode."}
+
     path = (args.get("path", "") or "").strip()
     local_path = resolve_local_path(args.get("local_path", "") or "")
     content = args.get("content")
@@ -386,7 +389,24 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         read_result = _read_remote_file_bytes(session, path, max_bytes=max_bytes)
         if not read_result.get("success", False): return read_result
 
-        text = read_result["data"].decode("utf-8", errors="replace")
+        # Binary data check
+        payload_bytes = read_result["data"]
+        is_binary = b'\x00' in payload_bytes[:8192]
+        if is_binary:
+            return {
+                "success": True,
+                "action": "read",
+                "mode": "binary_hidden",
+                "path": path,
+                "method": read_result["method"],
+                "message": "File is binary. Content was hidden to save tokens and prevent terminal corruption.",
+                "size": len(payload_bytes),
+                "sha256": _sha256_hex(payload_bytes),
+                "session_id": session.id,
+                "status": "completed"
+            }
+
+        text = payload_bytes.decode("utf-8", errors="replace")
         window = _slice_text_by_lines(text, offset_line=offset_line, limit_lines=limit_lines)
         filtered = apply_text_filters(window["text"], contains=contains, regex=regex, tail_lines=tail_lines)
         if not filtered.get("success", False):
@@ -395,7 +415,14 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         inspect_text = filtered["output"]
         char_limited = False
         if len(inspect_text) > max_chars:
-            inspect_text = inspect_text[:max_chars]
+            keep_size = max_chars // 2
+            inspect_text = (
+                f"{inspect_text[:keep_size]}\n\n"
+                f"[... SYSTEM WARNING: Output truncated to {max_chars} characters to save tokens. "
+                "Middle lines hidden. Use pagination 'offset_line' or text filters 'contains'/'regex' "
+                "to inspect specific lines ...]\n\n"
+                f"{inspect_text[-keep_size:]}"
+            )
             char_limited = True
 
         return {
@@ -450,7 +477,29 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             
             if occurrences > 0:
                 if not replace_all and occurrences != 1:
-                    return {"success": False, "error": f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences"}
+                    # Provide helpful snippet context for ambiguous match
+                    lines = updated_text.splitlines()
+                    matching_snippets = []
+                    for i, line in enumerate(lines):
+                        if old_text in line:
+                            start = max(0, i - 2)
+                            end = min(len(lines), i + 3)
+                            snippet = []
+                            for idx_line in range(start, end):
+                                prefix = "--> " if idx_line == i else "    "
+                                snippet.append(f"{prefix}Line {idx_line+1}: {lines[idx_line]}")
+                            matching_snippets.append("\n".join(snippet))
+                    snippet_text = "\n\n".join(matching_snippets)
+                    return {
+                        "success": False,
+                        "error": (
+                            f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences.\n"
+                            "To fix this, please provide more unique surrounding lines of code in 'old_text'. "
+                            "Here are the occurrences found in the file:\n"
+                            f"{snippet_text}"
+                        ),
+                        "session_id": session.id
+                    }
                 if replace_all:
                     updated_text = updated_text.replace(old_text, new_text)
                     total_replacements += occurrences
@@ -469,10 +518,51 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             occurrences = len(matches)
 
             if occurrences == 0:
-                return {"success": False, "error": f"old_text not found for edit at index {idx}. Hint: check for exact whitespace/line endings."}
+                # Let's provide an extremely helpful similarity diagnostic
+                lines = updated_text.splitlines()
+                import difflib
+                close_matches = []
+                for i, line in enumerate(lines):
+                    ratio = difflib.SequenceMatcher(None, old_text.strip(), line.strip()).ratio()
+                    if ratio > 0.7:
+                        close_matches.append(f"Line {i+1}: '{line.strip()}' (similarity: {int(ratio*100)}%)")
+                
+                hint = "Hint: check for exact whitespace/line endings (CRLF vs LF) or check the file content using 'file' read action."
+                if close_matches:
+                    hint += "\nDid you mean one of these similar lines in the file?\n" + "\n".join(close_matches)
+                    
+                return {
+                    "success": False,
+                    "error": f"old_text not found for edit at index {idx}.\n{hint}",
+                    "session_id": session.id
+                }
             
             if not replace_all and occurrences != 1:
-                return {"success": False, "error": f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences"}
+                # Provide helpful snippet context for ambiguous flexible match
+                matching_snippets = []
+                for match in matches:
+                    # Find which line number this start position corresponds to
+                    start_pos = match.start()
+                    line_no = updated_text[:start_pos].count("\n")
+                    lines = updated_text.splitlines()
+                    start = max(0, line_no - 2)
+                    end = min(len(lines), line_no + 3)
+                    snippet = []
+                    for idx_line in range(start, end):
+                        prefix = "--> " if idx_line == line_no else "    "
+                        snippet.append(f"{prefix}Line {idx_line+1}: {lines[idx_line]}")
+                    matching_snippets.append("\n".join(snippet))
+                snippet_text = "\n\n".join(matching_snippets)
+                return {
+                    "success": False,
+                    "error": (
+                        f"ambiguous old_text for edit at index {idx}: found {occurrences} occurrences under flexible matching.\n"
+                        "To fix this, please provide more unique surrounding lines of code in 'old_text'. "
+                        "Here are the occurrences found in the file:\n"
+                        f"{snippet_text}"
+                    ),
+                    "session_id": session.id
+                }
 
             updated_text = pattern.sub(lambda m: new_text, updated_text, count=0 if replace_all else 1)
             total_replacements += occurrences

@@ -31,13 +31,21 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     # If we are here, success is True.
     # Command might have failed (status="failed") or session died (status="dead").
     
-    is_failed = (status in {"failed", "dead"})
+    exit_status = result.get("exit_status")
+    is_failed = (status in {"failed", "dead"} or status == "completed_nonzero" or (exit_status is not None and exit_status != 0))
     
     # 1. Output/Error (First field)
     if is_failed:
-        projected["error"] = result.get("error") or "command failed"
+        projected["error"] = result.get("error") or f"Command failed with exit status {exit_status or 1}"
         if "output" in result and result["output"]:
-            projected["output"] = result["output"]
+            projected["output"] = (
+                f"[WARNING: Command execution failed with Exit Status {exit_status or 1}!]\n"
+                f"--- OUTPUT ---\n"
+                f"{result['output']}\n"
+                f"---------------\n"
+            )
+        else:
+            projected["output"] = ""
     elif tool_name in {"run", "exec", "read"}:
         projected["output"] = result.get("output", "")
     elif tool_name in {"run_pipeline", "pipeline_status"}:

@@ -8,13 +8,15 @@ from datetime import datetime
 from typing import Any, Dict, Optional, List
 import paramiko
 import codecs
+import json
 
 from src.config import (
     CONNECT_TIMEOUT, KEEPALIVE_INTERVAL, BUFFER_SIZE, HEALTH_CHECK_INTERVAL,
     DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT, DEFAULT_STARTUP_WAIT, MAX_STARTUP_WAIT,
     DEFAULT_HARD_TIMEOUT, MAX_HARD_TIMEOUT, MAX_BUFFER_CHARS, MAX_TOTAL_BUFFER_CHARS,
     DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_CHARS, MAX_READ_MAX_LINES, MAX_READ_MAX_CHARS,
-    DEFAULT_QUIET_COMPLETE_TIMEOUT, MAX_QUIET_COMPLETE_TIMEOUT, config, DEFAULT_PATH
+    DEFAULT_QUIET_COMPLETE_TIMEOUT, MAX_QUIET_COMPLETE_TIMEOUT, config, DEFAULT_PATH,
+    PAGER_REGEXES, INTERACTIVE_PROMPT_PATTERNS
 )
 from src.utils import (
     log_error, clamp_float, clamp_int, iso_now, json_line, safe_name,
@@ -146,6 +148,23 @@ class RunState:
             self.completion_method = completion_method
             self.finished_at = time.time()
             self.done_event.set()
+            
+        # Log run completion to run log file
+        try:
+            json_line(self.run_log_path, {
+                "ts": iso_now(),
+                "dir": "SYS",
+                "event": "run_done",
+                "run_id": self.run_id,
+                "status": status,
+                "reason": reason,
+                "error": error,
+                "completion_method": completion_method,
+                "exit_status": self.exit_status,
+                "finished_at": self.finished_at
+            })
+        except Exception:
+            pass
 
     def set_recv_paused(self, paused: bool, reason: str = "") -> None:
         with self.lock:
@@ -693,11 +712,16 @@ class SSHSession:
                     run.append_output(chunk)
                     self._log_run(run, "OUT", {"chunk": chunk})
 
-                    if "More" in chunk:
-                        tail = run.output_buffer[-500:]
-                        if re.search(r"--\s*More\s*--", tail) or re.search(r"More\.\.\.", tail):
-                            self.channel.send(" ") 
-                            self._log_run(run, "SYS", {"event": "pagination_detected_sending_space"})
+                    # Pagination detection (configurable regexes)
+                    tail = run.output_buffer[-500:]
+                    found_pager = False
+                    for pattern in PAGER_REGEXES:
+                        if re.search(pattern, tail):
+                            found_pager = True
+                            break
+                    if found_pager:
+                        self.channel.send(" ") 
+                        self._log_run(run, "SYS", {"event": "pagination_detected_sending_space"})
 
                     prompt = find_prompt(run.output_buffer)
                     if prompt:
@@ -716,7 +740,28 @@ class SSHSession:
                         
                         if hint in {"quiet", "either"} and run.total_received_chars > 0 and not stdin_recent:
                             if (time.time() - run.last_data_at) >= quiet_timeout:
-                                if not run.quiet_event.is_set():
+                                # Interactive hang check
+                                tail = run.output_buffer[-200:]
+                                is_interactive = False
+                                for pattern in INTERACTIVE_PROMPT_PATTERNS:
+                                    if re.search(pattern, tail):
+                                        is_interactive = True
+                                        break
+                                if is_interactive:
+                                    run.interrupt_sent = True
+                                    self._send_ctrl_c_raw()
+                                    run.mark_done(
+                                        "failed",
+                                        reason="interactive_prompt_detected",
+                                        error=(
+                                            "Interactive prompt detected. Command was aborted to prevent hang. "
+                                            "Please execute the command using non-interactive flags (e.g., -y, --force, "
+                                            "DEBIAN_FRONTEND=noninteractive) or pass input through signal:stdin."
+                                        ),
+                                        completion_method="aborted_interactive"
+                                    )
+                                    break
+                                elif not run.quiet_event.is_set():
                                     run.quiet_event.set()
                     time.sleep(0.05)
         except Exception as exc:
@@ -779,7 +824,29 @@ class SSHSession:
                     if run.mode == "sync":
                         quiet_timeout = getattr(run, "quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
                         if run.total_received_chars > 0 and (time.time() - run.last_data_at) >= quiet_timeout:
-                            if not run.quiet_event.is_set():
+                            # Interactive hang check
+                            tail = run.output_buffer[-200:]
+                            is_interactive = False
+                            for pattern in INTERACTIVE_PROMPT_PATTERNS:
+                                if re.search(pattern, tail):
+                                    is_interactive = True
+                                    break
+                            if is_interactive:
+                                run.interrupt_sent = True
+                                try: channel.close()
+                                except: pass
+                                run.mark_done(
+                                    "failed",
+                                    reason="interactive_prompt_detected",
+                                    error=(
+                                        "Interactive prompt detected. Command was aborted to prevent hang. "
+                                        "Please execute the command using non-interactive flags (e.g., -y, --force, "
+                                        "DEBIAN_FRONTEND=noninteractive) or pass input through signal:stdin."
+                                    ),
+                                    completion_method="aborted_interactive"
+                                )
+                                break
+                            elif not run.quiet_event.is_set():
                                 run.quiet_event.set()
                     time.sleep(0.05)
         except Exception as exc:
@@ -839,6 +906,26 @@ class SSHSession:
         hard_timeout = clamp_float(hard_timeout, DEFAULT_HARD_TIMEOUT, 0.0, MAX_HARD_TIMEOUT)
         quiet_complete_timeout = clamp_float(quiet_complete_timeout, DEFAULT_QUIET_COMPLETE_TIMEOUT, 0.1, MAX_QUIET_COMPLETE_TIMEOUT)
 
+        # Blacklist check
+        for blacklisted in config.COMMAND_BLACKLIST:
+            if blacklisted in command:
+                return {
+                    "success": False,
+                    "error": f"Security: Command is blocked by command blacklist (matched blacklisted word: '{blacklisted}').",
+                    "session_id": self.id
+                }
+
+        # Read-only check
+        if config.READ_ONLY:
+            import re
+            write_pattern = re.compile(r"\b(rm|mv|mkdir|rmdir|touch|chmod|chown|dd|format|mkfs|reboot|poweroff|halt|shutdown|opkg|apt|yum|dnf|pip install|npm install|wget\s+-O|curl\s+-o)\b|>>|>[^>]")
+            if write_pattern.search(command):
+                return {
+                    "success": False,
+                    "error": "Security: Write command is blocked in read-only sandbox mode.",
+                    "session_id": self.id
+                }
+
         busy = self.busy_info()
         if busy.get("busy"):
             return {"success": False, "error": f"Session {self.id} is busy", "session_id": self.id}
@@ -885,6 +972,22 @@ class SSHSession:
         )
         run.completion_hint = completion_hint
         run.quiet_complete_timeout = quiet_complete_timeout
+
+        # Log run creation to run log file
+        try:
+            json_line(run.run_log_path, {
+                "ts": iso_now(),
+                "dir": "SYS",
+                "event": "run_created",
+                "command": command,
+                "mode": mode,
+                "started_at": run.started_at,
+                "wait_timeout": wait_timeout,
+                "startup_wait": startup_wait,
+                "hard_timeout": hard_timeout
+            })
+        except Exception:
+            pass
 
         with self.lock:
             self.runs[run_id] = run
@@ -943,6 +1046,81 @@ class SSHSession:
             "output": snapshot["output"], "next_offset": snapshot["next_offset"]
         }
 
+    def _restore_run_from_disk(self, run_id: int) -> Optional[RunState]:
+        import glob
+        pattern = os.path.join(self.cache_dirs["runs_dir"], f"{self.project_tag}__s{self.id}__r{run_id}__*.log")
+        files = glob.glob(pattern)
+        if not files:
+            return None
+        
+        # Take the most recent if multiple (should be only one)
+        files.sort(key=os.path.getmtime)
+        filepath = files[-1]
+        
+        # Parse log file
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as exc:
+            log_error(f"Failed to read log file for run {run_id}: {exc}")
+            return None
+            
+        # Reconstruct RunState
+        # Default fallback values in case they are not in the log yet
+        run = RunState(
+            run_id=run_id,
+            session_id=self.id,
+            command="",
+            mode="sync",
+            started_at=os.path.getctime(filepath),
+            wait_timeout=20.0,
+            startup_wait=2.0,
+            hard_timeout=0.0,
+            max_buffer_chars=MAX_BUFFER_CHARS,
+            run_log_path=filepath
+        )
+        
+        # Populate fields based on logged lines
+        output_chunks = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+                direction = evt.get("dir")
+                if direction == "OUT" or direction == "ERR":
+                    chunk = evt.get("chunk", "")
+                    output_chunks.append(chunk)
+                elif direction == "SYS":
+                    event = evt.get("event")
+                    if event == "run_created":
+                        run.command = evt.get("command", "")
+                        run.mode = evt.get("mode", "sync")
+                        run.started_at = evt.get("started_at", run.started_at)
+                        run.wait_timeout = evt.get("wait_timeout", run.wait_timeout)
+                        run.startup_wait = evt.get("startup_wait", run.startup_wait)
+                        run.hard_timeout = evt.get("hard_timeout", run.hard_timeout)
+                    elif event == "run_done":
+                        run.status = evt.get("status", "completed")
+                        run.finish_reason = evt.get("reason", "")
+                        run.error = evt.get("error", "")
+                        run.completion_method = evt.get("completion_method", "")
+                        run.exit_status = evt.get("exit_status")
+                        run.finished_at = evt.get("finished_at")
+                        run.done_event.set()
+            except Exception:
+                pass
+                
+        run.output_buffer = "".join(output_chunks)
+        run.total_received_chars = len(run.output_buffer)
+        
+        # Cache it back in self.runs so we don't reload it every time
+        with self.lock:
+            self.runs[run_id] = run
+            
+        return run
+
     def read_run(self, run_id: Optional[int], offset: Optional[int], max_lines: int, max_chars: int) -> Dict[str, Any]:
         max_lines = clamp_int(max_lines, DEFAULT_READ_MAX_LINES, 1, MAX_READ_MAX_LINES)
         max_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 100, MAX_READ_MAX_CHARS)
@@ -951,6 +1129,10 @@ class SSHSession:
             if run_id is not None: selected = self.runs.get(run_id)
             elif self.active_run_id is not None: selected = self.runs.get(self.active_run_id)
             elif self.last_run_id is not None: selected = self.runs.get(self.last_run_id)
+            
+        if not selected and run_id is not None:
+            selected = self._restore_run_from_disk(run_id)
+
         if not selected: return {"success": False, "error": "No run found", "session_id": self.id}
         snapshot = selected.read_slice(offset=offset, max_lines=max_lines, max_chars=max_chars)
         status = selected.status

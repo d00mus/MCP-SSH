@@ -31,6 +31,25 @@ MAX_QUIET_COMPLETE_TIMEOUT = 30.0
 
 DEFAULT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/bin:/opt/sbin"
 
+# Configurable regexes for paging detection (e.g. --More--)
+PAGER_REGEXES = [
+    r"--\s*More\s*--",
+    r"More\.\.\.",
+    r"--More--",
+    r"Press any key to continue",
+    r"Press Enter to continue"
+]
+
+# Configurable regexes for interactive hangs/prompts detection
+INTERACTIVE_PROMPT_PATTERNS = [
+    r"(?i)(password|passphrase|secret|token)\s*:\s*$",
+    r"\[y/n\]\s*$",
+    r"\[Y/n\]\s*$",
+    r"\[y/N\]\s*$",
+    r"Do you want to continue\??\s*$",
+    r"\(yes/no\)\??\s*$",
+]
+
 # ========= Output cleanup =========
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
@@ -50,6 +69,8 @@ class ServerConfig:
         self.PROJECT_ROOT: str = ""
         self.PROJECT_TAG: str = ""
         self.CACHE_DIRS: Dict[str, str] = {}
+        self.READ_ONLY: bool = False
+        self.COMMAND_BLACKLIST: list = []
 
     def load_from_env(self):
         self.SSH_HOST = os.environ.get("SSH_HOST", self.SSH_HOST)
@@ -62,6 +83,11 @@ class ServerConfig:
         verify_host_env = os.environ.get("SSH_VERIFY_HOST_KEY")
         if verify_host_env is not None:
              self.SSH_VERIFY_HOST_KEY = verify_host_env.lower() in ("true", "1", "yes")
+
+        self.READ_ONLY = os.environ.get("SSH_READ_ONLY", "false").lower() in ("true", "1", "yes")
+        blacklist_env = os.environ.get("SSH_COMMAND_BLACKLIST", "")
+        if blacklist_env:
+            self.COMMAND_BLACKLIST = [c.strip() for c in blacklist_env.split(",") if c.strip()]
 
 # Global instance
 config = ServerConfig()
