@@ -1,44 +1,32 @@
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-gateway": {
       "command": "python",
       "args": [
-        "C:\\path\\to\\mcp-server.py",
-        "--project-root", "D:\\dev\\keenetic_github",
-        "--host", "192.168.1.1",
-        "--user", "admin",
-        "--password", "YOUR_PASSWORD",
-        "--port", "22",
-        "--cache-dir", "D:\\mcp-cache"
-      ]
+        "C:\\tools\\ssh-gateway\\mcp-server.py",
+        "--servers-config", "C:\\tools\\ssh-gateway\\servers.json",
+        "--project-root", "C:\\tools\\ssh-gateway",
+        "--cache-dir", "C:\\tools\\ssh-gateway\\.ssh-cache"
+      ],
+      "env": {
+        "KEENETIC_PASSWORD": "SecretPassword123"
+      }
     },
-    
-    "linux-server-key": {
-      "command": "python",
+
+    "ssh-gateway-docker": {
+      "command": "docker",
       "args": [
-        "/path/to/mcp-server.py",
-        "--project-root", "/workspace/my-project",
-        "--host", "my-server.example.com",
-        "--user", "myuser",
-        "--key", "/home/myuser/.ssh/id_rsa",
-        "--passphrase", "OPTIONAL_KEY_PASSPHRASE",
-        "--verify-host",
-        "--port", "2222",
-        "--cache-dir", "/var/tmp/mcp-cache"
-      ]
-    },
-    
-    "linux-server-password": {
-      "command": "python",
-      "args": [
-        "/path/to/mcp-server.py",
-        "--project-root", "/workspace/my-project",
-        "--host", "my-server.example.com",
-        "--user", "myuser",
-        "--password", "SERVER_PASSWORD",
-        "--port", "2222",
-        "--cache-dir", "/var/tmp/mcp-cache"
-      ]
+        "run", "-i", "--rm",
+        "-v", "C:/tools/ssh-gateway/servers.json:/app/servers.json:ro",
+        "-v", "C:/Users/username/.ssh:/root/.ssh:ro",
+        "-v", "C:/tools/ssh-gateway/.ssh-cache:/app/.ssh-cache",
+        "mcp-ssh-server",
+        "--servers-config", "/app/servers.json",
+        "--cache-dir", "/app/.ssh-cache"
+      ],
+      "env": {
+        "KEENETIC_PASSWORD": "SecretPassword123"
+      }
     }
   }
 }

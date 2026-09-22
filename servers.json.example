@@ -1,0 +1,36 @@
+{
+  "servers": {
+    "keenetic": {
+      "host": "192.168.1.1",
+      "port": 22,
+      "user": "admin",
+      "password": "${KEENETIC_PASSWORD:-admin123}",
+      "description": "Keenetic Ultra router (gateway & Entware)",
+      "verify_host": false,
+      "extra_path": "/opt/bin:/opt/sbin"
+    },
+    "nas": {
+      "host": "192.168.1.10",
+      "port": 22,
+      "user": "storage",
+      "key_path": "~/.ssh/id_rsa",
+      "description": "TrueNAS storage server",
+      "max_sessions": 10
+    },
+    "vps-prod": {
+      "host": "203.0.113.5",
+      "port": 2222,
+      "user": "ubuntu",
+      "key_path": "${VPS_KEY_PATH:-~/.ssh/vps_key}",
+      "read_only": true,
+      "command_blacklist": [
+        "reboot",
+        "shutdown",
+        "poweroff",
+        "rm -rf",
+        "dd"
+      ],
+      "description": "Production cloud server (read-only sandbox)"
+    }
+  }
+}

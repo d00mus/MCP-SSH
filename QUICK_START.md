@@ -1,103 +1,151 @@
-# Quick Start
+# Quick Start: Multi-Server SSH MCP Gateway
 
-## 1. Choose your path
+Control all your SSH infrastructure (routers, NAS, VPS, staging clusters) through a **single, unified MCP server instance**.
 
-### Path A: Docker (Recommended)
-You only need to build the image once.
-```bash
-docker build -t mcp-ssh-server .
-```
+---
 
-### Path B: Python
-Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+## 1. Prepare Configuration (`servers.json`)
 
-## 2. Configure your Agent
+Create `servers.json` in your workspace root (or copy from `servers.json.example`):
 
-### Cursor IDE
-Edit `.cursor/mcp.json`:
-
-**Docker:**
 ```json
 {
-  "mcpServers": {
-    "ssh-mcp": {
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-v", "D:/path/to/project:/workspace",
-        "-v", "C:/Users/me/.ssh:/home/mcp/.ssh:ro",
-        "-w", "/workspace",
-        "mcp-ssh-server",
-        "--host", "my-server.example.com",
-        "--user", "myuser",
-        "--key", "/home/mcp/.ssh/id_rsa",
-        "--verify-host"
-      ]
+  "servers": {
+    "keenetic": {
+      "host": "192.168.1.1",
+      "port": 22,
+      "user": "admin",
+      "password": "${KEENETIC_PASSWORD}",
+      "description": "Keenetic Ultra router",
+      "verify_host": false,
+      "extra_path": "/opt/bin:/opt/sbin"
+    },
+    "nas": {
+      "host": "192.168.1.10",
+      "port": 22,
+      "user": "storage",
+      "key_path": "~/.ssh/id_rsa",
+      "description": "TrueNAS storage",
+      "max_sessions": 10
+    },
+    "vps-prod": {
+      "host": "203.0.113.5",
+      "port": 2222,
+      "user": "ubuntu",
+      "key_path": "~/.ssh/vps_key",
+      "read_only": true,
+      "command_blacklist": ["reboot", "poweroff", "rm -rf"],
+      "description": "Production web server (read-only)"
     }
   }
 }
 ```
 
-**Python (Secure):**
+> **Feature Highlight:** Supports environment variable interpolation (e.g. `${KEENETIC_PASSWORD}`), `~` home expansion, up to 10 concurrent sessions per server by default, and zero-downtime hot-reload when edited.
+
+---
+
+## 2. Installation & Running
+
+### Path A: Python (Fastest)
+
+```bash
+pip install -r requirements.txt
+```
+
+### Path B: Docker
+
+```bash
+docker build -t mcp-ssh-server .
+```
+
+---
+
+## 3. Configure your AI Agent
+
+### MCP Client Config (`mcp.json`)
+
+**With Python (Windows example):**
 ```json
 {
   "mcpServers": {
-    "ssh-mcp": {
+    "ssh-gateway": {
       "command": "python",
       "args": [
-        "D:/path/to/mcp-server.py",
-        "--host", "192.168.1.1",
-        "--user", "admin"
+        "C:\\tools\\ssh-gateway\\mcp-server.py",
+        "--servers-config", "C:\\tools\\ssh-gateway\\servers.json",
+        "--project-root", "C:\\tools\\ssh-gateway"
       ],
       "env": {
-        "SSH_KEY_PATH": "C:/Users/me/.ssh/id_rsa",
-        "SSH_VERIFY_HOST_KEY": "true"
+        "KEENETIC_PASSWORD": "your_secure_password"
       }
     }
   }
 }
 ```
 
-### Continue.dev
-Edit `config.yaml`:
+**With Docker:**
 
-**Docker:**
-```yaml
-mcpServers:
-  - name: ssh-mcp
-    type: stdio
-    command: docker
-    args:
-      - run
-      - -i
-      - --rm
-      - mcp-ssh-server
-      - "--host"
-      - "192.168.1.1"
-      - "--user"
-      - "admin"
-      - "--password"
-      - "YOUR_PASSWORD"
+```json
+{
+  "mcpServers": {
+    "ssh-gateway": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "C:/tools/ssh-gateway/servers.json:/app/servers.json:ro",
+        "-v", "C:/Users/username/.ssh:/root/.ssh:ro",
+        "-v", "C:/tools/ssh-gateway/.ssh-cache:/app/.ssh-cache",
+        "mcp-ssh-server",
+        "--servers-config", "/app/servers.json"
+      ],
+      "env": {
+        "KEENETIC_PASSWORD": "your_secure_password"
+      }
+    }
+  }
+}
 ```
 
-## 3. Start chatting!
+### Claude Desktop (`claude_desktop_config.json`)
 
-Try asking your AI:
-- "Check CPU load on my router"
-- "Are there any errors in `/var/log/messages`?" (remind it to use `shell: true` for grep)
-- "List all active sessions"
+```json
+{
+  "mcpServers": {
+    "ssh-gateway": {
+      "command": "python",
+      "args": [
+        "/opt/ssh-gateway/mcp-server.py",
+        "--servers-config", "/opt/ssh-gateway/servers.json"
+      ]
+    }
+  }
+}
+```
 
-## 💡 Important Tips
+---
 
-1. **Optimized for Efficiency**: This server is specifically tuned for low token usage and works great with local LLMs. Responses are lean; use `last_command_details` only if something goes wrong.
-2. **Shell Mode**: For any command with `|`, `&&`, `||`, or `if/else`, the agent must set `shell: true`.
-3. **Keenetic**: If you are using a Keenetic router, the server will automatically handle the transition from restricted CLI to Linux shell when `shell: true` is requested.
-4. **Auto-Recovery**: You don't need to manage sessions manually. The `run` tool will auto-create or recover sessions if needed, minimizing tool-call overhead.
-5. **Cache location**: default is `<project-root>/.ssh-cache` (project root = process cwd). Override via `--cache-dir` or `SSH_MCP_CACHE_DIR`.
-6. **File tool workflow**:
-   - `file.read` with `local_path` downloads file.
-   - `file.read` without `local_path` is for inspection.
-   - `file.edit` performs in-place text replacements—ideal for quick fixes without re-uploading.
+## 4. Key Agent Workflows & Best Practices
+
+1. **Discover Servers:**
+   The AI calls `server_list` to see all configured hosts, status, and active sessions.
+2. **Execute Commands (`run`):**
+   - Explicit target: `run(server="keenetic", command="show interface", shell=false)`
+   - Composite session ID: `run(session_id="nas/1", command="zpool status")`
+   - **Default Timeout (5.0s):** Commands taking longer return `still_running: true` without failing. The agent can poll remaining output via `read(run_id=...)`.
+   - **Async Execution:** Pass `wait_timeout: 0` for immediate confirmed start in background.
+   - **Standard Shell Pipelines:** Use standard `| grep`, `| awk`, `| head` inside the command string for filtering.
+   - **Multiline code / scripts:** For Python snippets (`python3 -c "..."`) or scripts with newlines, pass `use_pty: false` to avoid secondary prompt (`>`) issues in PTY.
+3. **Session Management (1 Session = 1 Terminal):**
+   - An SSH session is a single terminal process (PTY). Never send concurrent commands to the same session.
+   - Run without `session_id` to execute commands in parallel in a new clean session.
+   - For Keenetic: keep NDM CLI (`shell: false`) and Linux shell (`shell: true`) in separate sessions.
+4. **Buffered Output & Rewind (`read`):**
+   - The gateway retains up to 2MB circular buffer per command.
+   - Call `read(offset=0)` to rewind and re-read the entire output from the beginning.
+5. **Interrupt Stuck Commands (`signal`):**
+   - Call `signal(action="ctrl_c")` to immediately terminate a hanging command and free the session.
+6. **Register New Servers On The Fly:**
+   - The AI can call `server_add(alias="staging-app", host="10.0.0.5", user="deploy")` without restarting the server.
+7. **Live Hot-Reload:**
+   - Edit credentials or servers in `servers.json` — the gateway detects changes automatically within seconds with zero downtime for unaffected sessions.
