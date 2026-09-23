@@ -13,11 +13,12 @@ import threading
 from typing import Any, Dict, Optional, List, Tuple, NamedTuple, Set
 
 from src.config import (
-    CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, MAX_TOTAL_BUFFER_CHARS,
+    CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, MAX_TOTAL_BUFFER_CHARS, MAX_LOG_TOTAL_BYTES,
     ServerTargetConfig, ServersRegistry, config
 )
-from src.utils import log_error, iso_now, safe_name, cleanup_old_logs, cleanup_dead_session_logs
+from src.utils import log_error, iso_now, safe_name, cleanup_old_logs, cleanup_dead_session_logs, mask_secrets
 from src.session import SSHSession
+from src.ssh_state import CHARS_ACCOUNT
 
 
 def _sanitize_tool_data(data: Any, depth: int = 0) -> Any:
@@ -29,14 +30,17 @@ def _sanitize_tool_data(data: Any, depth: int = 0) -> Any:
             if any(s in str(k).lower() for s in ("password", "passphrase", "secret", "token", "key_pass", "key_path", "private_key", "key_file")):
                 clean[k] = "******"
             elif isinstance(v, str) and len(v) > 10000:
-                clean[k] = v[:10000] + "... [truncated in last_command_details]"
+                clean[k] = mask_secrets(v[:10000]) + "... [truncated in last_command_details]"
             else:
                 clean[k] = _sanitize_tool_data(v, depth + 1)
         return clean
     elif isinstance(data, list):
         return [_sanitize_tool_data(x, depth + 1) for x in data[:100]]
-    elif isinstance(data, str) and len(data) > 10000:
-        return data[:10000] + "... [truncated in last_command_details]"
+    elif isinstance(data, str):
+        # Secret-looking fragments (password=..., --token ...) stay out of diagnostics
+        if len(data) > 10000:
+            return mask_secrets(data[:10000]) + "... [truncated in last_command_details]"
+        return mask_secrets(data)
     return data
 
 
@@ -179,6 +183,7 @@ class ServerNode:
         for ds in dead_to_close:
             try:
                 ds.close(permanent=True)
+                ds.free_buffers()
             except Exception as e:
                 log_error(f"Error closing purged dead session: {e}")
 
@@ -227,6 +232,7 @@ class ServerNode:
             if not s:
                 return {"success": False, "error": f"session {self.alias}/{session_id} not found", "server": self.alias}
         s.close(permanent=True)
+        s.free_buffers()
         return {"success": True, "server": self.alias, "closed_session_id": f"{self.alias}/{session_id}"}
 
     def update_session(self, session_id: int, name: Optional[str], make_current: Optional[bool] = None) -> Dict[str, Any]:
@@ -249,26 +255,20 @@ class ServerNode:
                 return self.sessions.get(session_id)
             return None
 
-    def set_current_session(self, session_id: int) -> None:
-        pass
-
     def total_buffer_chars(self) -> int:
-        now = time.time()
-        with self._buffer_cache_lock:
-            if now - self._cached_total_buffer_time < 0.25:
-                return self._cached_total_buffer
+        """Exact sum of buffered chars for this node (runs + scrollback). Cheap:
+        ChunkBuffer reports its length without materialising the text (F7)."""
         with self.lock:
             sessions = list(self.sessions.values())
         total = 0
         for s in sessions:
             with s.lock:
                 runs = list(s.runs.values())
+                total += len(s.scrollback) if hasattr(s, "scrollback") else 0
             for r in runs:
                 with r.lock:
-                    total += len(r.output_buffer)
-        with self._buffer_cache_lock:
-            self._cached_total_buffer = total
-            self._cached_total_buffer_time = now
+                    size = getattr(r, "buffer_len", None)
+                    total += size if isinstance(size, int) else len(r.output_buffer)
         return total
 
     def find_first_idle_alive_session(self) -> Optional[SSHSession]:
@@ -320,6 +320,7 @@ class ServerNode:
         for s in sessions:
             try:
                 s.close(permanent=True)
+                s.free_buffers()
             except Exception as e:
                 log_error(f"Error closing session {s.id}: {e}")
 
@@ -657,13 +658,29 @@ class MultiServerManager:
                 return {"success": True, **self.last_tool_result_global}
         return {"success": False, "error": "No recorded result"}
 
+    def cancel_request(self, req_id: Any) -> Dict[str, Any]:
+        """Cancel an in-flight run by JSON-RPC request id (notifications/cancelled)."""
+        if req_id is None:
+            return {"success": False, "error": "notifications/cancelled has no requestId"}
+        with self.lock:
+            nodes = list(self.nodes.values())
+        for node in nodes:
+            with node.lock:
+                sessions = list(node.sessions.values())
+            for session in sessions:
+                with session.lock:
+                    tracked = req_id in session.inflight_by_req
+                if tracked:
+                    return session.cancel_run_for_request(req_id)
+        return {"success": True, "message": "nothing to cancel: request unknown or already finished"}
+
     def _health_loop(self) -> None:
         while not self.health_stop_event.wait(HEALTH_CHECK_INTERVAL):
             if self.health_stop_event.is_set():
                 break
             try:
                 self.check_reload()
-                cleanup_old_logs(self.cache_dirs)
+                cleanup_old_logs(self.cache_dirs, max_total_bytes=MAX_LOG_TOTAL_BYTES)
                 cleanup_dead_session_logs(self.cache_dirs)
                 with self.lock:
                     nodes = list(self.nodes.values())
@@ -774,19 +791,9 @@ class MultiServerManager:
         )
 
     def total_buffer_chars(self) -> int:
-        now = time.time()
-        with self._buffer_cache_lock:
-            if now - self._cached_total_buffer_time < 0.25:
-                return self._cached_total_buffer
-        total = 0
-        with self.lock:
-            nodes = list(self.nodes.values())
-        for node in nodes:
-            total += node.total_buffer_chars()
-        with self._buffer_cache_lock:
-            self._cached_total_buffer = total
-            self._cached_total_buffer_time = now
-        return total
+        """Live process-wide total (runs + scrollback). The old 250 ms cache let
+        several readers pass the limit check on stale data (F7)."""
+        return CHARS_ACCOUNT.total
 
     def evict_completed_run_buffers(self) -> int:
         """Drop output of finished runs until the process is under the global cap. The active run is kept."""
@@ -804,7 +811,9 @@ class MultiServerManager:
                     if rid == active or not run.done_event.is_set():
                         continue
                     with run.lock:
-                        size = len(run.output_buffer)
+                        size = getattr(run, "buffer_len", None)
+                        if not isinstance(size, int):
+                            size = len(run.output_buffer)
                         finished = run.finished_at or 0.0
                     if size:
                         victims.append((finished, run))
@@ -815,34 +824,18 @@ class MultiServerManager:
             if total <= MAX_TOTAL_BUFFER_CHARS:
                 break
             with obj.lock:
-                cleared = len(obj.output_buffer)
-                if not cleared:
-                    continue
-                obj.buffer_base_offset += cleared
-                if obj.shared_cursor < obj.buffer_base_offset:
-                    obj.shared_cursor = obj.buffer_base_offset
-                obj.output_buffer = ""
+                cleared = obj.discard_all_output()
+            if not cleared:
+                continue
             freed += cleared
             total -= cleared
-        if freed:
-            with self._buffer_cache_lock:
-                self._cached_total_buffer_time = 0.0
-            for node in nodes:
-                node._cached_total_buffer_time = 0.0
         return freed
 
     def can_accept_more_buffer(self, incoming: int = 0) -> bool:
+        # Exact, live accounting (F7): decide on real numbers, not a cached sum.
         total = self.total_buffer_chars()
-        near_cap = total >= MAX_TOTAL_BUFFER_CHARS - 1_000_000
-        if total + incoming > MAX_TOTAL_BUFFER_CHARS or near_cap:
-            with self._buffer_cache_lock:
-                self._cached_total_buffer_time = 0.0
-            with self.lock:
-                nodes = list(self.nodes.values())
-            for node in nodes:
-                node._cached_total_buffer_time = 0.0
-            if total + incoming > MAX_TOTAL_BUFFER_CHARS:
-                self.evict_completed_run_buffers()
+        if total + incoming > MAX_TOTAL_BUFFER_CHARS:
+            self.evict_completed_run_buffers()
             total = self.total_buffer_chars()
         return (total + incoming) <= MAX_TOTAL_BUFFER_CHARS
 

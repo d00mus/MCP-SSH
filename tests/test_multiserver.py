@@ -229,7 +229,7 @@ class TestMultiServer(unittest.TestCase):
         # VPS is read_only
         res = s_vps.run_command("touch /tmp/test", mode="sync", shell=True, wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0, completion_hint="either", quiet_complete_timeout=0.5)
         self.assertFalse(res["success"])
-        self.assertIn("read-only sandbox mode on server 'vps'", res["error"])
+        self.assertIn("read-only guardrail mode on server 'vps'", res["error"])
 
         # Keenetic has blacklist ["reboot"]
         res_rb = s_keen.run_command("reboot", mode="sync", shell=True, wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0, completion_hint="either", quiet_complete_timeout=0.5)
@@ -261,7 +261,7 @@ class TestMultiServer(unittest.TestCase):
         # 1. file write on read_only server 'vps' is blocked
         res_write_vps = file_dispatch({"action": "write", "path": "/test.txt", "content": "data", "server": "vps"}, self.manager)
         self.assertFalse(res_write_vps["success"])
-        self.assertIn("blocked in read-only sandbox mode on server 'vps'", res_write_vps["error"])
+        self.assertIn("blocked in read-only guardrail mode on server 'vps'", res_write_vps["error"])
 
         # 2. file write on non-readonly server 'nas' reaches session
         node_nas = self.manager.get_or_create_node(self.cfg2)
@@ -417,7 +417,7 @@ class TestMultiServer(unittest.TestCase):
             completion_hint="either", quiet_complete_timeout=0.5
         )
         self.assertFalse(res_rm["success"])
-        self.assertIn("blocked in read-only sandbox mode", res_rm["error"])
+        self.assertIn("blocked in read-only guardrail mode", res_rm["error"])
 
         # 2. Command blocked by command_blacklist
         res_reb = s2.run_command(
@@ -1038,25 +1038,36 @@ class TestMultiServer(unittest.TestCase):
         self.assertFalse(res["success"])
         self.assertIn("busy", res["error"].lower())
 
-    def test_total_buffer_chars_caching(self):
-        """Verify MultiServerManager.total_buffer_chars caches results for fast repeated calls."""
-        mgr = MultiServerManager(self.cache_dirs, "test_cache")
-        try:
-            mgr.registry.register(self.cfg1)
-            node = mgr.get_or_create_node(self.cfg1)
-            node.total_buffer_chars = MagicMock(return_value=500)
+    def test_total_buffer_chars_is_live_and_includes_scrollback(self):
+        """T2.4/F7: accounting must be exact and include scrollback (was: a 250ms cache
+        that let several readers pass the limit check on stale data)."""
+        from src.ssh_state import RunState
+        cfg = ServerTargetConfig(alias="acct", host="10.2.2.2", user="u")
+        self.manager.registry.register(cfg)
+        node = self.manager.get_or_create_node(cfg)
+        session = SSHSession(1, "", self.cache_dirs, "test", server_config=cfg)
+        run = RunState(
+            run_id=1, session_id=1, command="yes", mode="sync", started_at=time.time(),
+            wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "acct.log"),
+        )
+        with node.lock:
+            node.sessions[1] = session
+        session.runs[1] = run
 
-            # First call computes and caches
-            c1 = mgr.total_buffer_chars()
-            self.assertEqual(c1, 500)
-            self.assertEqual(node.total_buffer_chars.call_count, 1)
+        before = self.manager.total_buffer_chars()
+        run.append_output("x" * 50)
+        session.append_scrollback("y" * 30)
+        after = self.manager.total_buffer_chars()
+        self.assertEqual(after - before, 80, "runs AND scrollback must be accounted")
+        self.assertEqual(node.total_buffer_chars(), 80)
 
-            # Second call within 250ms uses cache without calling node.total_buffer_chars again
-            c2 = mgr.total_buffer_chars()
-            self.assertEqual(c2, 500)
-            self.assertEqual(node.total_buffer_chars.call_count, 1)
-        finally:
-            mgr.close_all()
+        # freeing must return the account to its previous value
+        with run.lock:
+            run.discard_all_output()
+        with session.lock:
+            session.scrollback.clear()
+        self.assertEqual(self.manager.total_buffer_chars(), before)
 
     def test_server_node_epoch_closes_connecting_session_if_node_closed(self):
         """Verify ServerNode.open_session detects node closure / epoch change and prevents zombie sessions."""
@@ -1199,6 +1210,251 @@ class TestMultiServer(unittest.TestCase):
         self.assertIsNotNone(self.manager.registry.get("legacy"))
         self.assertIn("legacy", self.manager.nodes)
         node.close_all.assert_not_called()
+
+    def test_sequential_runs_reuse_single_session(self):
+        """T1.1/F3: 11 sequential run() calls without session_id must use ONE session (was: hard failure on #11)."""
+        cfg = ServerTargetConfig(alias="box", host="10.9.9.9", user="u", max_sessions=10)
+        self.manager.registry.register(cfg)
+        node = self.manager.get_or_create_node(cfg)
+
+        def fake_connect(session):
+            session.is_dead = False
+            session.client = MagicMock()
+            session.channel = MagicMock()
+            session.channel.closed = False
+            return True
+
+        def fake_run_command(session, **kwargs):
+            return {
+                "success": True, "output": "ok", "status": "completed",
+                "session_id": f"box/{session.id}", "numeric_session_id": session.id, "server": "box",
+            }
+
+        with patch.object(SSHSession, "connect", fake_connect), \
+             patch.object(SSHSession, "is_alive", lambda s: not s.is_dead), \
+             patch.object(SSHSession, "ensure_alive", lambda s: None), \
+             patch.object(SSHSession, "run_command", fake_run_command):
+            sids = set()
+            for i in range(1, 12):
+                resp = handle_request({
+                    "jsonrpc": "2.0", "id": i, "method": "tools/call",
+                    "params": {"name": "run", "arguments": {"server": "box", "command": "echo %d" % i}},
+                }, self.manager)
+                self.assertIsNone(resp.get("error"), resp)
+                payload = json.loads(resp["result"]["content"][0]["text"])
+                self.assertNotIn("error", payload, payload)
+                self.assertEqual(payload.get("output"), "ok")
+                sids.add(payload["session_id"])
+        self.assertEqual(len(sids), 1, f"expected one reused session, got {sorted(sids)}")
+        self.assertEqual(len(node.sessions), 1)
+
+    def test_concurrent_runs_pick_separate_sessions(self):
+        """T1.1/F3: two concurrent runs must both succeed and never share one busy PTY."""
+        cfg = ServerTargetConfig(alias="race", host="10.6.6.6", user="u", max_sessions=10)
+        self.manager.registry.register(cfg)
+        node = self.manager.get_or_create_node(cfg)
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_connect(session):
+            session.is_dead = False
+            session.client = MagicMock()
+            session.channel = MagicMock()
+            session.channel.closed = False
+            return True
+
+        def fake_run_command(session, **kwargs):
+            with session.lock:
+                if session.active_run_id is not None:
+                    return {
+                        "success": False,
+                        "error": f"Session {session.id} is busy running 'x'.",
+                        "session_id": f"race/{session.id}", "numeric_session_id": session.id, "server": "race",
+                    }
+                session.active_run_id = session.run_counter
+                session.run_counter += 1
+            started.set()
+            release.wait(5.0)
+            with session.lock:
+                session.active_run_id = None
+            return {
+                "success": True, "output": "ok", "status": "completed",
+                "session_id": f"race/{session.id}", "numeric_session_id": session.id, "server": "race",
+            }
+
+        results = []
+
+        def worker():
+            resp = handle_request({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "run", "arguments": {"server": "race", "command": "echo hi"}},
+            }, self.manager)
+            results.append(resp)
+
+        with patch.object(SSHSession, "connect", fake_connect), \
+             patch.object(SSHSession, "is_alive", lambda s: not s.is_dead), \
+             patch.object(SSHSession, "ensure_alive", lambda s: None), \
+             patch.object(SSHSession, "run_command", fake_run_command):
+            first = threading.Thread(target=worker)
+            first.start()
+            self.assertTrue(started.wait(5.0), "first run never started")
+            second = threading.Thread(target=worker)
+            second.start()
+            second.join(10.0)
+            release.set()
+            first.join(10.0)
+
+        self.assertEqual(len(results), 2)
+        for resp in results:
+            self.assertIsNone(resp.get("error"), resp)
+            body = json.loads(resp["result"]["content"][0]["text"])
+            self.assertNotIn("error", body, body)
+            self.assertEqual(body.get("output"), "ok")
+        self.assertGreaterEqual(len(node.sessions), 1)
+        self.assertLessEqual(len(node.sessions), 2, "each command must get its own terminal")
+
+    def test_concurrent_runs_same_explicit_session_strictly_rejects_second_without_new_session(self):
+        """If an agent targets an explicit session_id, parallel commands must NOT create a new session;
+        the loser must fail with a busy error so session state is never silently substituted."""
+        cfg = ServerTargetConfig(alias="explicit_box", host="10.7.7.7", user="u", max_sessions=10)
+        self.manager.registry.register(cfg)
+        node = self.manager.get_or_create_node(cfg)
+        session = SSHSession(1, "", self.cache_dirs, "test", server_config=cfg)
+        session.is_dead = False
+        session.client = MagicMock()
+        session.channel = MagicMock()
+        session.channel.closed = False
+        with node.lock:
+            node.sessions[1] = session
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_run_command(**kwargs):
+            with session.lock:
+                if session.active_run_id is not None:
+                    return {
+                        "success": False,
+                        "error": f"Session {session.id} is busy running 'first_cmd'.",
+                        "session_id": f"explicit_box/{session.id}",
+                        "numeric_session_id": session.id,
+                        "server": "explicit_box",
+                    }
+                session.active_run_id = 99
+            started.set()
+            release.wait(5.0)
+            with session.lock:
+                session.active_run_id = None
+            return {
+                "success": True, "output": "first done", "status": "completed",
+                "session_id": f"explicit_box/{session.id}",
+                "numeric_session_id": session.id,
+                "server": "explicit_box",
+            }
+
+        session.run_command = fake_run_command
+
+        results = []
+
+        def worker(cmd):
+            resp = handle_request({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "run", "arguments": {
+                    "server": "explicit_box",
+                    "session_id": "explicit_box/1",
+                    "command": cmd
+                }},
+            }, self.manager)
+            results.append(resp)
+
+        t1 = threading.Thread(target=worker, args=("cmd1",))
+        t1.start()
+        self.assertTrue(started.wait(5.0), "first run never started")
+
+        t2 = threading.Thread(target=worker, args=("cmd2",))
+        t2.start()
+        t2.join(5.0)
+        release.set()
+        t1.join(5.0)
+
+        self.assertEqual(len(results), 2)
+        successes = [r for r in results if not r.get("result", {}).get("isError")]
+        failures = [r for r in results if r.get("result", {}).get("isError")]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        fail_body = json.loads(failures[0]["result"]["content"][0]["text"])
+        self.assertFalse(fail_body["success"])
+        self.assertIn("busy", fail_body["error"].lower())
+
+        # Crucial invariant: NO new session was opened in background!
+        self.assertEqual(len(node.sessions), 1, "no new session must be created for explicit session_id")
+
+    def test_cancelled_request_interrupts_active_run(self):
+        """T1.4/F12: notifications/cancelled must stop the exact run it names, once."""
+        import os
+        import time
+        from src.ssh_state import RunState
+        cfg = ServerTargetConfig(alias="cx", host="10.8.8.8", user="u")
+        self.manager.registry.register(cfg)
+        node = self.manager.get_or_create_node(cfg)
+        session = SSHSession(1, "", self.cache_dirs, "test", server_config=cfg)
+        channel = MagicMock()
+        channel.closed = False
+        channel.recv_ready.return_value = False
+        session.channel = channel
+        session.client = MagicMock()
+        session.is_dead = False
+        run = RunState(
+            run_id=1, session_id=1, command="sleep 300", mode="sync",
+            started_at=time.time(), wait_timeout=5.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "cancel.log"),
+        )
+        run.req_id = 42
+        session.runs[1] = run
+        session.active_run_id = 1
+        session.inflight_by_req[42] = 1
+        node.sessions[1] = session
+
+        resp = handle_request({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                               "params": {"requestId": 42}}, self.manager)
+        self.assertIsNone(resp)
+        self.assertTrue(run.interrupt_sent)
+        channel.send.assert_called_with("\x03")
+
+        # after the run is done a late cancel must not touch anything else
+        run.mark_done("interrupted", completion_method="interrupted")
+        send_calls = channel.send.call_count
+        resp = handle_request({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                               "params": {"requestId": 42}}, self.manager)
+        self.assertIsNone(resp)
+        self.assertEqual(channel.send.call_count, send_calls)
+
+    def test_concurrent_appends_keep_buffer_and_accounting_consistent(self):
+        """T4.3/F7: concurrent writers must not corrupt the chunk buffer or the char account."""
+        from src.ssh_state import RunState, CHARS_ACCOUNT
+        run = RunState(
+            run_id=1, session_id=1, command="x", mode="sync", started_at=time.time(),
+            wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "race-buf.log"),
+        )
+        before = CHARS_ACCOUNT.total
+
+        def writer(tag):
+            for _ in range(200):
+                run.append_output(tag)
+
+        threads = [threading.Thread(target=writer, args=(c,)) for c in "ab"]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(run.buffer_len, 400)
+        self.assertEqual(len(run.output_buffer), 400)
+        self.assertEqual(CHARS_ACCOUNT.total - before, 400, "accounting must track every append")
+        with run.lock:
+            freed = run.discard_all_output()
+        self.assertEqual(freed, 400)
+        self.assertEqual(CHARS_ACCOUNT.total, before)
 
     def test_ensure_session_does_not_open_two(self):
         cfg = ServerTargetConfig(alias="one", host="10.0.0.1", user="u")

@@ -101,60 +101,120 @@ def parse_exit_marker(text: str, token: str) -> Optional[int]:
     return None
 
 
-def resolve_local_path(path: str) -> str:
+def _is_within(norm_real: str, norm_root: str) -> bool:
+    """True when norm_real is inside norm_root. Both must already be normcase'd."""
+    if not norm_root:
+        return False
+    try:
+        return os.path.commonpath([norm_root, norm_real]) == norm_root
+    except ValueError:
+        return False
+
+
+def resolve_local_path(path: str, for_write: bool = True) -> str:
+    """Resolve a local path and contain it.
+
+    Allowed roots: PROJECT_ROOT (when it is not a filesystem root), the gateway
+    cache directory, and - only with ALLOW_SYSTEM_TEMP - the system temp
+    directory (shared and world-writable on POSIX, hence opt-in). The gateway
+    install directory is refused for writes even inside PROJECT_ROOT unless
+    ALLOW_GATEWAY_DIR, and protected credential files are safeguarded (see
+    _protected_local_write and _protected_local_read).
+    """
     if not path:
         return ""
     expanded = os.path.expanduser(os.path.expandvars(path.strip()))
     # Use realpath to resolve symlinks and prevent symlink bypass (Fix L1)
     real_path = os.path.realpath(expanded)
     norm_real = os.path.normcase(real_path)
-    
-    # Sandboxing check
-    project_root = os.path.realpath(config.PROJECT_ROOT) if config.PROJECT_ROOT else ""
-    system_temp = os.path.realpath(tempfile.gettempdir())
-    norm_project = os.path.normcase(project_root) if project_root else ""
-    norm_temp = os.path.normcase(system_temp) if system_temp else ""
-    
-    def _inside_temp() -> bool:
-        if not norm_temp:
-            return False
-        try:
-            return os.path.commonpath([norm_temp, norm_real]) == norm_temp
-        except ValueError:
-            return False
+    gateway_root = getattr(config, "GATEWAY_ROOT", "") or ""
+    allow_gateway = bool(getattr(config, "ALLOW_GATEWAY_DIR", False))
+    allow_temp = bool(getattr(config, "ALLOW_SYSTEM_TEMP", False))
 
-    if not project_root or _is_filesystem_root(project_root):
-        if not _inside_temp():
-            why = "empty" if not project_root else "a filesystem root"
+    project_root = os.path.realpath(config.PROJECT_ROOT) if config.PROJECT_ROOT else ""
+    norm_project = os.path.normcase(project_root) if project_root else ""
+    # A filesystem root is not a sandbox: never treat it as a writable area.
+    if norm_project and _is_filesystem_root(project_root):
+        norm_project = ""
+
+    cache_root = ""
+    cache_dirs = getattr(config, "CACHE_DIRS", None)
+    if isinstance(cache_dirs, dict) and cache_dirs.get("cache_root"):
+        cache_root = os.path.realpath(cache_dirs["cache_root"])
+    norm_cache = os.path.normcase(cache_root) if cache_root else ""
+    norm_temp = os.path.normcase(os.path.realpath(tempfile.gettempdir()))
+    norm_gateway = os.path.normcase(os.path.realpath(gateway_root)) if gateway_root else ""
+
+    in_project = _is_within(norm_real, norm_project)
+    in_cache = _is_within(norm_real, norm_cache)
+    in_temp = allow_temp and _is_within(norm_real, norm_temp)
+    in_gateway = _is_within(norm_real, norm_gateway)
+
+    if not (in_project or in_cache or in_temp):
+        temp_hint = "" if allow_temp else " System temp is disabled (use --allow-system-temp)."
+        log_error(
+            f"Security: Path '{path}' resolves to '{real_path}' which is outside project root "
+            f"'{project_root}' and the gateway cache directory. Access denied.{temp_hint}"
+        )
+        return ""
+
+    if for_write:
+        if in_gateway and not in_cache and not allow_gateway:
+            # in_cache wins: the default layout keeps .ssh-cache inside the install
+            # dir, and the cache is the gateway's own scratch space.
             log_error(
-                f"Security: PROJECT_ROOT '{project_root}' is {why}. "
-                f"Path '{path}' is denied outside the temp directory."
+                f"Security: Path '{path}' is inside the gateway install directory '{gateway_root}'. "
+                "Rewriting the gateway's own files through the file tool is refused "
+                "(use --allow-gateway-dir for gateway development)."
             )
             return ""
+
+        # PROJECT_ROOT is the writable area. servers.json is the password store and
+        # .git is repository metadata; remote stdout must not replace either. The
+        # gateway's own code and config are protected too (see _protected_local_write).
         if _protected_local_write(real_path):
             log_error(f"Security: Path '{path}' resolves to a protected file '{real_path}'. Access denied.")
             return ""
-        return real_path
-
-    in_project = False
-    try:
-        if norm_project and os.path.commonpath([norm_project, norm_real]) == norm_project:
-            in_project = True
-    except ValueError:
-        pass
-
-    if not in_project and not _inside_temp():
-        log_error(f"Security: Path '{path}' resolves to '{real_path}' which is outside project root '{project_root}' and temp directory. Access denied.")
-        return ""
-
-    # PROJECT_ROOT is the writable area. Do not deny *.py: a download into the
-    # workspace is a normal file write. servers.json is the password store and
-    # .git is repository metadata; remote stdout must not replace either.
-    if _protected_local_write(real_path):
-        log_error(f"Security: Path '{path}' resolves to a protected file '{real_path}'. Access denied.")
-        return ""
+    else:
+        if _protected_local_read(real_path):
+            log_error(f"Security: Path '{path}' resolves to a protected credential file '{real_path}'. Access denied.")
+            return ""
 
     return real_path
+
+
+def _protected_local_read(real_path: str) -> bool:
+    norm_path = os.path.normcase(real_path).replace("\\", "/")
+    parts = norm_path.split("/")
+    if ".git" in parts:
+        return True
+    base_name = os.path.basename(norm_path).lower()
+    if base_name in {
+        "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+        "servers.json", "servers.json.example",
+    } or base_name.endswith(".ppk"):
+        return True
+    config_path = getattr(config, "SERVERS_CONFIG_PATH", None) or ""
+    if config_path:
+        try:
+            if os.path.normcase(real_path) == os.path.normcase(os.path.realpath(os.path.expanduser(config_path))):
+                return True
+        except Exception:
+            pass
+    try:
+        registry = getattr(config, "registry", None)
+        if registry:
+            for s in registry.list_all():
+                kp = getattr(s, "key_path", None)
+                if kp:
+                    try:
+                        if os.path.normcase(real_path) == os.path.normcase(os.path.realpath(os.path.expanduser(kp))):
+                            return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return False
 
 
 def _protected_local_write(real_path: str) -> bool:
@@ -163,8 +223,26 @@ def _protected_local_write(real_path: str) -> bool:
     if ".git" in parts:
         return True
     base_name = os.path.basename(norm_path).lower()
-    if base_name in {"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "servers.json", "servers.json.example"} or base_name.endswith(".ppk"):
+    # Gateway/client configuration stores (credentials, MCP commands) and SSH keys
+    # are protected unconditionally, in any directory.
+    if base_name in {
+        "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+        "servers.json", "servers.json.example", "mcp.json", "mcp-server.py",
+    } or base_name.endswith(".ppk"):
         return True
+    # The gateway's own code and packaging must never be rewritten through the file
+    # tool, even with --allow-gateway-dir (that flag opens the rest of the repo for
+    # gateway development). A download from an untrusted host must not become local
+    # code execution on the next restart.
+    gateway_root = getattr(config, "GATEWAY_ROOT", "") or ""
+    if gateway_root:
+        try:
+            norm_gateway = os.path.normcase(os.path.realpath(gateway_root))
+            if os.path.commonpath([norm_gateway, os.path.normcase(real_path)]) == norm_gateway:
+                if base_name.endswith(".py") or base_name in {"requirements.txt", "dockerfile"}:
+                    return True
+        except (ValueError, OSError):
+            pass
     config_path = getattr(config, "SERVERS_CONFIG_PATH", None) or ""
     if config_path:
         try:
@@ -210,6 +288,11 @@ def clean_output(text: str, remove_echo: bool = False) -> str:
     return text.strip()
 
 def json_line(path: str, payload: Dict[str, Any]) -> None:
+    if getattr(config, "LOG_OUTPUT", "meta") == "off":
+        return
+    # Never let obvious secrets reach the log store (T2.5/F7).
+    if isinstance(payload, dict) and payload.get("command"):
+        payload = {**payload, "command": mask_secrets(str(payload["command"]))}
     try:
         with _get_file_lock(path):
             if os.path.exists(path):
@@ -227,16 +310,49 @@ def json_line(path: str, payload: Dict[str, Any]) -> None:
 def make_cache_dirs(cache_root: str) -> Dict[str, str]:
     sessions_dir = os.path.join(cache_root, "sessions")
     runs_dir = os.path.join(cache_root, "runs")
-    os.makedirs(sessions_dir, exist_ok=True)
-    os.makedirs(runs_dir, exist_ok=True)
+    # Run/session logs can contain secrets (command text, raw output): keep the
+    # cache private to the owner. mode= is ignored on Windows, chmod is harmless.
+    for directory in (cache_root, sessions_dir, runs_dir):
+        os.makedirs(directory, exist_ok=True)
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
     return {
         "cache_root": cache_root,
         "sessions_dir": sessions_dir,
         "runs_dir": runs_dir,
     }
 
-def cleanup_old_logs(cache_dirs: Dict[str, str], max_age_seconds: float = 7 * 86400, max_files: int = 500) -> int:
-    """Removes log files in cache_dirs older than max_age_seconds or exceeding max_files. Returns count of deleted files."""
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization|passphrase)\b(\s*[=:]\s*)(\S+)"
+)
+_SECRET_FLAG = re.compile(r"(?i)(--?(?:password|passphrase|token|secret|api[_-]?key)[= ])(\S+)")
+
+
+def mask_secrets(text: str) -> str:
+    """Best-effort masking of secret-looking fragments in command/log text (T2.5/F7).
+
+    Not a security boundary (values can still be split or encoded) - it keeps
+    accidental leaks out of the on-disk logs and diagnostics.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    text = _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}******", text)
+    text = _SECRET_FLAG.sub(lambda m: f"{m.group(1)}******", text)
+    return text
+
+
+def cleanup_old_logs(
+    cache_dirs: Dict[str, str],
+    max_age_seconds: float = 7 * 86400,
+    max_files: int = 500,
+    max_total_bytes: int = 0,
+) -> int:
+    """Removes log files in cache_dirs older than max_age_seconds, exceeding
+    max_files, or beyond the max_total_bytes budget (oldest first). Returns the
+    count of deleted files. Pass max_total_bytes>0 to bound disk usage - a file
+    count alone is not a bound (T2.5/F7)."""
     now = time.time()
     deleted_count = 0
     for dir_key in ("runs_dir", "sessions_dir"):
@@ -248,12 +364,12 @@ def cleanup_old_logs(cache_dirs: Dict[str, str], max_age_seconds: float = 7 * 86
             for entry in os.scandir(target_dir):
                 if entry.is_file() and entry.name.endswith(".log"):
                     try:
-                        mtime = entry.stat().st_mtime
-                        entries.append((entry.path, mtime))
+                        stat = entry.stat()
+                        entries.append((entry.path, stat.st_mtime, stat.st_size))
                     except OSError:
                         pass
             remaining = []
-            for path, mtime in entries:
+            for path, mtime, size in entries:
                 if (now - mtime) > max_age_seconds:
                     try:
                         os.remove(path)
@@ -261,16 +377,30 @@ def cleanup_old_logs(cache_dirs: Dict[str, str], max_age_seconds: float = 7 * 86
                     except OSError:
                         pass
                 else:
-                    remaining.append((path, mtime))
+                    remaining.append((path, mtime, size))
             if len(remaining) > max_files:
                 remaining.sort(key=lambda x: x[1])
                 to_delete = remaining[:-max_files]
-                for path, _ in to_delete:
+                remaining = remaining[-max_files:]
+                for path, _mtime, _size in to_delete:
                     try:
                         os.remove(path)
                         deleted_count += 1
                     except OSError:
                         pass
+            if max_total_bytes > 0 and remaining:
+                # Newest first: keep as much recent history as fits the budget.
+                remaining.sort(key=lambda x: x[1], reverse=True)
+                total_bytes = 0
+                for path, _mtime, size in remaining:
+                    if total_bytes + size > max_total_bytes:
+                        try:
+                            os.remove(path)
+                            deleted_count += 1
+                        except OSError:
+                            pass
+                        continue
+                    total_bytes += size
         except Exception as e:
             log_error(f"Error during cleanup_old_logs in {target_dir}: {e}")
     return deleted_count

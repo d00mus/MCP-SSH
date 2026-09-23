@@ -205,6 +205,46 @@ def _read_remote_file_bytes(
     finally:
         _close_exec_streams(stdin, stdout, stderr)
 
+def _parse_mode(text) -> Optional[str]:
+    """Extract an octal file mode from remote output. Defensive: remote/mock output
+    may be anything, and a mode is optional anyway."""
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"\b([0-7]{3,4})\b", text)
+    return m.group(1) if m else None
+
+
+def _exec_simple(session, cmd: str, timeout: float = 15.0) -> str:
+    """Run one non-interactive command and return its stdout ("" on any failure)."""
+    streams = []
+    try:
+        stdin, stdout, stderr = session.client.exec_command(cmd)
+        streams = [stdin, stdout, stderr]
+        if getattr(stdout, "channel", None) is not None:
+            stdout.channel.settimeout(timeout)
+        return stdout.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    finally:
+        _close_exec_streams(*streams)
+
+
+def _shell_file_mode(session, safe_path: str) -> Optional[str]:
+    """Octal mode of an existing remote file via the interactive shell (T2.1/F6)."""
+    res = _sync_shell(
+        session,
+        f"stat -c %a '{safe_path}' 2>/dev/null || stat -f %Lp '{safe_path}' 2>/dev/null",
+        timeout=5.0, internal=True,
+    )
+    return _parse_mode(res.get("output") if isinstance(res, dict) else "")
+
+
+def _restore_shell_mode(session, safe_path: str, mode: Optional[str]) -> None:
+    """Restore permissions after tmp+mv, which would otherwise reset them (T2.1/F6)."""
+    if mode:
+        _sync_shell(session, f"chmod {mode} '{safe_path}'", timeout=5.0, internal=True)
+
+
 def _write_remote_file_bytes(
     session: SSHSession,
     path: str,
@@ -212,12 +252,43 @@ def _write_remote_file_bytes(
 ) -> Dict[str, Any]:
     sftp = session.open_sftp()
     if sftp is not None:
+        tmp_sftp = f"{path}.mcp_tmp.{int(time.time() * 1000)}_{os.getpid()}"
         try:
-            with sftp.file(path, "wb") as handle:
+            # T2.1/F6: write a sibling temp file and rename it over the target so a
+            # failed write can never leave a half-written file, and keep permissions.
+            original_mode = None
+            try:
+                mode = sftp.stat(path).st_mode
+                if isinstance(mode, int):
+                    original_mode = mode & 0o7777
+            except Exception:
+                pass
+            with sftp.file(tmp_sftp, "wb") as handle:
                 handle.write(payload_bytes)
+            renamed = False
+            try:
+                sftp.posix_rename(tmp_sftp, path)  # atomic overwrite (OpenSSH)
+                renamed = True
+            except Exception:
+                try:
+                    sftp.rename(tmp_sftp, path)
+                    renamed = True
+                except Exception:
+                    renamed = False
+            if not renamed:
+                raise RuntimeError("sftp cannot overwrite atomically, falling back to shell")
+            if original_mode is not None:
+                try:
+                    sftp.chmod(path, original_mode)
+                except Exception as exc:
+                    log_error(f"sftp chmod restore failed for {path}: {exc}")
             return {"success": True, "method": "sftp"}
         except Exception as exc:
             log_error(f"sftp write failed, fallback shell: {exc}")
+            try:
+                sftp.remove(tmp_sftp)
+            except Exception:
+                pass
         finally:
             try:
                 sftp.close()
@@ -243,6 +314,11 @@ def _write_remote_file_bytes(
             stdout_dir.channel.settimeout(30.0)
         stdout_dir.channel.recv_exit_status() # wait for completion
         
+        # T2.1/F6: keep the original permissions across tmp+mv (mv resets them).
+        original_mode = _parse_mode(_exec_simple(
+            session, f"stat -c %a '{safe_path}' 2>/dev/null || stat -f %Lp '{safe_path}' 2>/dev/null"
+        ))
+
         # Write file atomically using remote tmp file + mv
         cat_marker = f"MCP_CAT_OK_{stamp}"
         stdin, stdout, stderr = session.client.exec_command(f"cat > '{tmp_remote}' && mv -f '{tmp_remote}' '{safe_path}' && echo '{cat_marker}'")
@@ -270,6 +346,8 @@ def _write_remote_file_bytes(
             raise RuntimeError("exec_command not supported or unverified, falling back to sync_shell")
             
         if exit_code == 0 and cat_marker in out:
+            if original_mode:
+                _exec_simple(session, f"chmod {original_mode} '{safe_path}'")
             return {"success": True, "method": "exec_cat"}
         else:
             rm_in = rm_out = rm_err = None
@@ -285,6 +363,7 @@ def _write_remote_file_bytes(
             return {"success": False, "error": f"exec cat write failed with exit code {exit_code}: {err}", "session_id": session.id}
     except Exception as exc:
         log_error(f"exec cat write failed, falling back to sync_shell echo/cat: {exc}")
+        shell_mode = _shell_file_mode(session, safe_path)
         _sync_shell(session, f"mkdir -p \"$(dirname '{safe_path}')\"", timeout=10.0, internal=True)
         
         # Split base64 into 76-character chunks to avoid MAX_CANON terminal overflow (RFC 2045)
@@ -305,6 +384,7 @@ def _write_remote_file_bytes(
         decode_res = _sync_shell(session, decode_cmd, timeout=10.0, internal=True)
         output = decode_res.get("output", "")
         if decode_res.get("success", False) and re.search(rf"^(?:.*?[#$>]\s*)?{re.escape(marker_ok)}\s*$", output, re.MULTILINE):
+            _restore_shell_mode(session, safe_path, shell_mode)
             return {"success": True, "method": "shell_base64_write"}
         else:
             _sync_shell(session, f"rm -f {tmp_path} '{tmp_remote}'", timeout=5.0, internal=True)
@@ -335,6 +415,7 @@ def _write_remote_file_bytes(
             )
             write_res = _sync_shell(session, heredoc_cmd, timeout=15.0, internal=True)
             if write_res.get("success", False) and re.search(rf"^(?:.*?[#$>]\s*)?{re.escape(marker_hd_ok)}\s*$", write_res.get("output", ""), re.MULTILINE):
+                _restore_shell_mode(session, safe_path, shell_mode)
                 return {"success": True, "method": "shell_cat_heredoc"}
             return {"success": False, "error": "Interactive shell write failed", "session_id": session.id}
     finally:
@@ -366,13 +447,44 @@ def _slice_text_by_lines(text: str, offset_line: Optional[int], limit_lines: int
     }
 
 def _download_remote_to_path(session: SSHSession, remote_path: str, local_path: str) -> Dict[str, Any]:
-    """Stream a remote file to disk. Never load the whole file into memory."""
+    """Stream a remote file to disk. Never load the whole file into memory.
+
+    The bytes land in a sibling temp file which is re-validated and atomically moved
+    into place (T2.3/F2): between the path check and the write a local process must
+    not be able to swap a parent directory for a symlink and redirect the write.
+    """
+    part_path = f"{local_path}.part-{os.getpid()}-{int(time.time() * 1000)}"
+
+    def _drop_part() -> None:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+
+    def _open_part():
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(part_path, flags, 0o600)
+        return os.fdopen(fd, "wb")
+
+    def _finalize() -> Optional[str]:
+        # Re-check AFTER the bytes landed: the validated path must still resolve to
+        # the same place and must not have become a symlink in the meantime.
+        if os.path.islink(local_path):
+            return f"Security: '{local_path}' is a symlink - refusing to overwrite"
+        revalidated = resolve_local_path(local_path)
+        if not revalidated or os.path.normcase(revalidated) != os.path.normcase(local_path):
+            return f"Security: '{local_path}' failed revalidation before replace - refusing"
+        os.replace(part_path, local_path)
+        return None
+
     sftp = session.open_sftp()
     if sftp is not None:
         try:
             total = 0
             hasher = hashlib.sha256()
-            with sftp.file(remote_path, "rb") as handle, open(local_path, "wb") as out:
+            with sftp.file(remote_path, "rb") as handle, _open_part() as out:
                 while True:
                     chunk = handle.read(_DOWNLOAD_CHUNK)
                     if not chunk:
@@ -382,23 +494,20 @@ def _download_remote_to_path(session: SSHSession, remote_path: str, local_path: 
                         raise OverflowError("download exceeds cap")
                     out.write(chunk)
                     hasher.update(chunk)
+            err = _finalize()
+            if err:
+                _drop_part()
+                return {"success": False, "error": err}
             return {"success": True, "method": "sftp", "size": total, "sha256": hasher.hexdigest()}
         except OverflowError:
-            try:
-                os.remove(local_path)
-            except OSError:
-                pass
+            _drop_part()
             return {
                 "success": False,
                 "error": f"download exceeds {MAX_DOWNLOAD_BYTES} bytes; narrow the path or download in chunks",
             }
         except Exception as exc:
             log_error(f"sftp download failed, fallback capped read: {exc}")
-            try:
-                if os.path.exists(local_path):
-                    os.remove(local_path)
-            except OSError:
-                pass
+            _drop_part()
         finally:
             try:
                 sftp.close()
@@ -414,8 +523,16 @@ def _download_remote_to_path(session: SSHSession, remote_path: str, local_path: 
             "error": f"download exceeds {MAX_DOWNLOAD_BYTES} bytes; narrow the path or download in chunks",
         }
     data = read_result["data"]
-    with open(local_path, "wb") as handle:
-        handle.write(data)
+    try:
+        with _open_part() as handle:
+            handle.write(data)
+    except Exception as exc:
+        _drop_part()
+        return {"success": False, "error": f"failed to stage download: {exc}"}
+    err = _finalize()
+    if err:
+        _drop_part()
+        return {"success": False, "error": err}
     return {
         "success": True,
         "method": read_result.get("method"),
@@ -428,6 +545,7 @@ def _file_busy_error(session, node) -> Dict[str, Any]:
     alias = getattr(session, "server_alias", node.alias)
     return {
         "success": False,
+        "error_code": "busy",
         "error": f"Session {alias}/{session.id} is busy",
         "session_id": f"{alias}/{session.id}",
         "server": node.alias,
@@ -469,7 +587,7 @@ def file_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     if effective_readonly and action in {"write", "edit", "upload"}:
         return {
             "success": False,
-            "error": f"Security: action '{action}' is blocked in read-only sandbox mode on server '{node.alias}'.",
+            "error": f"Security: action '{action}' is blocked in read-only guardrail mode on server '{node.alias}'.",
             "server": node.alias
         }
 
@@ -507,8 +625,12 @@ def _file_dispatch_held(args: Dict[str, Any], session, node) -> Dict[str, Any]:
     num_id = getattr(session, "id", None)
     sid_str = f"{srv_str}/{num_id}" if srv_str else num_id
 
+    if action == "upload": action = "write"
+    if action == "download": action = "read"
+
+    is_local_read = action == "write"
     if raw_local_path:
-        local_path = resolve_local_path(raw_local_path)
+        local_path = resolve_local_path(raw_local_path, for_write=not is_local_read)
         if not local_path:
             return {
                 "success": False,
@@ -521,9 +643,6 @@ def _file_dispatch_held(args: Dict[str, Any], session, node) -> Dict[str, Any]:
 
     content = args.get("content")
     is_base64 = to_bool(args.get("is_base64", False))
-
-    if action == "upload": action = "write"
-    if action == "download": action = "read"
 
     if action == "list":
         target = path or "/"
@@ -809,16 +928,42 @@ def _file_dispatch_held(args: Dict[str, Any], session, node) -> Dict[str, Any]:
 
         updated_bytes = updated_text.encode("utf-8")
         changed = updated_bytes != original_bytes
+        old_sha256 = _sha256_hex(original_bytes)
         result_payload = {
             "success": True, "action": "edit", "mode": "edit", "path": path,
             "changed": changed, "replacements": total_replacements, "dry_run": dry_run,
-            "old_sha256": _sha256_hex(original_bytes), "new_sha256": _sha256_hex(updated_bytes), "size": len(updated_bytes),
+            "old_sha256": old_sha256, "new_sha256": _sha256_hex(updated_bytes), "size": len(updated_bytes),
             "session_id": sid_str, "numeric_session_id": session.id, "server": srv_str, "status": "completed"
         }
 
         if dry_run or not changed:
             result_payload["method"] = read_result["method"]
             return result_payload
+
+        # T2.2/F6: never clobber a concurrent change (TOCTOU between read and write).
+        def _edit_conflict(actual_sha: str) -> Dict[str, Any]:
+            return {
+                "success": False,
+                "error_code": "conflict",
+                "error": (
+                    f"conflict: '{path}' changed since it was read - refusing to overwrite. "
+                    "Re-read the file and reapply the edit."
+                ),
+                "path": path,
+                "actual_sha256": actual_sha,
+                "session_id": sid_str,
+                "server": srv_str,
+            }
+
+        expected_sha = args.get("expected_sha256")
+        if expected_sha and str(expected_sha).strip().lower() != old_sha256:
+            return _edit_conflict(old_sha256)
+        fresh = _read_remote_file_bytes(session, path, max_bytes=edit_max_bytes)
+        if not fresh.get("success", False):
+            return fresh
+        fresh_sha = _sha256_hex(fresh["data"])
+        if fresh_sha != old_sha256:
+            return _edit_conflict(fresh_sha)
 
         if create_backup:
             backup_path = f"{path}.mcp.bak"

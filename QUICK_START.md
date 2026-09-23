@@ -74,7 +74,7 @@ docker build -t mcp-ssh-server .
       "args": [
         "C:\\tools\\ssh-gateway\\mcp-server.py",
         "--servers-config", "C:\\tools\\ssh-gateway\\servers.json",
-        "--project-root", "C:\\tools\\ssh-gateway"
+        "--project-root", "C:\\work"
       ],
       "env": {
         "KEENETIC_PASSWORD": "your_secure_password"
@@ -134,13 +134,13 @@ docker build -t mcp-ssh-server .
    - Composite session ID: `run(session_id="nas/1", command="zpool status")`
    - **Direct Output:** For commands completing within 5.0s, output is returned directly in the response. Do NOT call `read` after a completed command!
    - **Long-Running Commands:** Commands taking longer than 5.0s return `still_running: true` without failing. Read their remaining output via `read`.
-   - **Sequential vs Concurrent:** Pass `session_id` to run sequential commands in the same session. Omit `session_id` to start a new concurrent session.
+   - **Sequential vs Concurrent:** Pass `session_id` to run sequential commands in the same session. Omit `session_id` to reuse an idle session (or pass `new_session: true` for a clean one).
    - **Async Execution:** Pass `wait_timeout: 0` for immediate confirmed start in background.
    - **Standard Shell Pipelines:** Use standard `| grep`, `| awk`, `| head` inside the command string for filtering.
    - **Multiline code / scripts:** For Python snippets (`python3 -c "..."`) or scripts with newlines, pass `use_pty: false` to avoid secondary prompt (`>`) issues in PTY.
 3. **Session Management (1 Session = 1 Terminal):**
    - An SSH session is a single terminal process (PTY). Never send concurrent commands to the same session.
-   - Reuse `session_id` for sequential steps; omit `session_id` (or pass `new_session: true`) to execute commands in parallel in a new clean session.
+   - Reuse `session_id` for sequential steps; pass `new_session: true` to execute commands in parallel in a clean session (omitting `session_id` reuses an idle one).
    - Close temporary diagnostic sessions with `session_close` when done to free the session limit.
    - For Keenetic: keep NDM CLI (`shell: false`) and Linux shell (`shell: true`) in separate sessions.
 4. **Buffered Output, Scrolling & Rewind (`read`):**

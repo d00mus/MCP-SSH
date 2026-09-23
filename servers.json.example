@@ -4,7 +4,7 @@
       "host": "192.168.1.1",
       "port": 22,
       "user": "admin",
-      "password": "${KEENETIC_PASSWORD:-admin123}",
+      "password": "${KEENETIC_PASSWORD}",
       "description": "Keenetic Ultra router (gateway & Entware)",
       "verify_host": false,
       "extra_path": "/opt/bin:/opt/sbin"
@@ -21,7 +21,7 @@
       "host": "203.0.113.5",
       "port": 2222,
       "user": "ubuntu",
-      "key_path": "${VPS_KEY_PATH:-~/.ssh/vps_key}",
+      "key_path": "${VPS_KEY_PATH}",
       "read_only": true,
       "command_blacklist": [
         "reboot",
@@ -30,7 +30,7 @@
         "rm -rf",
         "dd"
       ],
-      "description": "Production cloud server (read-only sandbox)"
+      "description": "Production cloud server (read-only guardrail)"
     }
   }
 }

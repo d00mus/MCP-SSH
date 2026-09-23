@@ -490,6 +490,17 @@ class TestSSH(unittest.TestCase):
         self.assertTrue(session.is_alive())
         mock_sock.settimeout.assert_called_with(DEFAULT_SOCKET_TIMEOUT)
 
+    def test_connect_failure_keeps_real_death_reason(self):
+        """T0.2/F8: a failed connect must report WHY, not the generic teardown reason."""
+        import paramiko
+        from src.config import ServerTargetConfig
+        cfg = ServerTargetConfig(alias="bad_auth", host="192.0.2.10", user="admin", password="wrong")
+        session = SSHSession(1, "", self.cache_dirs, "test", server_config=cfg)
+        with patch('paramiko.SSHClient.connect', side_effect=paramiko.AuthenticationException("Authentication failed.")):
+            self.assertFalse(session.connect())
+        self.assertIn("authentication failed", session.death_reason.lower())
+        self.assertNotEqual(session.death_reason, "session closed")
+
     def test_interactive_hang_detection_with_ansi_codes(self):
         """Verify reader loop detects interactive prompts colored with ANSI escape sequences."""
         session, _, mock_channel = self._create_mock_session()
@@ -1259,6 +1270,83 @@ class TestSSH(unittest.TestCase):
         self.assertEqual(run.status, "interrupted")
         self.assertIsNone(session.active_run_id)
 
+    def test_invalidate_pty_closes_channel_and_flags_state(self):
+        """T1.2/F4: unknown PTY boundary must kill the channel and warn about state loss."""
+        session, _, channel = self._create_mock_session()
+        channel.closed = False
+        session.in_shell = True
+        session._invalidate_pty("partial command send")
+        self.assertIsNone(session.channel)
+        self.assertTrue(channel.close.called)
+        self.assertTrue(session.state_lost)
+        self.assertFalse(session.in_shell)
+
+    def test_partial_send_invalidates_pty_and_reports_failure(self):
+        """T1.2/F4: a partial PTY send leaves a dirty remote line - the channel must die,
+        otherwise the NEXT command's text gets appended to the half-typed one."""
+        session, _, _ = self._create_mock_session()
+
+        class PartialSendChannel:
+            """Accepts 5 bytes once (a half-typed remote line), then dies."""
+            def __init__(self):
+                self.closed = False
+                self.delivered = b""
+
+            def send(self, data):
+                if not self.delivered:
+                    self.delivered += data[:5]
+                    return 5
+                raise OSError("broken pipe")
+
+            def settimeout(self, timeout):
+                pass
+
+            def gettimeout(self):
+                return 1.0
+
+            def recv_ready(self):
+                return False
+
+            def close(self):
+                self.closed = True
+
+        channel = PartialSendChannel()
+        session.channel = channel
+        session.in_shell = True
+        with patch.object(session, "_start_reader_thread"):
+            res = session.run_command(
+                command="rm -rf /var/log && echo done",
+                mode="sync", shell=True, wait_timeout=0.5, startup_wait=0.1,
+                hard_timeout=0.0, completion_hint="either", quiet_complete_timeout=0.5,
+            )
+        self.assertFalse(res["success"])
+        self.assertEqual(len(channel.delivered), 5, "scenario is a PARTIAL send")
+        self.assertTrue(channel.closed, "dirty PTY must be killed")
+        self.assertIsNone(session.channel)
+        self.assertTrue(session.state_lost)
+        self.assertIsNone(session.active_run_id)
+
+    def test_shell_interrupt_quiet_bound_invalidates_pty(self):
+        """T1.2/F4: interrupt without a prompt must not leave the PTY reusable."""
+        session, _, channel = self._create_mock_session()
+        channel.recv_ready.return_value = False
+        channel.closed = False
+        run = RunState(
+            run_id=3, session_id=1, command="sleep", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "quiet-inv.log"),
+        )
+        run.interrupt_sent = True
+        run.interrupt_at = time.time() - 5
+        run.quiet_complete_timeout = 0.05
+        session.runs[3] = run
+        session.active_run_id = 3
+        session._reader_loop(run)
+        self.assertEqual(run.status, "interrupted")
+        self.assertIsNone(session.channel)
+        self.assertTrue(channel.close.called)
+        self.assertTrue(session.state_lost)
+
     def test_exec_eof_does_not_kill_session(self):
         session, _, _ = self._create_mock_session()
         run = RunState(
@@ -1831,6 +1919,63 @@ class TestSSH(unittest.TestCase):
             self.assertTrue(res, f"Expected {alt_path} to resolve successfully")
             self.assertEqual(os.path.normcase(res), os.path.normcase(sample_file))
 
+    def test_log_policy_meta_drops_output_chunks_but_keeps_commands(self):
+        """T2.5/F7: default 'meta' policy must not store raw output chunks (secrets/IO)."""
+        from src.config import config as cfg
+        log_file = os.path.join(self.cache_dirs["runs_dir"], "policy.log")
+        run = RunState(
+            run_id=1, session_id=1, command="cat secret.conf", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=log_file,
+        )
+        session, _, _ = self._create_mock_session()
+        previous = cfg.LOG_OUTPUT
+        try:
+            cfg.LOG_OUTPUT = "meta"
+            session._log_run(run, "OUT", {"chunk": "raw output with password=hunter2"})
+            session._log_run(run, "ERR", {"chunk": "raw stderr"})
+            session._log_run(run, "SYS", {"event": "reader_started"})
+            with open(log_file, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertNotIn("raw output", body)
+            self.assertNotIn("raw stderr", body)
+            self.assertIn("reader_started", body)
+
+            cfg.LOG_OUTPUT = "full"
+            session._log_run(run, "OUT", {"chunk": "raw output kept"})
+            with open(log_file, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertIn("raw output kept", body)
+
+            cfg.LOG_OUTPUT = "off"
+            json_line(log_file, {"dir": "SYS", "event": "should_not_appear"})
+            with open(log_file, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertNotIn("should_not_appear", body)
+        finally:
+            cfg.LOG_OUTPUT = previous
+
+    def test_mask_secrets_hides_credentials_in_text(self):
+        """T2.5/F7: command text and diagnostics must not persist obvious secrets."""
+        from src.utils import mask_secrets
+        masked = mask_secrets("mysql -h db --password=hunter2 -e 'select 1' && curl -H 'Authorization: Bearer abc123'")
+        self.assertNotIn("hunter2", masked)
+        self.assertIn("******", masked)
+
+    def test_cleanup_old_logs_respects_byte_budget(self):
+        """T2.5/F7: disk usage must be bounded by bytes, not by file count."""
+        runs_dir = self.cache_dirs["runs_dir"]
+        for i, size in enumerate((900, 900, 300)):
+            path = os.path.join(runs_dir, f"budget_{i}.log")
+            with open(path, "wb") as fh:
+                fh.write(b"x" * size)
+            stamp = time.time() - (30 - i)  # budget_0 oldest, budget_2 newest
+            os.utime(path, (stamp, stamp))
+        deleted = cleanup_old_logs(self.cache_dirs, max_age_seconds=7 * 86400, max_files=500, max_total_bytes=1500)
+        self.assertGreaterEqual(deleted, 1)
+        self.assertFalse(os.path.exists(os.path.join(runs_dir, "budget_0.log")))
+        self.assertTrue(os.path.exists(os.path.join(runs_dir, "budget_2.log")))
+
     def test_json_line_caps_at_max_log_file_bytes(self):
         """Verify json_line drops OUT/ERR chunks when file exceeds MAX_LOG_FILE_BYTES but preserves SYS events."""
         log_file = os.path.join(self.test_dir, "capped_run.log")
@@ -1897,6 +2042,25 @@ class TestSSH(unittest.TestCase):
         self.assertEqual(res["status"], "completed")
         self.assertFalse(res["still_running"])
         self.assertEqual(res["exit_status"], 0)
+
+    def test_fully_consumed_run_buffer_is_freed(self):
+        """T2.4/F7: once the client read everything the buffer goes back to the pool
+        (discard_through used to be dead code); rewind then reports dropped_data."""
+        session, _, _ = self._create_mock_session()
+        run = RunState(
+            run_id=7, session_id=1, command="echo x", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "free.log"),
+        )
+        run.output_buffer = "payload\n"
+        run.mark_done("completed")
+        session.runs[7] = run
+        res = session.read_run(run_id=7, offset=None, max_lines=100, max_chars=1000, wait_timeout=0)
+        self.assertEqual(res["output"].strip(), "payload")
+        self.assertEqual(run.buffer_len, 0, "fully consumed buffer must be freed")
+        rewind = session.read_run(run_id=7, offset=0, max_lines=100, max_chars=1000, wait_timeout=0)
+        self.assertTrue(rewind.get("dropped_data"))
+        self.assertEqual(rewind["output"], "")
 
     def test_read_run_on_dead_session_returns_buffered_output(self):
         """Verify that read_run can read outputs from dead/closed sessions."""

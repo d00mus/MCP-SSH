@@ -52,6 +52,7 @@ def check_command_security(
         if regex.search(command):
             return {
                 "success": False,
+                "error_code": "security",
                 "error": f"Security: Command is blocked by command blacklist on server '{server_alias}' (matched: '{blacklisted}').",
                 "session_id": f"{server_alias}/{numeric_sid}",
                 "numeric_session_id": numeric_sid,
@@ -62,7 +63,8 @@ def check_command_security(
         if WRITE_COMMAND_PATTERN.search(command):
             return {
                 "success": False,
-                "error": f"Security: Write command is blocked in read-only sandbox mode on server '{server_alias}'.",
+                "error_code": "security",
+                "error": f"Security: Write command is blocked in read-only guardrail mode on server '{server_alias}'.",
                 "session_id": f"{server_alias}/{numeric_sid}",
                 "numeric_session_id": numeric_sid,
                 "server": server_alias,

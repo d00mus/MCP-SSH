@@ -176,19 +176,19 @@ class TestFS(unittest.TestCase):
         args_write = {"action": "write", "path": "file.txt", "content": "hello"}
         res = file_dispatch(args_write, manager)
         self.assertFalse(res["success"])
-        self.assertIn("blocked in read-only sandbox mode", res["error"])
+        self.assertIn("blocked in read-only guardrail mode", res["error"])
         
         # 2. Blocks edit action
         args_edit = {"action": "edit", "path": "file.txt", "edits": [{"old_text": "a", "new_text": "b"}]}
         res = file_dispatch(args_edit, manager)
         self.assertFalse(res["success"])
-        self.assertIn("blocked in read-only sandbox mode", res["error"])
+        self.assertIn("blocked in read-only guardrail mode", res["error"])
 
         # 3. Blocks upload action
         args_upload = {"action": "upload", "path": "file.txt", "local_path": "local.txt"}
         res = file_dispatch(args_upload, manager)
         self.assertFalse(res["success"])
-        self.assertIn("blocked in read-only sandbox mode", res["error"])
+        self.assertIn("blocked in read-only guardrail mode", res["error"])
 
         # 4. Allows read/list actions
         with patch('src.fs._read_remote_file_bytes') as mock_read:
@@ -204,9 +204,15 @@ class TestFS(unittest.TestCase):
         valid_file = os.path.join(self.test_dir, "test.txt")
         self.assertEqual(resolve_local_path(valid_file), os.path.abspath(valid_file))
 
-        # Valid path inside system temp
+        # System temp is denied by default (shared/world-writable), allowed with the flag
         temp_file = os.path.join(tempfile.gettempdir(), "test_mcp_temp.txt")
-        self.assertEqual(resolve_local_path(temp_file), os.path.abspath(temp_file))
+        self.assertEqual(resolve_local_path(temp_file), "")
+        previous_temp = config.ALLOW_SYSTEM_TEMP
+        try:
+            config.ALLOW_SYSTEM_TEMP = True
+            self.assertEqual(resolve_local_path(temp_file), os.path.abspath(temp_file))
+        finally:
+            config.ALLOW_SYSTEM_TEMP = previous_temp
         
         # Invalid path outside both project_root and system temp
         outside_file = os.path.abspath(os.path.join(tempfile.gettempdir(), "..", "outside_forbidden.txt"))
@@ -215,6 +221,93 @@ class TestFS(unittest.TestCase):
         # Windows different drive error handling: simulate ValueError from commonpath
         with patch('os.path.commonpath', side_effect=ValueError("Paths don't have the same drive")):
             self.assertEqual(resolve_local_path("C:\\some\\file.txt"), "")
+
+    def test_gateway_dir_and_gateway_files_are_protected(self):
+        """T0.1/F2: the gateway's own code must never be rewritten through the file tool."""
+        from src.utils import resolve_local_path
+        previous_root = config.PROJECT_ROOT
+        previous_flag = config.ALLOW_GATEWAY_DIR
+        try:
+            config.PROJECT_ROOT = config.GATEWAY_ROOT
+            config.ALLOW_GATEWAY_DIR = False
+            src_file = os.path.join(config.GATEWAY_ROOT, "src", "utils.py")
+            entry = os.path.join(config.GATEWAY_ROOT, "mcp-server.py")
+            doc_file = os.path.join(config.GATEWAY_ROOT, "PLAN.md")
+            self.assertEqual(resolve_local_path(src_file), "")
+            self.assertEqual(resolve_local_path(entry), "")
+            self.assertEqual(resolve_local_path(doc_file), "")
+            config.ALLOW_GATEWAY_DIR = True
+            # the flag opens the repo, but never the gateway's executable parts
+            self.assertEqual(resolve_local_path(doc_file), os.path.realpath(doc_file))
+            self.assertEqual(resolve_local_path(src_file), "")
+            self.assertEqual(resolve_local_path(entry), "")
+        finally:
+            config.PROJECT_ROOT = previous_root
+            config.ALLOW_GATEWAY_DIR = previous_flag
+
+    def test_cache_inside_gateway_dir_is_allowed(self):
+        """The default layout keeps .ssh-cache inside the install dir - the cache is the
+        gateway's own scratch space and must beat the gateway-dir deny."""
+        from src.utils import resolve_local_path
+        previous_root = config.PROJECT_ROOT
+        previous_cache = config.CACHE_DIRS
+        cache = os.path.join(config.GATEWAY_ROOT, ".ssh-cache")
+        try:
+            config.PROJECT_ROOT = config.GATEWAY_ROOT
+            config.CACHE_DIRS = {"cache_root": cache}
+            inside = os.path.join(cache, "tmp", "x.bin")
+            self.assertEqual(resolve_local_path(inside), os.path.realpath(inside))
+            # ordinary gateway files stay refused for writes
+            self.assertEqual(resolve_local_path(os.path.join(config.GATEWAY_ROOT, "PLAN.md")), "")
+        finally:
+            config.PROJECT_ROOT = previous_root
+            config.CACHE_DIRS = previous_cache
+
+    def test_mcp_config_files_are_protected_anywhere(self):
+        """T0.1/F2: mcp.json / mcp-server.py hold commands and secrets - never writable."""
+        from src.utils import resolve_local_path
+        for name in ("mcp.json", "mcp-server.py"):
+            blocked = os.path.join(self.test_dir, name)
+            self.assertEqual(resolve_local_path(blocked), "", name)
+
+    def test_upload_allows_reading_project_files_in_gateway_dir(self):
+        """resolve_local_path(..., for_write=False) allows reading project scripts for upload."""
+        from src.utils import resolve_local_path
+        previous_root = config.PROJECT_ROOT
+        try:
+            config.PROJECT_ROOT = config.GATEWAY_ROOT
+            src_file = os.path.join(config.GATEWAY_ROOT, "src", "utils.py")
+            # for_write=False (upload) is allowed
+            self.assertEqual(resolve_local_path(src_file, for_write=False), os.path.realpath(src_file))
+            # for_write=True (download) is blocked
+            self.assertEqual(resolve_local_path(src_file, for_write=True), "")
+        finally:
+            config.PROJECT_ROOT = previous_root
+
+    def test_upload_blocks_credential_files_even_on_read(self):
+        """Credential files (id_rsa, servers.json) are denied even with for_write=False."""
+        from src.utils import resolve_local_path
+        key_file = os.path.join(self.test_dir, "id_rsa")
+        self.assertEqual(resolve_local_path(key_file, for_write=False), "")
+        cfg_file = os.path.join(self.test_dir, "servers.json")
+        self.assertEqual(resolve_local_path(cfg_file, for_write=False), "")
+
+    def test_cache_root_is_allowed_when_project_root_is_empty(self):
+        """T0.1/F2: the gateway-private cache stays usable even without a project root."""
+        from src.utils import resolve_local_path
+        previous_root = config.PROJECT_ROOT
+        previous_cache = config.CACHE_DIRS
+        cache = os.path.join(self.test_dir, "gw-cache")
+        os.makedirs(cache, exist_ok=True)
+        try:
+            config.PROJECT_ROOT = ""
+            config.CACHE_DIRS = {"cache_root": cache}
+            inside = os.path.join(cache, "tmp", "x.bin")
+            self.assertEqual(resolve_local_path(inside), os.path.realpath(inside))
+            self.assertEqual(resolve_local_path(os.path.join(self.test_dir, "outside.bin")), "")
+        finally:
+            config.PROJECT_ROOT = previous_root
+            config.CACHE_DIRS = previous_cache
 
     def test_read_remote_file_bytes_closes_channels_in_finally(self):
         """Verify _read_remote_file_bytes closes stdin, stdout, stderr streams even on error."""
@@ -415,6 +508,173 @@ class TestFS(unittest.TestCase):
             self.assertFalse(res["success"])
             self.assertIn("Binary file cannot be written safely", res["error"])
 
+    def test_sftp_write_atomic_tmp_rename_and_mode(self):
+        """T2.1/F6: SFTP write must go through a sibling temp + rename and keep permissions."""
+        class FakeSFTP:
+            def __init__(self):
+                self.written = {}
+                self.calls = []
+                self.removed = []
+
+            class _H:
+                def __init__(self, outer, path):
+                    self.outer, self.path = outer, path
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def write(self, data):
+                    self.outer.written[self.path] = data
+
+            def stat(self, path):
+                m = MagicMock()
+                m.st_mode = 0o100755
+                return m
+
+            def file(self, path, mode):
+                self.calls.append(("file", path, mode))
+                return FakeSFTP._H(self, path)
+
+            def posix_rename(self, src, dst):
+                self.calls.append(("posix_rename", src, dst))
+                self.written[dst] = self.written.pop(src, None)
+
+            def chmod(self, path, mode):
+                self.calls.append(("chmod", path, mode))
+
+            def remove(self, path):
+                self.removed.append(path)
+
+            def close(self):
+                self.calls.append(("close",))
+
+        sftp = FakeSFTP()
+        session = MagicMock()
+        session.open_sftp.return_value = sftp
+        res = _write_remote_file_bytes(session, "/etc/rc.local", b"payload")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res["method"], "sftp")
+        self.assertEqual(sftp.written.get("/etc/rc.local"), b"payload")
+        renames = [c for c in sftp.calls if c[0] == "posix_rename"]
+        self.assertEqual(len(renames), 1)
+        self.assertTrue(renames[0][1].startswith("/etc/rc.local.mcp_tmp."), renames)
+        self.assertEqual(renames[0][2], "/etc/rc.local")
+        self.assertIn(("chmod", "/etc/rc.local", 0o755), sftp.calls)
+        # the destination itself must never be opened for writing (truncate risk)
+        self.assertFalse([c for c in sftp.calls if c[0] == "file" and c[1] == "/etc/rc.local"])
+
+    def test_sftp_write_failure_leaves_original_and_removes_tmp(self):
+        """T2.1/F6: a failed write must clean its temp file and never touch the target."""
+        class FailingSFTP:
+            def __init__(self):
+                self.removed = []
+
+            def stat(self, path):
+                m = MagicMock()
+                m.st_mode = 0o100644
+                return m
+
+            def file(self, path, mode):
+                raise IOError("disk full")
+
+            def remove(self, path):
+                self.removed.append(path)
+
+            def close(self):
+                pass
+
+        sftp = FailingSFTP()
+        session = MagicMock()
+        session.open_sftp.return_value = sftp
+        session.client = MagicMock()
+        session.client.exec_command.side_effect = RuntimeError("exec disabled")
+        with patch("src.fs._sync_shell", return_value={"success": False, "error": "no shell"}):
+            res = _write_remote_file_bytes(session, "/etc/rc.local", b"payload")
+        self.assertFalse(res["success"])
+        self.assertEqual(len(sftp.removed), 1, sftp.removed)
+        self.assertTrue(sftp.removed[0].startswith("/etc/rc.local.mcp_tmp."))
+
+    def test_shell_write_restores_mode_after_mv(self):
+        """T2.1/F6: tmp+mv resets permissions - the shell fallback must restore them."""
+        import re
+        session = MagicMock()
+        session.open_sftp.return_value = None
+        session.client = MagicMock()
+        session.client.exec_command.side_effect = RuntimeError("exec disabled")
+        captured = []
+
+        def mock_sync(s, cmd, **kwargs):
+            captured.append(cmd)
+            if "stat -c %a" in cmd:
+                return {"success": True, "output": "755"}
+            m = re.search(r"echo '(MCP_[A-Z0-9_]+)'", cmd)
+            if m:
+                return {"success": True, "output": m.group(1)}
+            return {"success": True, "output": ""}
+
+        with patch("src.fs._sync_shell", side_effect=mock_sync):
+            res = _write_remote_file_bytes(session, "/etc/init.d/rc.local", b"#!/bin/sh\n")
+        self.assertTrue(res["success"], res)
+        chmods = [c for c in captured if c.startswith("chmod 755 ")]
+        self.assertEqual(len(chmods), 1, captured)
+        self.assertIn("'/etc/init.d/rc.local'", chmods[0])
+
+    def test_edit_conflict_on_expected_sha_mismatch(self):
+        """T2.2/F6: expected_sha256 precondition must refuse to write on mismatch."""
+        manager, session = self._create_mock_manager()
+        with patch("src.fs._read_remote_file_bytes", return_value={"success": True, "data": b"abc\n", "method": "sftp"}), \
+             patch("src.fs._write_remote_file_bytes") as write_mock:
+            res = file_dispatch({
+                "action": "edit", "path": "/app/x", "expected_sha256": "deadbeef",
+                "edits": [{"old_text": "abc", "new_text": "xyz"}],
+            }, manager)
+        self.assertFalse(res["success"])
+        self.assertEqual(res.get("error_code"), "conflict")
+        self.assertIn("refusing to overwrite", res["error"])
+        write_mock.assert_not_called()
+
+    def test_edit_conflict_when_file_changed_between_read_and_write(self):
+        """T2.2/F6: a concurrent edit between read and write must conflict, not clobber."""
+        from src.utils import _sha256_hex
+        manager, session = self._create_mock_manager()
+        first = b"original content\n"
+        second = b"someone else edited\n"
+        with patch("src.fs._read_remote_file_bytes", side_effect=[
+                {"success": True, "data": first, "method": "sftp"},
+                {"success": True, "data": second, "method": "sftp"}]), \
+             patch("src.fs._write_remote_file_bytes") as write_mock:
+            res = file_dispatch({
+                "action": "edit", "path": "/app/x",
+                "edits": [{"old_text": "original", "new_text": "mine"}],
+            }, manager)
+        self.assertFalse(res["success"])
+        self.assertEqual(res.get("error_code"), "conflict")
+        self.assertEqual(res.get("actual_sha256"), _sha256_hex(second))
+        write_mock.assert_not_called()
+
+    def test_edit_dry_run_is_not_reported_as_written(self):
+        """T2.2/F9: dry_run must never look like a successful write to the model."""
+        from src.server import project_tool_result
+        manager, session = self._create_mock_manager()
+        with patch("src.fs._read_remote_file_bytes", return_value={"success": True, "data": b"abc\n", "method": "sftp"}), \
+             patch("src.fs._write_remote_file_bytes") as write_mock:
+            res = file_dispatch({
+                "action": "edit", "path": "/app/x", "dry_run": True,
+                "edits": [{"old_text": "abc", "new_text": "xyz"}],
+            }, manager)
+        self.assertTrue(res["success"])
+        self.assertTrue(res.get("dry_run"))
+        self.assertTrue(res.get("changed"))
+        write_mock.assert_not_called()
+        projected = project_tool_result("file", res)
+        self.assertIn("dry run", projected["message"].lower())
+        self.assertTrue(projected["dry_run"])
+        self.assertTrue(projected["changed"])
+        self.assertEqual(projected["replacements"], 0 + res["replacements"])
+
     def test_write_remote_file_bytes_atomic_mv_and_cleanup(self):
         """Verify _write_remote_file_bytes writes to a temporary file and atomically moves it via mv -f."""
         import re
@@ -569,6 +829,78 @@ class TestFS(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("download exceeds", result["error"])
         self.assertIn("download in chunks", result["error"])
+        self.assertFalse(os.path.exists(local_path))
+
+    def test_download_stages_via_temp_and_leaves_no_part(self):
+        """T2.3/F2: happy path - bytes arrive through a temp file which must not survive."""
+        session = MagicMock()
+        sftp = MagicMock()
+        handle = MagicMock()
+        chunks = [b"hello ", b"world"]
+
+        def read(n=None):
+            if n is None:
+                raise AssertionError("unbounded read")
+            return chunks.pop(0) if chunks else b""
+
+        handle.read.side_effect = read
+        wrapped = MagicMock()
+        wrapped.__enter__.return_value = handle
+        wrapped.__exit__.return_value = False
+        sftp.file.return_value = wrapped
+        session.open_sftp.return_value = sftp
+        local_path = os.path.join(self.test_dir, "staged.bin")
+        result = _download_remote_to_path(session, "/remote/x", local_path)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["size"], 11)
+        with open(local_path, "rb") as fh:
+            self.assertEqual(fh.read(), b"hello world")
+        leftovers = [n for n in os.listdir(self.test_dir) if ".part-" in n]
+        self.assertEqual(leftovers, [])
+
+    def test_download_refuses_when_path_fails_revalidation(self):
+        """T2.3/F2: if the validated path stops resolving to itself, refuse the replace."""
+        session = MagicMock()
+        sftp = MagicMock()
+        handle = MagicMock()
+        handle.read.side_effect = [b"data", b"", b"data", b""]
+        wrapped = MagicMock()
+        wrapped.__enter__.return_value = handle
+        wrapped.__exit__.return_value = False
+        sftp.file.return_value = wrapped
+        session.open_sftp.return_value = sftp
+        local_path = os.path.join(self.test_dir, "reval.bin")
+        # case 1: the path now resolves somewhere else (parent swapped for a symlink)
+        with patch("src.fs.resolve_local_path", return_value=os.path.join(self.test_dir, "swapped.bin")):
+            result = _download_remote_to_path(session, "/remote/x", local_path)
+        self.assertFalse(result["success"])
+        self.assertIn("revalidation", result["error"])
+        self.assertFalse(os.path.exists(local_path))
+        # case 2: the path no longer resolves at all (now outside the sandbox)
+        with patch("src.fs.resolve_local_path", return_value=""):
+            result = _download_remote_to_path(session, "/remote/x", local_path)
+        self.assertFalse(result["success"])
+        self.assertIn("revalidation", result["error"])
+        self.assertFalse(os.path.exists(local_path))
+        leftovers = [n for n in os.listdir(self.test_dir) if ".part-" in n]
+        self.assertEqual(leftovers, [], "staged bytes must be dropped")
+
+    def test_download_refuses_symlink_target(self):
+        """T2.3/F2: a symlink target would redirect the write - refuse it."""
+        session = MagicMock()
+        sftp = MagicMock()
+        handle = MagicMock()
+        handle.read.side_effect = [b"data", b""]
+        wrapped = MagicMock()
+        wrapped.__enter__.return_value = handle
+        wrapped.__exit__.return_value = False
+        sftp.file.return_value = wrapped
+        session.open_sftp.return_value = sftp
+        local_path = os.path.join(self.test_dir, "link.bin")
+        with patch("os.path.islink", return_value=True):
+            result = _download_remote_to_path(session, "/remote/x", local_path)
+        self.assertFalse(result["success"])
+        self.assertIn("symlink", result["error"])
         self.assertFalse(os.path.exists(local_path))
 
     def test_file_dispatch_refuses_busy_session(self):

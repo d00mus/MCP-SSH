@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import threading
 from dataclasses import dataclass, field
@@ -20,8 +21,10 @@ MAX_HARD_TIMEOUT = 3600.0
 
 MAX_BUFFER_CHARS = 2_000_000
 MAX_TOTAL_BUFFER_CHARS = 200_000_000
-DEFAULT_READ_MAX_LINES = 1000
-DEFAULT_READ_MAX_CHARS = 50000
+# Default response window (T3.4/F10): one call must not dump a context bomb into a
+# small local model - 50 KB was ~12k tokens. Raise per call via max_chars/max_lines.
+DEFAULT_READ_MAX_LINES = 200
+DEFAULT_READ_MAX_CHARS = 8192
 MAX_READ_MAX_LINES = 5000
 MAX_READ_MAX_CHARS = 200000
 DEFAULT_FILE_INSPECT_MAX_BYTES = 200000
@@ -31,9 +34,18 @@ MAX_FILE_EDIT_MAX_BYTES = 5_000_000
 MAX_INLINE_WRITE_BYTES = 200000
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILE_BYTES = 20 * 1024 * 1024
+# Retention is bounded by BYTES, not by file count (T2.5/F7): 500 files x 20 MB
+# used to mean ~10 GB of logs on disk.
+MAX_LOG_TOTAL_BYTES = 200 * 1024 * 1024
 DEFAULT_QUIET_COMPLETE_TIMEOUT = 2.5
 MAX_QUIET_COMPLETE_TIMEOUT = 30.0
 MAX_WORKERS = 32
+# Admission control (F5): cheap control calls get their own small pool so Ctrl+C is
+# never queued behind long runs; everything else is bounded instead of queueing
+# unboundedly. MAX_REQUEST_LINE_BYTES caps what we are willing to parse at all.
+CONTROL_WORKERS = 4
+MAX_PENDING_REQUESTS = 64
+MAX_REQUEST_LINE_BYTES = 8 * 1024 * 1024
 MAX_SERVERS = 100
 MAX_DEAD_SESSION_LOGS_PER_SERVER = 20
 MIN_LOG_RETENTION_SECONDS = 7200  # 2 hours
@@ -90,14 +102,51 @@ class ServerTargetConfig:
     def from_dict(cls, alias: str, data: Dict[str, Any]) -> "ServerTargetConfig":
         def _expand(val: Any) -> Any:
             if isinstance(val, str):
-                return os.path.expandvars(os.path.expanduser(val))
+                expanded = os.path.expandvars(os.path.expanduser(val))
+                # Non-secret fields: a ${...} that stayed literal is almost always a
+                # typo, a missing export or bash-only syntax like ${VAR:-default} -
+                # say so now instead of failing obscurely at connect time.
+                leftover = sorted({m.group(1) for m in re.finditer(r"\$\{([A-Za-z0-9_]+)\}", expanded)})
+                if "${" in expanded:
+                    print(
+                        f"[SSH-MCP] Warning: server '{alias}' has an unresolvable reference in "
+                        f"a field value (use only ${{NAME}}, no bash default syntax): {expanded!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif leftover:
+                    print(
+                        f"[SSH-MCP] Warning: server '{alias}' references unset environment "
+                        f"variables: {', '.join(leftover)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return expanded
             return val
 
         def _expand_secret(val: Any) -> Any:
             if isinstance(val, str):
-                if "${" in val:
-                    return re.sub(r"\$\{([A-Za-z0-9_]+)\}", lambda m: os.environ.get(m.group(1), m.group(0)), val)
-                return val
+                # Secrets must never fall back to the literal "${VAR}" as a password:
+                # that used to surface as a baffling "authentication failed" (F13).
+                missing = sorted({
+                    m.group(1) for m in re.finditer(r"\$\{([A-Za-z0-9_]+)\}", val)
+                    if m.group(1) not in os.environ
+                })
+                if missing:
+                    raise ValueError(
+                        f"server '{alias}' references unset environment variables: "
+                        f"{', '.join(missing)}. Export them before starting the gateway "
+                        f"(or use a literal value)."
+                    )
+                expanded = os.path.expandvars(val)
+                if "${" in expanded:
+                    # e.g. ${VAR:-default}: bash-only syntax that would silently become
+                    # the literal password and fail as "authentication failed".
+                    raise ValueError(
+                        f"server '{alias}' has an unresolvable secret reference "
+                        f"(use only ${{NAME}} - bash default syntax is not supported)."
+                    )
+                return expanded
             return val
 
         try:
@@ -344,7 +393,8 @@ class ServersRegistry:
                         port=port,
                         user=user,
                         key_path=key_path,
-                        description=f"Host from ~/.ssh/config ({host_entry})"
+                        description=f"Host from ~/.ssh/config ({host_entry})",
+                        origin="cli",  # survives hot-reload removal (only file hosts are diffed)
                     )
                     self.register(cfg)
         except Exception:
@@ -368,6 +418,19 @@ class ServerConfig:
         self.READ_ONLY: bool = False
         self.COMMAND_BLACKLIST: list = []
         self.SERVERS_CONFIG_PATH: Optional[str] = None
+        # Install directory of this gateway (repo root). The file tool must never
+        # rewrite the gateway's own code/config: a download from an untrusted host
+        # would otherwise become local code execution on the next restart.
+        self.GATEWAY_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.ALLOW_GATEWAY_DIR: bool = False
+        self.ALLOW_SYSTEM_TEMP: bool = False
+        # Log policy (T2.5/F7): "full" keeps raw output chunks (the main source of
+        # secrets and disk I/O), "meta" keeps lifecycle+command text only (default),
+        # "off" writes nothing.
+        self.LOG_OUTPUT: str = "meta"
+        # Tool catalog profile (T3.2/F10): "lean" ships the 6 everyday tools only,
+        # "full" adds server_add/session_update/last_command_details.
+        self.TOOL_PROFILE: str = "full"
         self.registry = ServersRegistry()
 
     def load_from_env(self):

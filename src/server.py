@@ -31,6 +31,11 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
         # For MCP-level errors (not command errors)
         projected["error"] = result.get("error", "unknown error")
         projected["success"] = False
+        if result.get("error_code"):
+            projected["error_code"] = result["error_code"]
+        for extra in ("actual_sha256", "path"):
+            if result.get(extra):
+                projected[extra] = result[extra]
         if session_id is not None: projected["session_id"] = session_id
         return projected
 
@@ -42,24 +47,28 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     
     # 1. Output/Error (First field)
     if is_failed:
-        projected["error"] = result.get("error") or f"Command failed with exit status {exit_status or 1}"
-        if "output" in result and result["output"]:
-            projected["output"] = (
-                f"[WARNING: Command execution failed with Exit Status {exit_status or 1}!]\n"
-                f"--- OUTPUT ---\n"
-                f"{result['output']}\n"
-                f"---------------\n"
-            )
+        # T3.3/F9: never invent an exit code ("exit status 1" for an unknown code was
+        # a lie) and never wrap output in decorative banners - one honest error line
+        # plus the raw output is cheaper and clearer for the model.
+        if exit_status is None:
+            projected["error"] = result.get("error") or f"Command failed ({status})"
         else:
-            projected["output"] = ""
-    elif tool_name in {"run", "exec", "read"}:
+            projected["error"] = result.get("error") or f"Command failed with exit status {exit_status}"
+        projected["output"] = result.get("output", "")
+        if result.get("hint"):
+            projected["hint"] = result["hint"]
+        if result.get("error_code"):
+            projected["error_code"] = result["error_code"]
+    elif tool_name in {"run", "read"}:
         projected["output"] = result.get("output", "")
         if result.get("message"):
             projected["message"] = result.get("message")
-        if result.get("session_recovered"):
-            projected["session_recovered"] = True
-        if result.get("selection_reason"):
-            projected["selection_reason"] = result.get("selection_reason")
+        if result.get("session_reused"):
+            projected["session_reused"] = True
+        if result.get("process_stopped") is False:
+            projected["process_stopped"] = False
+        if result.get("hint"):
+            projected["hint"] = result["hint"]
         if result.get("created_session_id"):
             projected["created_session_id"] = result.get("created_session_id")
         if result.get("recv_paused"):
@@ -92,8 +101,17 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
                 if "truncated" in result:
                     projected["truncated"] = result["truncated"]
         elif action in {"write", "edit"}:
-            projected["message"] = f"File {action} successful"
+            # T2.2/F9: a dry run or a no-op must never look like a successful write.
+            if action == "edit" and result.get("dry_run"):
+                projected["message"] = "File edit dry run - NOTHING was written"
+            elif action == "edit" and not result.get("changed", True):
+                projected["message"] = "File edit: no changes needed"
+            else:
+                projected["message"] = f"File {action} successful"
             if "size" in result: projected["size"] = result["size"]
+            for key in ("changed", "dry_run", "replacements", "old_sha256", "new_sha256", "backup_path"):
+                if key in result:
+                    projected[key] = result[key]
     elif tool_name in {"server_list", "server_add"}:
         projected["success"] = True
         if "servers" in result:
@@ -123,12 +141,15 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
         projected["status"] = status
     
     # Add extra useful fields for some tools if they exist
-    if tool_name in {"read", "run", "exec"} and "next_offset" in result:
+    if tool_name in {"read", "run"} and "next_offset" in result:
         projected["next_offset"] = result["next_offset"]
-    if tool_name in {"run", "exec", "read"} and "still_running" in result:
+    if tool_name in {"run", "read"} and "still_running" in result:
         projected["still_running"] = result["still_running"]
     if result.get("limited"):
         projected["limited"] = True
+        projected.setdefault("hint", "output truncated - page with offset/next_offset or raise max_chars")
+    if "total_chars" in result:
+        projected["total_chars"] = result["total_chars"]
     
     if "exit_status" in result and result["exit_status"] is not None:
         projected["exit_status"] = result["exit_status"]
@@ -150,29 +171,31 @@ def format_tool_result(result: Dict[str, Any], is_error: bool = False) -> Dict[s
 def make_response(req_id: Any, result: Dict[str, Any], is_error: bool = False) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": format_tool_result(result, is_error)}
 
+# Everyday tool surface (T3.2/F10). Admin/diagnostic tools ship only in 'full'.
+LEAN_TOOLS = {"server_list", "run", "read", "signal", "file", "session_close"}
+ADMIN_TOOLS = {"server_add", "session_update", "last_command_details"}
+
+
 def tools_list() -> Dict[str, Any]:
     server_param = {
         "type": "string",
-        "description": "Target server alias or IP. If omitted, must be specified in session_id (e.g. 'keenetic/1' or 'keenetic').",
+        "description": "Server alias/IP, or session_id='alias/1'.",
     }
     session_id_param = {
         "type": "string",
-        "description": "Session identifier (e.g. 'keenetic/1' or '1' if server is set). If omitted in 'run', a new clean session is automatically created and returned.",
+        "description": "Session id ('alias/1' or '1'). REQUIRED to preserve shell state (cwd, env). If omitted, an idle session is reused with UNKNOWN state.",
     }
     tools = [
         {
             "name": "server_list",
             "description": (
-                "List all configured SSH servers with alias, host, user, status, active session counts and description. "
-                "Pass 'reload=true' to force an immediate reload of servers configuration from disk."
+                "List configured servers (alias, host, user, status, sessions) and active "
+                "sessions; reload=true re-reads servers.json."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "reload": {
-                        "type": "boolean",
-                        "description": "Optional. Force re-read configuration file from disk.",
-                    }
+                    "reload": {"type": "boolean"}
                 },
             },
         },
@@ -223,7 +246,7 @@ def tools_list() -> Dict[str, Any]:
                     },
                     "read_only": {
                         "type": "boolean",
-                        "description": "Enforce read-only sandbox mode. Default false.",
+                        "description": "Best-effort write guardrail (regex denylist over the command text). Default false. NOT a security boundary - use a restricted SSH account for that.",
                     },
                     "command_blacklist": {
                         "type": "array",
@@ -241,11 +264,8 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "session_list",
             "description": (
-                "List active SSH sessions. "
-                "Note: You do NOT need to check session_list before running commands. Directly call 'run(server=...)' without session_id to open a new session. "
-                "Use session_list only for inspection or debugging. "
-                "Without arguments returns all sessions across all servers. "
-                "Pass 'server' (or prefix) to filter by server name."
+                "List active sessions (id, status) across servers; filter with 'server'. "
+                "Rarely needed: run() reports session_id and reuses idle sessions."
             ),
             "inputSchema": {
                 "type": "object",
@@ -261,7 +281,7 @@ def tools_list() -> Dict[str, Any]:
         },
         {
             "name": "session_close",
-            "description": "Close and remove a session by id.",
+            "description": "Close a session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -273,7 +293,7 @@ def tools_list() -> Dict[str, Any]:
         },
         {
             "name": "session_update",
-            "description": "Update session properties: rename session.",
+            "description": "Rename a session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -287,30 +307,24 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "run",
             "description": (
-                "Execute command on a target server. "
-                "Returns command output directly in the response if completed within wait_timeout (default 5.0s) — do NOT call 'read' unless still_running=true is returned. "
-                "You do NOT need to call 'session_list' before your first command — simply call 'run(server=...)' and a new session will be created automatically. "
-                "To run sequential commands in the same session, pass the returned 'session_id'. "
-                "To run commands concurrently, omit 'session_id' (or use new_session=true) to open a new clean session. "
-                "An SSH session is a single terminal process (PTY); you CANNOT execute commands in parallel in the same session. "
-                "If 'session_id' is provided, runs strictly in that session (fails if busy, closed, or not found). "
-                "Commands taking longer than wait_timeout return still_running=true without failing; read their remaining output via 'read'. "
-                "Set wait_timeout=0 for immediate async execution (returns once started). "
-                "For multiline code or scripts (e.g. python -c): set use_pty=false to avoid PTY secondary prompt/echo issues. "
-                "For router (Keenetic): shell=false uses NDM CLI; shell=true uses Linux shell. "
-                "Do not mix NDM CLI and Linux shell in the same session."
+                "Run a command on a server. Output returns directly when it finishes within "
+                "wait_timeout (default 5s) - call 'read' only when still_running=true. Without "
+                "session_id an idle session is reused with UNKNOWN state (pwd/env); pass session_id "
+                "to preserve state, or new_session=true for a clean shell - "
+                "one terminal runs one command at a time."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "server": server_param,
-                    "command": {"type": "string", "description": "The command string to execute (e.g., 'ls -la'). Use standard shell pipelines (| grep, | head, | awk) for filtering. Avoid '2>/dev/null' unless intentionally hiding errors."},
+                    "command": {"type": "string", "description": "Command to run (filter with | grep, | head)."},
                     "session_id": session_id_param,
-                    "wait_timeout": {"type": "number", "description": "Max seconds to wait for output (default 5.0). Set 0 for async start (returns once started)."},
-                    "shell": {"type": "boolean", "description": "Boolean flag. TRUE for Linux shell (default), FALSE for native CLI (NDM)."},
-                    "new_session": {"type": "boolean", "description": "Create a new session on target server and run there immediately."},
-                    "session_name": {"type": "string", "description": "Optional name for new session."},
-                    "use_pty": {"type": "boolean", "description": "Default true. Set false for multiline scripts or to strictly separate stdout/stderr."},
+                    "wait_timeout": {"type": "number", "description": "Seconds to wait for output (default 5; 0=async)."},
+                    "hard_timeout": {"type": "number", "description": "Interrupt after N seconds (0=off)."},
+                    "shell": {"type": "boolean", "description": "true=Linux shell, false=NDM CLI; omit=auto."},
+                    "new_session": {"type": "boolean", "description": "Force opening a clean session with default state."},
+                    "session_name": {"type": "string"},
+                    "use_pty": {"type": "boolean", "description": "true (default); false for multiline scripts."},
                 },
                 "required": ["command"],
             },
@@ -318,13 +332,9 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "read",
             "description": (
-                "Read output from a terminal tab (session). "
-                "Use when a command in 'run' returned still_running=true, or to scroll through tab history. "
-                "If a command is still running, waits up to wait_timeout seconds (default 5.0) for completion before returning. "
-                "Do NOT call 'read' after 'run' if the command already completed. "
-                "Supports scrolling tab history: set offset=0 to rewind and read from the very beginning of the tab (useful if you forgot earlier context/output), "
-                "or use negative offset (e.g. -2000) for the tail. Use 'next_offset' for pagination. Retains up to 2MB in memory. "
-                "Statuses: 'completed', 'running', 'stalled', 'failed', 'dead'."
+                "Read terminal output/history. Use after run returns still_running=true (it waits "
+                "up to wait_timeout), or to page: offset 0 rewinds to the start, negative = tail. "
+                "Do NOT call after a completed run - its output already came back."
             ),
             "inputSchema": {
                 "type": "object",
@@ -332,32 +342,29 @@ def tools_list() -> Dict[str, Any]:
                     "server": server_param,
                     "session_id": session_id_param,
                     "wait_timeout": {"type": "number", "description": "Max seconds to wait for running command to finish (default 5.0). Set 0 for instant non-blocking read."},
-                    "offset": {"type": "number", "description": "Optional offset for tab history navigation. Set 0 to rewind to tab beginning (full history), negative (e.g. -2000) for buffer tail, or next_offset to paginate. If omitted, reads new unread output."},
-                    "max_lines": {"type": "number", "description": "Max lines per page (default 1000)."},
-                    "max_chars": {"type": "number", "description": "Max chars per page (default 50000)."},
+                    "offset": {"type": "number", "description": "0=rewind, negative=tail, else next_offset."},
+                    "max_lines": {"type": "number"},
+                    "max_chars": {"type": "number"},
                 },
             },
         },
         {
             "name": "signal",
-            "description": "Send ctrl_c, stdin, or eof to a session/run on target server. Use action='ctrl_c' to immediately interrupt a stuck command and free the session.",
+            "description": "Send ctrl_c/stdin/eof to a session's active command; ctrl_c unblocks a stuck one.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "server": server_param,
                     "session_id": session_id_param,
-                    "action": {"type": "string", "enum": ["ctrl_c", "stdin", "eof"], "description": "Signal action. 'ctrl_c' interrupts active command and frees session."},
-                    "text": {"type": "string", "description": "Text for stdin action."},
-                    "press_enter": {"type": "boolean", "description": "Append Enter for stdin action. Default true."},
+                    "action": {"type": "string", "enum": ["ctrl_c", "stdin", "eof"]},
+                    "text": {"type": "string"},
+                    "press_enter": {"type": "boolean"},
                 },
             },
         },
         {
             "name": "last_command_details",
-            "description": (
-                "Get the exact command string, arguments, execution status, and raw output of the last executed tool call on target server or session. "
-                "Useful for troubleshooting and debugging."
-            ),
+            "description": "Raw record of the last tool call on a server/session - diagnostics only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -369,30 +376,63 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "file",
             "description": (
-                "Remote file operations (list, read, write, edit, upload, download) with SFTP and shell fallbacks. "
-                "IMPORTANT: For editing remote files, ALWAYS use action='edit' with 'edits': [{'old_text': '...', 'new_text': '...'}]. "
-                "Do NOT write custom Python/shell scripts or sed/awk on the remote server to edit files — this tool handles fuzzy matching and line context safely. "
-                "Actions: read (inspect/download), write (upload/inline), list, edit (in-place replacement)."
+                "Remote files (SFTP, shell fallback): action=list|read|write|edit. To edit ALWAYS "
+                "use action='edit' with edits=[{old_text,new_text,replace_all}] - never sed/python "
+                "on the host. read=inspect/download (local_path), write=create/overwrite (content or local_path)."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "server": server_param,
                     "session_id": session_id_param,
-                    "action": {"type": "string", "enum": ["read", "write", "list", "upload", "download", "edit"]},
-                    "path": {"type": "string", "description": "Remote path."},
-                    "local_path": {"type": "string", "description": "Local path for transfer (supports ~, %TEMP%)."},
-                    "content": {"type": "string", "description": "Optional inline content for write/upload."},
-                    "is_base64": {"type": "boolean", "description": "Optional. If true, content is base64-decoded."},
-                    "edits": {"type": "array", "description": "For edit: list of {old_text, new_text, replace_all}."},
+                    "action": {"type": "string", "enum": ["read", "write", "list", "edit"]},
+                    "path": {"type": "string"},
+                    "local_path": {"type": "string", "description": "Local transfer path."},
+                    "content": {"type": "string"},
+                    "is_base64": {"type": "boolean"},
+                    "max_bytes": {"type": "number"},
+                    "edits": {"type": "array", "description": "edit: [{old_text,new_text,replace_all}]."},
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": "sha256 as read; conflict if changed.",
+                    },
                 },
                 "required": ["action"],
             },
         },
     ]
+    profile = getattr(config, "TOOL_PROFILE", "full")
+    if profile == "lean":
+        tools = [t for t in tools if t["name"] in LEAN_TOOLS]
     return {"jsonrpc": "2.0", "id": 1, "result": {"tools": tools}}
 
-def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
+# Cheap, non-blocking tools run on a dedicated small pool: a stuck run must never
+# delay Ctrl+C, session_close or a listing (F5). Everything that can wait for I/O
+# or a wait_timeout (run/read/file) stays on the main pool.
+CONTROL_TOOLS = {
+    "signal", "session_close", "session_update",
+    "session_list", "server_list", "last_command_details",
+}
+
+
+def is_control_request(request: Any) -> bool:
+    if not isinstance(request, dict):
+        return False
+    if request.get("method") != "tools/call":
+        return True  # initialize, tools/list, ping, notifications: all cheap
+    params = request.get("params") or {}
+    name = params.get("name") if isinstance(params, dict) else None
+    return name in CONTROL_TOOLS
+
+
+def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str, Any]:
+    command = args.get("command", "")
+    if not isinstance(command, str) or not command.strip():
+        return {
+            "success": False,
+            "error": "'command' is required and must be a non-empty string. "
+            "Example: run(command='uname -a', server='keenetic').",
+        }
     session_id = args.get("session_id")
     node, numeric_sid, new_req, err_resp = manager.resolve_target_for_args(args)
     if err_resp:
@@ -409,16 +449,20 @@ def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     raw_shell = args.get("shell")
     shell = to_bool(raw_shell) if raw_shell is not None else None
     wait_timeout = args.get("wait_timeout", DEFAULT_WAIT_TIMEOUT)
-    if to_bool(args.get("background", False)) or mode == "async":
+    if to_bool(args.get("background", False)):
         wait_timeout = 0.0
-    startup_wait = args.get("startup_wait", DEFAULT_STARTUP_WAIT)
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
     background = to_bool(args.get("background", False))
     use_pty = to_bool(args.get("use_pty", True))
-    completion_hint = args.get("completion_hint", "either")
-    quiet_complete_timeout = args.get("quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
+    # Internal knobs are deliberately not agent-facing (T3.1): fixed sane defaults
+    # here; the file tool reaches the full run_command surface internally.
+    mode = "sync"
+    startup_wait = DEFAULT_STARTUP_WAIT
+    completion_hint = "either"
+    quiet_complete_timeout = DEFAULT_QUIET_COMPLETE_TIMEOUT
 
     session_created = False
+    reused_session = False
     created_session_id = None
     requested_session_id = session_id
     selection_source = ""
@@ -462,14 +506,23 @@ def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
             }
         selection_source = "explicit"
     else:
-        created = target_manager.open_session(name=session_name)
-        if not created.get("success", False):
-            return created
-        created_session_id = created["session_id"]
-        session_created = True
-        selection_source = "new_session"
-        num_id = created.get("numeric_session_id", created["session_id"])
-        session = target_manager.get_session(num_id)
+        # T1.1/F3: without session_id reuse an idle live session instead of opening a
+        # new SSH connection per command (that exhausted max_sessions on the 11th call
+        # and cost a full handshake each time). new_session=true still forces a clean
+        # session, so "fresh terminal" stays explicitly available.
+        session = None if new_session else target_manager.find_first_idle_alive_session()
+        if session is not None:
+            selection_source = "reused"
+            reused_session = True
+        else:
+            created = target_manager.open_session(name=session_name)
+            if not created.get("success", False):
+                return created
+            created_session_id = created["session_id"]
+            session_created = True
+            selection_source = "new_session"
+            num_id = created.get("numeric_session_id", created["session_id"])
+            session = target_manager.get_session(num_id)
 
     if not session:
         return {"success": False, "error": "no session available", "server": target_manager.alias}
@@ -478,16 +531,43 @@ def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
         startup_wait=startup_wait, hard_timeout=hard_timeout,
         completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
-        background=background, use_pty=use_pty
+        background=background, use_pty=use_pty, req_id=req_id
     )
+
+    # One retry: between the idle scan and run_command's reservation a concurrent
+    # request may have taken the reused session. That race must not fail the call.
+    if reused_session and not result.get("success") and "busy" in str(result.get("error", "")).lower():
+        created = target_manager.open_session(name=session_name)
+        if created.get("success", False):
+            retry_session = target_manager.get_session(created.get("numeric_session_id"))
+            if retry_session is not None:
+                retry_result = retry_session.run_command(
+                    command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
+                    startup_wait=startup_wait, hard_timeout=hard_timeout,
+                    completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
+                    background=background, use_pty=use_pty, req_id=req_id
+                )
+                result = retry_result
+                if retry_result.get("success"):
+                    session = retry_session
+                    session_created = True
+                    reused_session = False
+                    created_session_id = created["session_id"]
+                    selection_source = "retry_new_session"
 
     if result.get("success"):
         result["session_created"] = session_created
+        result["session_reused"] = reused_session
         result["requested_session_id"] = requested_session_id
         result["executed_session_id"] = result.get("session_id")
         result["session_selection"] = selection_source
         if session_created:
             result["created_session_id"] = created_session_id
+        if reused_session:
+            result.setdefault(
+                "hint",
+                "reused idle session with existing state; pass session_id for sequential commands or new_session=true for a clean shell"
+            )
     return result
 
 def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
@@ -749,11 +829,22 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
     params = request.get("params", {})
     req_id = request.get("id", 1)
 
+    if isinstance(method, str) and method.startswith("notifications/"):
+        # Notifications get no response. Cancellation must actually stop work (T1.4).
+        if method == "notifications/cancelled":
+            cancel_params = params if isinstance(params, dict) else {}
+            manager.cancel_request(cancel_params.get("requestId"))
+        return None
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
     if method == "initialize":
+        requested_version = params.get("protocolVersion") if isinstance(params, dict) else None
         return {
             "jsonrpc": "2.0", "id": req_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": requested_version if isinstance(requested_version, str) and requested_version else "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "ssh-mcp-vnext", "version": "6.0.0"},
             },
@@ -766,8 +857,12 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
         return response
 
     if method == "tools/call":
+        if not isinstance(params, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "params must be an object"}}
         tool_name = params.get("name")
         args = params.get("arguments", {}) or {}
+        if not isinstance(args, dict):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "arguments must be an object"}}
         try:
             if tool_name == "server_list":
                 reload_flag = to_bool(args.get("reload", False))
@@ -791,8 +886,8 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
                     make_current=to_bool(args.get("make_current")),
                     server=args.get("server")
                 )
-            elif tool_name in {"run", "exec"}:
-                result = run_dispatch(args, manager)
+            elif tool_name == "run":
+                result = run_dispatch(args, manager, req_id=req_id)
             elif tool_name == "read":
                 result = read_dispatch(args, manager)
             elif tool_name == "signal":

@@ -34,7 +34,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(res["error"], "connection timeout")
 
     def test_project_tool_result_completed_nonzero(self):
-        # Non-zero exit status should be wrapped in loud warnings
+        # A known non-zero exit status is reported honestly, output stays raw (T3.3/F9)
         raw = {
             "success": True,
             "status": "completed_nonzero",
@@ -48,7 +48,33 @@ class TestServer(unittest.TestCase):
         self.assertNotIn("run_id", res)
         self.assertEqual(res["status"], "completed_nonzero")
         self.assertIn("Command failed with exit status 127", res["error"])
-        self.assertIn("[WARNING: Command execution failed", res["output"])
+        self.assertEqual(res["output"], "bash: command not found")
+
+    def test_project_tool_result_never_invents_exit_status(self):
+        """T3.3/F9: an unknown exit code must stay unknown - no fabricated 'exit status 1'."""
+        raw = {
+            "success": True,
+            "status": "failed",
+            "error": "channel EOF",
+            "output": "partial output\n",
+            "session_id": 1,
+        }
+        res = project_tool_result("run", raw)
+        self.assertEqual(res["error"], "channel EOF")
+        self.assertNotIn("exit status", res["error"].lower())
+        self.assertEqual(res["output"], "partial output\n")
+        self.assertNotIn("[WARNING", res["output"])
+
+    def test_project_tool_result_keeps_hint(self):
+        """T3.3/F9: recovery hints travel to the model instead of decorative banners."""
+        raw = {
+            "success": True, "status": "interrupted", "output": "",
+            "process_stopped": False, "hint": "the remote process may still be running",
+            "session_id": 1,
+        }
+        res = project_tool_result("run", raw)
+        self.assertFalse(res["process_stopped"])
+        self.assertEqual(res["hint"], "the remote process may still be running")
 
     def test_project_tool_result_file_read_download(self):
         # File download action
@@ -204,6 +230,102 @@ class TestServer(unittest.TestCase):
             self.assertNotIn("error", res)
             self.assertIn("result", res)
 
+    def test_control_request_routing(self):
+        """T1.3/F5: cheap control calls must run on the control lane, never behind long runs."""
+        from src.server import is_control_request
+        for name in ("signal", "session_close", "session_update", "session_list", "server_list", "last_command_details"):
+            self.assertTrue(is_control_request({"method": "tools/call", "params": {"name": name}}), name)
+        for name in ("run", "read", "file"):
+            self.assertFalse(is_control_request({"method": "tools/call", "params": {"name": name}}), name)
+        self.assertTrue(is_control_request({"method": "initialize"}))
+        self.assertTrue(is_control_request({"method": "tools/list"}))
+        self.assertFalse(is_control_request("not a dict"))
+
+    def test_submit_request_busy_when_saturated(self):
+        """T1.3/F5: past the in-flight cap the caller gets an immediate busy answer, not a queue."""
+        import threading
+        import json as json_mod
+        from src.main import submit_request
+        written = []
+        pending = threading.BoundedSemaphore(1)
+        self.assertTrue(pending.acquire(blocking=False))  # saturate the cap
+        main_executor = MagicMock()
+        control_executor = MagicMock()
+        submit_request(
+            json_mod.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                            "params": {"name": "run", "arguments": {"command": "x"}}}),
+            MagicMock(), written.append, main_executor, control_executor, pending,
+        )
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["id"], 7)
+        self.assertEqual(written[0]["error"]["code"], -32000)
+        self.assertIn("busy", written[0]["error"]["message"])
+        main_executor.submit.assert_not_called()
+        self.assertEqual(pending._value, 0, "busy path must not release the slot it never took")
+
+    def test_submit_request_control_lane_ignores_saturated_cap(self):
+        """T1.3/F5: Ctrl+C and friends must get through even when the main pool is saturated."""
+        import threading
+        import json as json_mod
+        from src.main import submit_request
+        written = []
+        pending = threading.BoundedSemaphore(1)
+        self.assertTrue(pending.acquire(blocking=False))
+        main_executor = MagicMock()
+        control_executor = MagicMock()
+        submit_request(
+            json_mod.dumps({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                            "params": {"name": "signal", "arguments": {"action": "ctrl_c"}}}),
+            MagicMock(), written.append, main_executor, control_executor, pending,
+        )
+        self.assertEqual(written, [])
+        control_executor.submit.assert_called_once()
+        main_executor.submit.assert_not_called()
+
+    def test_submit_request_rejects_oversized_lines(self):
+        """T1.3/F5: a huge request line must be refused before parsing (memory DoS)."""
+        from src.main import submit_request
+        written = []
+        pending = __import__("threading").BoundedSemaphore(4)
+        with patch("src.main.MAX_REQUEST_LINE_BYTES", 10):
+            submit_request("x" * 50, MagicMock(), written.append, MagicMock(), MagicMock(), pending)
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["error"]["code"], -32600)
+        self.assertIn("too large", written[0]["error"]["message"])
+
+    def test_ping_and_protocol_version(self):
+        """T1.4/F12: ping must answer, initialize must echo the client's protocol version."""
+        resp = handle_request({"jsonrpc": "2.0", "id": 5, "method": "ping"}, MagicMock())
+        self.assertEqual(resp["result"], {})
+        init = handle_request({"jsonrpc": "2.0", "id": 6, "method": "initialize",
+                               "params": {"protocolVersion": "2025-06-18"}}, MagicMock())
+        self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")
+
+    def test_cancelled_notification_returns_no_response(self):
+        """T1.4/F12: notifications get no response, but cancellation must be forwarded."""
+        manager = MagicMock()
+        manager.cancel_request.return_value = {"success": True}
+        resp = handle_request({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                               "params": {"requestId": 9}}, manager)
+        self.assertIsNone(resp)
+        manager.cancel_request.assert_called_once_with(9)
+
+    def test_run_dispatch_passes_req_id_to_run_command(self):
+        """T1.4/F12: the JSON-RPC id must reach run_command so cancel can find the run."""
+        node = MagicMock()
+        node.alias = "srv1"
+        mock_sess = MagicMock()
+        mock_sess.run_command.return_value = {
+            "success": True, "session_id": "srv1/7", "server": "srv1", "output": "ok", "status": "completed"
+        }
+        node.find_first_idle_alive_session.return_value = mock_sess
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, None, False, None)
+
+        res = run_dispatch({"server": "srv1", "command": "echo 1"}, manager, req_id=77)
+        self.assertTrue(res["success"])
+        self.assertEqual(mock_sess.run_command.call_args.kwargs.get("req_id"), 77)
+
     def test_process_line_parse_error(self):
         from src.main import process_line
         captured_responses = []
@@ -235,6 +357,33 @@ class TestServer(unittest.TestCase):
         res_space = server_add_dispatch({"alias": "bad server", "host": "1.2.3.4", "user": "u"}, mock_manager)
         self.assertFalse(res_space["success"])
         self.assertIn("Invalid server alias", res_space["error"])
+
+    def test_from_dict_unresolved_secret_env_raises(self):
+        """T0.3/F13: a ${VAR} secret that cannot resolve must fail loudly, not become the password."""
+        with self.assertRaises(ValueError) as ctx:
+            ServerTargetConfig.from_dict("prod", {
+                "host": "10.0.0.1", "user": "u", "password": "${DEFINITELY_NOT_SET_VAR_12345}",
+            })
+        self.assertIn("DEFINITELY_NOT_SET_VAR_12345", str(ctx.exception))
+
+    def test_from_dict_rejects_bash_default_syntax_in_secrets(self):
+        """${VAR:-default} is bash-only: it must fail loudly, not become the literal password."""
+        with self.assertRaises(ValueError) as ctx:
+            ServerTargetConfig.from_dict("prod", {
+                "host": "10.0.0.1", "user": "u", "password": "${SOME_VAR_XYZ:-admin123}",
+            })
+        self.assertIn("unresolvable secret reference", str(ctx.exception))
+
+    def test_from_dict_resolves_secret_env(self):
+        """T0.3/F13: resolvable ${VAR} secrets still interpolate."""
+        os.environ["MCP_TEST_SECRET_PW"] = "s3cret"
+        try:
+            cfg = ServerTargetConfig.from_dict("prod", {
+                "host": "10.0.0.1", "user": "u", "password": "${MCP_TEST_SECRET_PW}",
+            })
+            self.assertEqual(cfg.password, "s3cret")
+        finally:
+            del os.environ["MCP_TEST_SECRET_PW"]
 
     def test_from_dict_handles_null_port_and_max_sessions(self):
         """Verify ServerTargetConfig.from_dict gracefully defaults null port and null max_sessions."""
@@ -463,18 +612,20 @@ class TestServer(unittest.TestCase):
             self.assertFalse(response["result"].get("isError"), status)
         projected = project_tool_result("run", {
             "success": True,
-            "status": "running",
+            "status": "interrupted",
             "output": "",
             "message": "Command started in background",
-            "session_recovered": True,
-            "selection_reason": "current session died",
+            "session_reused": True,
+            "process_stopped": False,
+            "hint": "the remote process may still be running",
             "created_session_id": "srv/2",
             "recv_paused": True,
             "session_id": "srv/2",
         })
         self.assertEqual(projected["message"], "Command started in background")
-        self.assertTrue(projected["session_recovered"])
-        self.assertEqual(projected["selection_reason"], "current session died")
+        self.assertTrue(projected["session_reused"])
+        self.assertFalse(projected["process_stopped"])
+        self.assertEqual(projected["hint"], "the remote process may still be running")
         self.assertEqual(projected["created_session_id"], "srv/2")
         self.assertTrue(projected["recv_paused"])
 
@@ -616,7 +767,14 @@ class TestServer(unittest.TestCase):
             outside = "C:\\Windows\\notepad.exe" if os.name == "nt" else "/etc/passwd"
             self.assertEqual(resolve_local_path(outside), "")
             temp_file = os.path.join(tempfile.gettempdir(), "mcp_dispute_allow.txt")
-            self.assertTrue(resolve_local_path(temp_file))
+            # system temp is opt-in now
+            self.assertEqual(resolve_local_path(temp_file), "")
+            previous_temp = config.ALLOW_SYSTEM_TEMP
+            try:
+                config.ALLOW_SYSTEM_TEMP = True
+                self.assertTrue(resolve_local_path(temp_file))
+            finally:
+                config.ALLOW_SYSTEM_TEMP = previous_temp
             config.PROJECT_ROOT = project
             inside = os.path.join(project, "owned.txt")
             self.assertEqual(resolve_local_path(inside), os.path.realpath(inside))
@@ -661,7 +819,14 @@ class TestServer(unittest.TestCase):
             outside = "C:\\Windows\\notepad.exe" if os.name == "nt" else "/etc/passwd"
             self.assertEqual(resolve_local_path(outside), "")
             temp_file = os.path.join(tempfile.gettempdir(), "mcp_empty_root.txt")
-            self.assertTrue(resolve_local_path(temp_file))
+            # system temp is opt-in now
+            self.assertEqual(resolve_local_path(temp_file), "")
+            previous_temp = config.ALLOW_SYSTEM_TEMP
+            try:
+                config.ALLOW_SYSTEM_TEMP = True
+                self.assertTrue(resolve_local_path(temp_file))
+            finally:
+                config.ALLOW_SYSTEM_TEMP = previous_temp
         finally:
             config.PROJECT_ROOT = previous
 
@@ -704,7 +869,7 @@ class TestServer(unittest.TestCase):
         session.runs = {1: run}
         session.run_command.return_value = {
             "success": True,
-            "output": page,
+            "output": page[:DEFAULT_READ_MAX_CHARS],
             "run_id": 1,
             "status": "completed",
             "still_running": False,
@@ -734,20 +899,37 @@ class TestServer(unittest.TestCase):
         tools = tools_list()["result"]["tools"]
         run_tool = next(tool for tool in tools if tool["name"] == "run")
         description = run_tool["description"]
-        self.assertIn("single terminal process", description)
+        # T3.1/F10: descriptions stay compact - every char is paid per request
+        self.assertLessEqual(len(description), 500, "run description must stay compact for small models")
+        self.assertIn("one terminal runs one command at a time", description)
         self.assertIn("new_session=true", description)
-        self.assertIn("5.0", description)
+        self.assertIn("still_running", description)
         props = run_tool["inputSchema"]["properties"]
         self.assertNotIn("background", props)
         self.assertNotIn("contains", props)
         self.assertNotIn("regex", props)
         self.assertNotIn("tail_lines", props)
+        self.assertIn("hard_timeout", props)
+
+    def test_tool_profile_lean_shows_only_everyday_tools(self):
+        """T3.2/F10: the lean catalog keeps small-model prompts small."""
+        from src.config import config as cfg
+        from src.server import LEAN_TOOLS
+        previous = cfg.TOOL_PROFILE
+        try:
+            cfg.TOOL_PROFILE = "lean"
+            names = {t["name"] for t in tools_list()["result"]["tools"]}
+            self.assertEqual(names, LEAN_TOOLS)
+            cfg.TOOL_PROFILE = "full"
+            self.assertEqual(len(tools_list()["result"]["tools"]), 10)
+        finally:
+            cfg.TOOL_PROFILE = previous
 
     def test_read_and_session_list_schemas_hide_internal_run_ids(self):
         tools = tools_list()["result"]["tools"]
         read_tool = next(tool for tool in tools if tool["name"] == "read")
-        self.assertIn("terminal tab", read_tool["description"])
-        self.assertIn("offset=0 to rewind", read_tool["description"])
+        self.assertIn("terminal", read_tool["description"])
+        self.assertIn("0 rewinds", read_tool["description"])
         read_props = read_tool["inputSchema"]["properties"]
         self.assertNotIn("run_id", read_props)
 
@@ -788,10 +970,78 @@ class TestServer(unittest.TestCase):
         self.assertIn("Session 99 not found on server 'srv1'", res_signal["error"])
         node.ensure_session.assert_not_called()
 
-    def test_run_dispatch_without_session_id_always_opens_new_session(self):
-        """Test that calling run without session_id always opens a new session and sets session_created=True."""
+    def test_run_dispatch_rejects_empty_command(self):
+        """T0.4/F10: an empty command must fail loudly, not run a bare exit marker as success."""
+        manager = MagicMock()
         node = MagicMock()
         node.alias = "srv1"
+        manager.resolve_target_for_args.return_value = (node, 1, False, None)
+        for bad in ("", "   ", None):
+            res = run_dispatch({"server": "srv1", "session_id": "srv1/1", "command": bad}, manager)
+            self.assertFalse(res["success"])
+            self.assertIn("command", res["error"].lower())
+        manager.resolve_target_for_args.assert_not_called()
+
+    def test_run_dispatch_without_session_id_reuses_idle_session(self):
+        """T1.1/F3: run without session_id must REUSE an idle session, not open a new SSH connection."""
+        node = MagicMock()
+        node.alias = "srv1"
+        mock_sess = MagicMock()
+        mock_sess.run_command.return_value = {
+            "success": True,
+            "session_id": "srv1/7",
+            "server": "srv1",
+            "output": "ok",
+            "status": "completed"
+        }
+        node.find_first_idle_alive_session.return_value = mock_sess
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, None, False, None)
+
+        res = run_dispatch({"server": "srv1", "command": "echo 1"}, manager)
+        self.assertTrue(res["success"])
+        self.assertTrue(res.get("session_reused"))
+        self.assertFalse(res.get("session_created"))
+        node.open_session.assert_not_called()
+        mock_sess.run_command.assert_called_once()
+
+    def test_run_dispatch_new_session_true_always_opens_new(self):
+        """T1.1/F3: new_session=true must still force a clean session."""
+        node = MagicMock()
+        node.alias = "srv1"
+        node.open_session.return_value = {
+            "success": True,
+            "session_id": "srv1/1",
+            "numeric_session_id": 1,
+            "server": "srv1",
+            "name": ""
+        }
+        mock_sess = MagicMock()
+        mock_sess.run_command.return_value = {
+            "success": True,
+            "session_id": "srv1/1",
+            "server": "srv1",
+            "output": "ok",
+            "status": "completed"
+        }
+        node.get_session.return_value = mock_sess
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, None, False, None)
+
+        res = run_dispatch({"server": "srv1", "command": "echo 1", "new_session": True}, manager)
+        self.assertTrue(res["success"])
+        self.assertTrue(res.get("session_created"))
+        self.assertFalse(res.get("session_reused"))
+        self.assertEqual(res.get("session_selection"), "new_session")
+        self.assertEqual(res.get("created_session_id"), "srv1/1")
+        node.open_session.assert_called_once()
+        node.find_first_idle_alive_session.assert_not_called()
+
+    def test_run_dispatch_opens_new_when_none_idle(self):
+        """T1.1/F3: with no idle session a fresh one is created (old behaviour preserved)."""
+        node = MagicMock()
+        node.alias = "srv1"
+        node.find_first_idle_alive_session.return_value = None
         node.open_session.return_value = {
             "success": True,
             "session_id": "srv1/1",
@@ -818,6 +1068,41 @@ class TestServer(unittest.TestCase):
         self.assertEqual(res.get("created_session_id"), "srv1/1")
         node.open_session.assert_called_once()
 
+    def test_run_dispatch_busy_reused_session_retries_on_new_session(self):
+        """T1.1/F3: losing the idle-session race must retry once on a fresh session."""
+        node = MagicMock()
+        node.alias = "srv1"
+        busy_sess = MagicMock()
+        busy_sess.run_command.return_value = {
+            "success": False,
+            "error": "Session 1 is busy running 'x'.",
+            "session_id": "srv1/1",
+            "server": "srv1",
+        }
+        fresh_sess = MagicMock()
+        fresh_sess.run_command.return_value = {
+            "success": True,
+            "session_id": "srv1/2",
+            "server": "srv1",
+            "output": "ok",
+            "status": "completed"
+        }
+        node.find_first_idle_alive_session.return_value = busy_sess
+        node.open_session.return_value = {
+            "success": True, "session_id": "srv1/2", "numeric_session_id": 2, "server": "srv1", "name": ""
+        }
+        node.get_session.return_value = fresh_sess
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, None, False, None)
+
+        res = run_dispatch({"server": "srv1", "command": "echo 1"}, manager)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res.get("session_selection"), "retry_new_session")
+        self.assertTrue(res.get("session_created"))
+        self.assertFalse(res.get("session_reused"))
+        self.assertEqual(res.get("created_session_id"), "srv1/2")
+        node.open_session.assert_called_once()
+
     def test_read_dispatch_wait_timeout_passes_to_session(self):
         """Test that wait_timeout is parsed and passed to session.read_run."""
         node = MagicMock()
@@ -831,7 +1116,7 @@ class TestServer(unittest.TestCase):
         res = read_dispatch({"server": "srv1", "session_id": "srv1/1", "wait_timeout": 3.5}, manager)
         self.assertTrue(res["success"])
         mock_sess.read_run.assert_called_once_with(
-            run_id=None, offset=None, max_lines=1000, max_chars=50000, wait_timeout=3.5
+            run_id=None, offset=None, max_lines=200, max_chars=8192, wait_timeout=3.5
         )
 
     def test_security_case_insensitive_blacklist_and_readonly(self):
@@ -858,7 +1143,7 @@ class TestServer(unittest.TestCase):
         )
         self.assertIsNotNone(blocked_ro)
         self.assertFalse(blocked_ro["success"])
-        self.assertIn("blocked in read-only sandbox mode", blocked_ro["error"])
+        self.assertIn("blocked in read-only guardrail mode", blocked_ro["error"])
 
     def test_cleanup_dead_session_logs_retention_and_cascade(self):
         """Test cleanup_dead_session_logs retains logs < 2 hours, caps older to 20, and cascades to runs_dir."""

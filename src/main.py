@@ -7,11 +7,13 @@ import threading
 import atexit
 import signal
 from concurrent.futures import ThreadPoolExecutor
-from src.config import config, MAX_WORKERS
+from src.config import (
+    config, MAX_WORKERS, CONTROL_WORKERS, MAX_PENDING_REQUESTS, MAX_REQUEST_LINE_BYTES,
+)
 from src.utils import (
     log_error, resolve_runtime_paths, make_cache_dirs
 )
-from src.server import handle_request
+from src.server import handle_request, is_control_request
 
 # Force UTF-8 I/O to avoid charmap encoding errors on Windows
 # (e.g., docker outputs ✔ \u2714 which cp1252 can't encode)
@@ -36,6 +38,27 @@ def _write_response(response: dict) -> None:
                 log_error(f"response write fallback error: {exc2}. Client connection likely closed.")
 
 
+def process_request(req, manager, write_fn=_write_response) -> None:
+    """Handle one parsed JSON-RPC request, send error or response via write_fn."""
+    try:
+        response = handle_request(req, manager)
+        if response is not None:
+            write_fn(response)
+    except Exception as exc:
+        log_error(f"unexpected error processing request: {exc}")
+        try:
+            req_id = req.get("id") if isinstance(req, dict) else None
+            if req_id is not None:
+                err_response = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32603, "message": f"Internal error: {exc}"},
+                }
+                write_fn(err_response)
+        except Exception:
+            pass
+
+
 def process_line(raw_line: str, manager, write_fn=_write_response) -> None:
     """Process a single JSON-RPC line from stdin, send error or response via write_fn."""
     try:
@@ -56,24 +79,73 @@ def process_line(raw_line: str, manager, write_fn=_write_response) -> None:
             "error": {"code": -32700, "message": f"Parse error: {exc}"}
         })
         return
+    process_request(req, manager, write_fn)
 
+
+def _run_worker(req, manager, write_fn, pending) -> None:
     try:
-        response = handle_request(req, manager)
-        if response is not None:
-            write_fn(response)
+        process_request(req, manager, write_fn)
+    finally:
+        if pending is not None:
+            pending.release()
+
+
+def _busy_response(req) -> dict:
+    req_id = req.get("id") if isinstance(req, dict) else None
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32000,
+            "message": (
+                f"server busy: {MAX_PENDING_REQUESTS} requests are already in flight. "
+                "Wait for running commands (read/signal) or send fewer parallel ones, then retry."
+            ),
+        },
+    }
+
+
+def submit_request(raw_line, manager, write_fn, main_executor, control_executor, pending) -> None:
+    """Route one stdin line to a worker with admission control (F5).
+
+    Control calls run on their own small pool so Ctrl+C is never queued behind long
+    runs; other requests are bounded by `pending`, so a burst gets an immediate busy
+    answer instead of growing an unbounded queue.
+    """
+    if len(raw_line) > MAX_REQUEST_LINE_BYTES:
+        log_error(f"request line too large: {len(raw_line)} bytes")
+        write_fn({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32600,
+                "message": f"request line too large ({len(raw_line)} > {MAX_REQUEST_LINE_BYTES} bytes)",
+            },
+        })
+        return
+    try:
+        req = json.loads(raw_line)
     except Exception as exc:
-        log_error(f"unexpected error processing request: {exc}")
-        try:
-            req_id = req.get("id") if isinstance(req, dict) else None
-            if req_id is not None:
-                err_response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32603, "message": f"Internal error: {exc}"},
-                }
-                write_fn(err_response)
-        except Exception:
-            pass
+        log_error(f"invalid json: {exc}")
+        write_fn({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": f"Parse error: {exc}"}
+        })
+        return
+
+    control = is_control_request(req)
+    if not control and not pending.acquire(blocking=False):
+        log_error("request refused: in-flight limit reached")
+        write_fn(_busy_response(req))
+        return
+    target = control_executor if control else main_executor
+    try:
+        target.submit(_run_worker, req, manager, write_fn, None if control else pending)
+    except RuntimeError:
+        if not control:
+            pending.release()
+        log_error("request dropped: executor is shutting down")
 
 
 def main() -> None:
@@ -92,6 +164,16 @@ def main() -> None:
     parser.add_argument("--cache-dir", help="Optional cache root override")
     parser.add_argument("--read-only", action="store_true", help="Enable read-only sandbox mode")
     parser.add_argument("--command-blacklist", help="Comma-separated list of prohibited commands")
+    parser.add_argument("--import-ssh-config", action="store_true",
+                        help="Also register hosts from ~/.ssh/config (key auth; they survive hot-reloads)")
+    parser.add_argument("--tool-profile", choices=["lean", "full"], default="full",
+                        help="Tool catalog: 'lean' exposes the 6 everyday tools (smaller catalog for small models), 'full' adds admin/diagnostic tools")
+    parser.add_argument("--log-output", choices=["full", "meta", "off"], default="meta",
+                        help="Log policy: 'full' stores raw output chunks, 'meta' lifecycle+commands only (default), 'off' disables logging")
+    parser.add_argument("--allow-system-temp", action="store_true",
+                        help="Allow the file tool to use the system temp directory (default: project root and cache dir only)")
+    parser.add_argument("--allow-gateway-dir", action="store_true",
+                        help="Allow the file tool to touch the gateway install directory (gateway development only)")
     
     args = parser.parse_args()
 
@@ -112,6 +194,12 @@ def main() -> None:
 
     if args.path: config.EXTRA_PATH = args.path
     if args.read_only: config.READ_ONLY = True
+    if args.allow_system_temp: config.ALLOW_SYSTEM_TEMP = True
+    if args.allow_gateway_dir: config.ALLOW_GATEWAY_DIR = True
+    config.LOG_OUTPUT = args.log_output
+    config.TOOL_PROFILE = args.tool_profile
+    if args.import_ssh_config:
+        config.registry.load_from_ssh_config()
     if args.command_blacklist:
         config.COMMAND_BLACKLIST = [c.strip() for c in args.command_blacklist.split(",") if c.strip()]
     
@@ -149,10 +237,13 @@ def main() -> None:
         f"project_root={config.PROJECT_ROOT} cache={config.CACHE_DIRS['cache_root']}"
     )
 
-    # Sync run holds a worker until wait_timeout. signal and session_close share
-    # this pool. A second queue would delay Ctrl+C the same way a max_sessions
-    # waiter would. The caller retries when the pool is full.
+    # Sync run holds a worker until wait_timeout. signal and session_close get their
+    # own control pool so they are never delayed by that (F5); other requests are
+    # bounded by MAX_PENDING_REQUESTS and get an immediate busy answer instead of
+    # queueing without limit.
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="mcp-worker")
+    control_executor = ThreadPoolExecutor(max_workers=CONTROL_WORKERS, thread_name_prefix="mcp-control")
+    pending = threading.BoundedSemaphore(MAX_PENDING_REQUESTS)
 
     shutdown_done = threading.Event()
 
@@ -169,6 +260,10 @@ def main() -> None:
             executor.shutdown(wait=True, cancel_futures=False)
         except Exception as e:
             log_error(f"Executor shutdown error: {e}")
+        try:
+            control_executor.shutdown(wait=True, cancel_futures=False)
+        except Exception as e:
+            log_error(f"Control executor shutdown error: {e}")
 
     atexit.register(_shutdown_gracefully)
 
@@ -196,7 +291,7 @@ def main() -> None:
         line = line.strip()
         if not line:
             continue
-        executor.submit(process_line, line, manager)
+        submit_request(line, manager, _write_response, executor, control_executor, pending)
 
     _shutdown_gracefully()
 

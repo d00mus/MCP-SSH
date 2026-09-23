@@ -34,7 +34,7 @@ from src.utils import (
     find_prompt, parse_exit_marker, cleanup_dead_session_logs, clean_output
 )
 from src.security import check_command_security, escape_shell_path
-from src.ssh_state import RunState
+from src.ssh_state import RunState, ChunkBuffer, CHARS_ACCOUNT
 
 _buffer_checker = None
 _total_buffer_getter = None
@@ -138,6 +138,22 @@ def _describe_connect_error(exc: Exception, host: str, port: int) -> str:
     return f"SSH connect failed to {host}:{port}: {msg}"
 
 
+def _interrupt_fields_for(run: Any) -> Dict[str, Any]:
+    """Honest metadata for an interrupted run. Only a returned prompt proves the
+    command is gone; anything else must NOT claim the remote process stopped (F4)."""
+    confirmed = str(getattr(run, "finish_reason", "") or "").startswith("prompt detected after interrupt")
+    if confirmed:
+        return {"process_stopped": True, "hint": "prompt returned after Ctrl+C - the shell is ready again"}
+    return {
+        "process_stopped": False,
+        "hint": (
+            "Ctrl+C was sent but no prompt confirmed the stop - the remote process may still "
+            "be running. The shell boundary was reset (a fresh shell is created for the next "
+            "command, so cwd/env are gone)."
+        ),
+    }
+
+
 class SSHSession:
     def __init__(self, session_id: int, name: str, cache_dirs: Dict[str, str], project_tag: str, server_config: Optional[ServerTargetConfig] = None):
         self.id = session_id
@@ -181,9 +197,10 @@ class SSHSession:
         self.run_counter = 1
         self.runs: Dict[int, RunState] = {}
         self.reader_threads: Dict[int, threading.Thread] = {}
+        # req_id -> run_id, for MCP notifications/cancelled (bounded FIFO, see T1.4)
+        self.inflight_by_req: Dict[Any, int] = {}
 
-        self.scrollback_buffer: str = ""
-        self.scrollback_base_offset: int = 0
+        self.scrollback = ChunkBuffer(MAX_BUFFER_CHARS, account=CHARS_ACCOUNT)
         self.scrollback_cursor: int = 0
 
         self.lock = threading.Lock()
@@ -220,6 +237,10 @@ class SSHSession:
         json_line(self.session_log_path, data)
 
     def _log_run(self, run: Any, direction: str, payload: Dict[str, Any]) -> None:
+        if direction in ("OUT", "ERR") and getattr(config, "LOG_OUTPUT", "meta") != "full":
+            # Raw output chunks are the main source of secrets and disk I/O (T2.5/F7):
+            # the default 'meta' policy keeps lifecycle events and command text only.
+            return
         run_id = getattr(run, "run_id", None)
         data = {"ts": iso_now(), "dir": direction, "session_id": f"{self.server_alias}/{self.id}", "server": self.server_alias, "numeric_session_id": self.id}
         if run_id is not None:
@@ -231,13 +252,9 @@ class SSHSession:
         if not chunk:
             return
         with self.lock:
-            self.scrollback_buffer += chunk
-            overflow = len(self.scrollback_buffer) - MAX_BUFFER_CHARS
-            if overflow > 0:
-                self.scrollback_buffer = self.scrollback_buffer[overflow:]
-                self.scrollback_base_offset += overflow
-            if self.scrollback_cursor < self.scrollback_base_offset:
-                self.scrollback_cursor = self.scrollback_base_offset
+            self.scrollback.append(chunk)
+            if self.scrollback_cursor < self.scrollback.base_offset:
+                self.scrollback_cursor = self.scrollback.base_offset
 
     def read_scrollback(
         self,
@@ -246,12 +263,13 @@ class SSHSession:
         max_chars: int,
     ) -> Dict[str, Any]:
         with self.lock:
-            if not self.scrollback_buffer and self.runs:
+            if not len(self.scrollback) and self.runs:
                 for r in sorted(self.runs.values(), key=lambda x: x.run_id):
-                    self.scrollback_buffer += r.output_buffer
+                    with r.lock:
+                        self.scrollback.append(r.output_buffer)
 
-            total_len = len(self.scrollback_buffer)
-            base_offset = self.scrollback_base_offset
+            total_len = len(self.scrollback)
+            base_offset = self.scrollback.base_offset
             use_cursor = offset is None
 
             if offset is None:
@@ -266,12 +284,10 @@ class SSHSession:
                 dropped_data = True
 
             relative = max(0, offset - base_offset)
-            data = self.scrollback_buffer[relative:]
-
-            limited = False
-            if len(data) > max_chars:
-                data = data[:max_chars]
-                limited = True
+            available = max(0, total_len - relative)
+            char_cap = max(1, max_chars)
+            limited = available > char_cap
+            data = self.scrollback.window(relative, char_cap)
 
             if max_lines > 0:
                 lines = data.splitlines(keepends=True)
@@ -326,6 +342,8 @@ class SSHSession:
             res["exit_status"] = exit_status
         if dropped_data:
             res["dropped_data"] = True
+        if status == "interrupted":
+            res.update(_interrupt_fields_for(last_r))
         return res
 
     def _invoke_shell_with_timeout(self, width: int = 220, height: int = 50, timeout: float = 15.0) -> paramiko.Channel:
@@ -389,6 +407,13 @@ class SSHSession:
                 return True
             try:
                 self.close(permanent=False)
+                # A fresh connect attempt supersedes any earlier death verdict:
+                # otherwise "session closed" from the teardown above would stick and
+                # hide the real reason of this failure (F8).
+                with self.lock:
+                    self.is_dead = False
+                    self.death_reason = ""
+                    self.death_time = None
                 self.client = paramiko.SSHClient()
 
                 if self.server_config.verify_host:
@@ -458,9 +483,11 @@ class SSHSession:
                 self._log_session("SYS", {"event": "connected", "host": self.server_config.host, "port": self.server_config.port})
                 return True
             except Exception as exc:
-                self.close()
                 reason = _describe_connect_error(exc, self.server_config.host, self.server_config.port)
+                # Record the real reason BEFORE close(): close() tears down with the
+                # generic "session closed" and would otherwise mask it (F8).
                 self._mark_dead(reason)
+                self.close()
                 self._log_session("SYS", {"event": "connect_failed", "error": reason})
                 return False
 
@@ -589,7 +616,7 @@ class SSHSession:
             if not self.channel or self.channel.closed:
                 with self.lock:
                     active_r = self.runs.get(self.active_run_id) if self.active_run_id else None
-                if active_r and not active_r.exec_channel:
+                if active_r and not active_r.exec_channel and not active_r.done_event.is_set():
                     self._mark_dead("channel closed during active run")
                     self.close(permanent=False)
                     return False
@@ -696,6 +723,25 @@ class SSHSession:
         if self.channel and not self.channel.closed:
             self.channel.send("\x03")
 
+    def _invalidate_pty(self, reason: str) -> None:
+        """The command boundary on the PTY is unknown (partial send, interrupt without
+        a prompt): a half-typed remote line would swallow the NEXT command's text.
+        Kill the channel so that cannot happen (F4) and flag the state loss - a new
+        shell means cwd/env are gone, which the next command is told about once.
+        """
+        with self.lock:
+            if self.in_shell or self._is_subshell:
+                self.state_lost = True
+            self.in_shell = False
+            self._is_subshell = False
+            channel, self.channel = self.channel, None
+        try:
+            if channel is not None:
+                channel.close()
+        except Exception as e:
+            log_error(f"Error closing invalidated PTY on session {self.id}: {e}")
+        self._log_session("SYS", {"event": "pty_invalidated", "reason": reason})
+
     def _start_reader_thread(self, run: RunState):
         thread = threading.Thread(target=self._reader_loop, args=(run,), daemon=True)
         with self.lock:
@@ -777,6 +823,12 @@ class SSHSession:
                                     reason="interrupted by ctrl_c",
                                     completion_method="interrupted",
                                 )
+                                with self.lock:
+                                    if self.active_run_id == run.run_id:
+                                        self.active_run_id = None
+                                # No prompt confirmed the stop: the next command must not
+                                # land in a still-running process (F4).
+                                self._invalidate_pty("interrupted without prompt")
                                 break
                         time.sleep(0.05)
                         continue
@@ -800,8 +852,8 @@ class SSHSession:
 
                     # Read tail under lock to prevent race condition
                     with run.lock:
-                        tail = run.output_buffer[-500:]
-                        curr_buffer = run.output_buffer[-2000:]
+                        tail = run.tail_locked(500)
+                        curr_buffer = run.tail_locked(2000)
 
                     # Pagination detection (configurable regexes)
                     found_pager = False
@@ -845,15 +897,20 @@ class SSHSession:
                     if run.interrupt_sent and getattr(run, "interrupt_at", None) is not None:
                         quiet_timeout = getattr(run, "quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
                         if time.time() - run.interrupt_at >= quiet_timeout:
-                            # Do not wait forever for a prompt after Ctrl+C. A shell that ignores SIGINT
-                            # would keep the session busy until session_close. The quiet bound releases
-                            # it; the next command can still land in that process, which is why the wait
-                            # exists at all.
+                            # Do not wait forever for a prompt after Ctrl+C. A shell that
+                            # ignores SIGINT would keep the session busy until session_close.
+                            # The quiet bound releases it - and since nothing proved the
+                            # process stopped, the boundary is invalid (F4): the next
+                            # command must not land inside that process.
                             run.mark_done(
                                 "interrupted",
                                 reason="interrupted by ctrl_c",
                                 completion_method="interrupted",
                             )
+                            with self.lock:
+                                if self.active_run_id == run.run_id:
+                                    self.active_run_id = None
+                            self._invalidate_pty("interrupted without prompt")
                             break
                     if run.mode == "sync":
                         hint = getattr(run, "completion_hint", "either")
@@ -866,7 +923,7 @@ class SSHSession:
                             if hint in ("quiet", "either"):
                                 # Interactive hang check
                                 with run.lock:
-                                    tail = run.output_buffer[-200:]
+                                    tail = run.tail_locked(200)
                                 clean_tail = ANSI_ESCAPE.sub("", tail)
                                 is_interactive = False
                                 for pattern in COMPILED_INTERACTIVE_PATTERNS:
@@ -999,7 +1056,7 @@ class SSHSession:
                         quiet_timeout = getattr(run, "quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
                         if run.total_received_chars > 0 and (time.time() - run.last_data_at) >= quiet_timeout:
                             with run.lock:
-                                tail = run.output_buffer[-200:]
+                                tail = run.tail_locked(200)
                             clean_tail = ANSI_ESCAPE.sub("", tail)
                             is_interactive = False
                             for pattern in COMPILED_INTERACTIVE_PATTERNS:
@@ -1060,7 +1117,7 @@ class SSHSession:
 
         for r in to_clean_runs:
             with r.lock:
-                r.output_buffer = ""
+                r.discard_all_output()
 
     def _check_security(self, command: str) -> Optional[Dict[str, Any]]:
         return check_command_security(
@@ -1088,6 +1145,7 @@ class SSHSession:
         background: bool = False,
         use_pty: bool = True,
         internal: bool = False,
+        req_id: Any = None,
     ) -> Dict[str, Any]:
         error = self.ensure_alive()
         if error:
@@ -1175,6 +1233,12 @@ class SSHSession:
             self.runs[run_id] = run
             self.active_run_id = run_id
             self.last_run_id = run_id
+            if req_id is not None:
+                run.req_id = req_id
+                self.inflight_by_req[req_id] = run_id
+                # bounded FIFO: stale entries are harmless (cancel checks active_run_id)
+                while len(self.inflight_by_req) > 256:
+                    self.inflight_by_req.pop(next(iter(self.inflight_by_req)))
 
         self._cleanup_old_runs()
 
@@ -1251,6 +1315,9 @@ class SSHSession:
                         if self.active_run_id == run_id:
                             self.active_run_id = None
                     run.mark_done("failed", error=send_err, completion_method="failed")
+                    # A partial send leaves a half-typed line open on the remote shell:
+                    # the next command would be appended to it. Kill the PTY (F4).
+                    self._invalidate_pty(f"command send failed: {send_err}")
                     return {"success": False, "error": send_err, "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias, "run_id": run_id}
             else:
                 if not self.client:
@@ -1338,6 +1405,7 @@ class SSHSession:
             "next_offset": snapshot["next_offset"],
             "limited": snapshot["limited"],
             "still_running": snapshot["still_running"],
+            "total_chars": snapshot["total_received_chars"],
         }
         if snapshot.get("recv_paused"):
             resp["recv_paused"] = True
@@ -1348,6 +1416,8 @@ class SSHSession:
             resp["error"] = snapshot["error"]
         if run.exit_status is not None:
             resp["exit_status"] = run.exit_status
+        if status == "interrupted":
+            resp.update(_interrupt_fields_for(run))
         return resp
 
     def _restore_run_from_disk(self, run_id: int) -> Optional[RunState]:
@@ -1447,6 +1517,11 @@ class SSHSession:
                 selected.done_event.wait(timeout=wait_timeout)
 
             snapshot = selected.read_slice(offset=offset, max_lines=max_lines, max_chars=max_chars)
+            # T2.4/F7: a fully-consumed buffer goes back to the pool (discard_through
+            # used to be dead code). A later rewind then honestly reports dropped_data;
+            # tab-level history (scrollback) still supports offset=0.
+            if snapshot["next_offset"] >= selected.buffer_base_offset + selected.buffer_len:
+                selected.discard_through(snapshot["next_offset"])
             status = selected.status
             if selected.done_event.is_set():
                 if selected.completion_method == "prompt_detected":
@@ -1471,6 +1546,7 @@ class SSHSession:
                 "next_offset": snapshot["next_offset"],
                 "limited": snapshot["limited"],
                 "still_running": not selected.done_event.is_set(),
+                "total_chars": snapshot["total_received_chars"],
             }
             if selected.exit_status is not None:
                 result["exit_status"] = selected.exit_status
@@ -1479,6 +1555,8 @@ class SSHSession:
                 result["pause_reason"] = snapshot.get("pause_reason") or ""
             if snapshot.get("dropped_data"):
                 result["dropped_data"] = True
+            if status == "interrupted":
+                result.update(_interrupt_fields_for(selected))
             return result
 
         # 2. run_id is None -> Tab-level read
@@ -1497,7 +1575,7 @@ class SSHSession:
                     if self.last_run_id is not None:
                         target_r = self.runs.get(self.last_run_id)
 
-            if target_r is not None and target_r.shared_cursor < len(target_r.output_buffer):
+            if target_r is not None and target_r.shared_cursor < target_r.buffer_len:
                 snapshot = target_r.read_slice(offset=None, max_lines=max_lines, max_chars=max_chars)
                 status = target_r.status
                 if target_r.done_event.is_set():
@@ -1522,6 +1600,7 @@ class SSHSession:
                     "next_offset": snapshot["next_offset"],
                     "limited": snapshot["limited"],
                     "still_running": not target_r.done_event.is_set(),
+                    "total_chars": snapshot["total_received_chars"],
                 }
                 if target_r.exit_status is not None:
                     result["exit_status"] = target_r.exit_status
@@ -1530,9 +1609,23 @@ class SSHSession:
                     result["pause_reason"] = snapshot.get("pause_reason") or ""
                 if snapshot.get("dropped_data"):
                     result["dropped_data"] = True
+                if status == "interrupted":
+                    result.update(_interrupt_fields_for(target_r))
                 return result
 
         return self.read_scrollback(offset=offset, max_lines=max_lines, max_chars=max_chars)
+
+    def cancel_run_for_request(self, req_id: Any) -> Dict[str, Any]:
+        """MCP notifications/cancelled: interrupt the run started by that request.
+        Only acts while the request's run is still active AND unfinished, so a late
+        cancellation can never kill an unrelated newer command (T1.4)."""
+        with self.lock:
+            run_id = self.inflight_by_req.get(req_id)
+            run = self.runs.get(run_id) if run_id is not None else None
+            active = self.active_run_id
+        if run_id is None or active != run_id or run is None or run.done_event.is_set():
+            return {"success": True, "message": "nothing to cancel: request already finished"}
+        return self.send_signal("ctrl_c")
 
     def begin_file_op(self) -> bool:
         with self.lock:
@@ -1678,6 +1771,10 @@ class SSHSession:
         if active_r and not active_r.done_event.is_set():
             active_r.mark_done("dead", reason="session closed", error="session closed", completion_method="dead")
 
+        # NOTE: buffered output stays readable after death on purpose (read_run on a
+        # dead session is a feature). Freeing happens in free_buffers() when the
+        # session leaves its node and can no longer be read at all.
+
         for r in all_runs:
             try:
                 if r.exec_stdin:
@@ -1708,6 +1805,18 @@ class SSHSession:
         for th in threads_to_join:
             if th.is_alive() and th != threading.current_thread():
                 th.join(timeout=1.5)
+
+    def free_buffers(self) -> None:
+        """Release buffered output and its char accounting. Called when the session
+        leaves its node (closed/purged): after that it cannot be read anymore (F7)."""
+        with self.lock:
+            for r in list(self.runs.values()):
+                try:
+                    with r.lock:
+                        r.discard_all_output()
+                except Exception:
+                    pass
+            self.scrollback.clear()
 
     def info(self) -> Dict[str, Any]:
         with self.lock:
