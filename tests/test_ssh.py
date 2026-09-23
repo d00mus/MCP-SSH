@@ -1107,6 +1107,10 @@ class TestSSH(unittest.TestCase):
     def test_posix_banner_sets_in_shell_keenetic_does_not(self):
         from src.session import banner_sets_posix_shell
         self.assertTrue(banner_sets_posix_shell("root@vps:~# "))
+        self.assertTrue(banner_sets_posix_shell("$"))
+        self.assertTrue(banner_sets_posix_shell("Hardware Model: OpenStack Nova\n$"))
+        self.assertTrue(banner_sets_posix_shell("/ # "))
+        self.assertTrue(banner_sets_posix_shell("user@host:~$ "))
         self.assertFalse(banner_sets_posix_shell("\n> "))
         self.assertFalse(banner_sets_posix_shell("(config)> "))
 
@@ -1127,6 +1131,7 @@ class TestSSH(unittest.TestCase):
             return session
 
         self.assertTrue(connect_with(b"root@vps:~# ").in_shell)
+        self.assertTrue(connect_with(b"Hardware Model: OpenStack Nova\n$").in_shell)
         self.assertFalse(connect_with(b"\n> ").in_shell)
 
     def test_background_keeps_session_busy(self):
@@ -1917,6 +1922,44 @@ class TestSSH(unittest.TestCase):
         self.assertEqual(res["output"].strip(), "output before death")
         self.assertEqual(res["status"], "completed")
         self.assertEqual(res["exit_status"], 0)
+
+    def test_terminal_tab_scrollback_and_amnesia_rewind(self):
+        """Verify unified tab scrollback: rewind to start (offset=0), negative offset (tail), and pagination without run_id."""
+        session, _, _ = self._create_mock_session()
+
+        # Simulate terminal activity across multiple sequential commands
+        cmd1 = "$ echo first\n" + ("first line output " * 10) + "\n"
+        cmd2 = "$ echo second\n" + ("second line output " * 10) + "\n"
+        cmd3 = "$ echo third\n" + ("third line output " * 10) + "\n"
+        session.append_scrollback(cmd1)
+        session.append_scrollback(cmd2)
+        session.append_scrollback(cmd3)
+
+        # 1. Full rewind (offset=0) to solve agent context loss / amnesia
+        res_rewind = session.read_run(run_id=None, offset=0, max_lines=1000, max_chars=50000)
+        self.assertTrue(res_rewind["success"])
+        self.assertNotIn("run_id", res_rewind)
+        self.assertIn("first line output", res_rewind["output"])
+        self.assertIn("second line output", res_rewind["output"])
+        self.assertIn("third line output", res_rewind["output"])
+
+        # 2. Negative offset (tail buffer)
+        res_tail = session.read_run(run_id=None, offset=-50, max_lines=1000, max_chars=50000)
+        self.assertTrue(res_tail["success"])
+        self.assertNotIn("run_id", res_tail)
+        self.assertIn("third line output", res_tail["output"])
+        self.assertNotIn("first line output", res_tail["output"])
+
+        # 3. Pagination across pages using next_offset
+        page1 = session.read_run(run_id=None, offset=0, max_lines=1000, max_chars=100)
+        self.assertTrue(page1["success"])
+        self.assertTrue(page1["limited"])
+        self.assertEqual(page1["next_offset"], 100)
+
+        page2 = session.read_run(run_id=None, offset=page1["next_offset"], max_lines=1000, max_chars=50000)
+        self.assertTrue(page2["success"])
+        self.assertIn("second line output", page2["output"])
+        self.assertIn("third line output", page2["output"])
 
 if __name__ == "__main__":
     unittest.main()

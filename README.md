@@ -70,11 +70,11 @@ Our toolset is optimized to minimize context bloat while giving your AI agent fu
 | `session_list` | Session audit | Lists all active persistent sessions and their statuses (`idle`, `busy`, `broken`). Filterable by server prefix. |
 | `session_update` | Rename session | Renames sessions for easier identification. |
 | `session_close` | Terminate channel | Cleanly terminates remote background processes and tears down the SSH channel. |
-| `run` | Execute commands | Runs commands with 5s anti-hang timeout. Direct execution without session_id creates a new session. Passing session_id runs strictly in that session. Long commands return `still_running: true` (read rest via `read`). Set `wait_timeout: 0` for immediate async execution. Set `use_pty: false` for multiline scripts. |
-| `read` | Read output | Reads buffered terminal output with optional `wait_timeout` to wait for active runs. Retains up to 2MB in-memory circular buffer with full rewind support (`offset: 0`). |
+| `run` | Execute commands | Runs commands with 5s anti-hang timeout and returns output directly. Sequential commands reuse session via `session_id`. Concurrent commands omit `session_id`. Only commands taking >5s return `still_running: true` (read remaining output via `read`). Set `wait_timeout: 0` for async execution. Set `use_pty: false` for multiline scripts. |
+| `read` | Read / Scroll Tab | Reads remaining output for commands that returned `still_running: true`, or scrolls through the terminal tab history. Supports full rewind (`offset: 0`) for agent context recovery, tail viewing (negative offset), and pagination (`next_offset`). Retains up to 2MB circular buffer. |
 | `signal` | Control processes | Sends `action: "ctrl_c"` to immediately interrupt a stuck command and free the session, or `stdin` to answer prompts. |
 | `file` | Manage files | Sandbox-compliant file tool supporting directory listings, read windows, uploads, downloads, and in-place search-and-replace edits. |
-| `last_command_details`| Debug telemetry | Returns verbose execution telemetry, system resource usage, and raw socket buffers for troubleshooting. |
+| `last_command_details`| Command inspect | Returns exact command string, arguments, execution status, and raw output of the last executed tool call for troubleshooting. |
 
 ---
 

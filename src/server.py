@@ -117,8 +117,6 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
         projected["session_id"] = session_id
         if "session_name" in result:
             projected["session_name"] = result["session_name"]
-    if "run_id" in result:
-        projected["run_id"] = result["run_id"]
     
     # 3. status
     if status is not None:
@@ -257,8 +255,7 @@ def tools_list() -> Dict[str, Any]:
                         "description": "Optional server name or prefix to filter sessions (e.g. 'keen' or 'keenetic').",
                     },
                     "include_name": {"type": "boolean", "description": "Optional. Include session name in listing."},
-                    "include_last_command": {"type": "boolean", "description": "Optional. Include last launched command in listing."},
-                    "include_active_ids": {"type": "boolean", "description": "Optional. Include active_run_id for debugging."},
+                    "include_last_command": {"type": "boolean", "description": "Optional. If true, includes the last executed command string for each session in the listing."},
                 },
             },
         },
@@ -291,13 +288,14 @@ def tools_list() -> Dict[str, Any]:
             "name": "run",
             "description": (
                 "Execute command on a target server. "
+                "Returns command output directly in the response if completed within wait_timeout (default 5.0s) — do NOT call 'read' unless still_running=true is returned. "
                 "You do NOT need to call 'session_list' before your first command — simply call 'run(server=...)' and a new session will be created automatically. "
-                "If 'session_id' is omitted, always creates and returns a new session. "
-                "If 'session_id' is provided, runs strictly in that session (fails if busy, closed, or not found). "
+                "To run sequential commands in the same session, pass the returned 'session_id'. "
+                "To run commands concurrently, omit 'session_id' (or use new_session=true) to open a new clean session. "
                 "An SSH session is a single terminal process (PTY); you CANNOT execute commands in parallel in the same session. "
-                "Use new_session=true or run without session_id to run concurrently in a new session. "
-                "Default wait_timeout is 5.0 seconds. Commands taking longer will return still_running=true without failing; "
-                "read their remaining output via 'read'. Set wait_timeout=0 for immediate async execution (returns once started). "
+                "If 'session_id' is provided, runs strictly in that session (fails if busy, closed, or not found). "
+                "Commands taking longer than wait_timeout return still_running=true without failing; read their remaining output via 'read'. "
+                "Set wait_timeout=0 for immediate async execution (returns once started). "
                 "For multiline code or scripts (e.g. python -c): set use_pty=false to avoid PTY secondary prompt/echo issues. "
                 "For router (Keenetic): shell=false uses NDM CLI; shell=true uses Linux shell. "
                 "Do not mix NDM CLI and Linux shell in the same session."
@@ -306,7 +304,7 @@ def tools_list() -> Dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "server": server_param,
-                    "command": {"type": "string", "description": "The command string to execute (e.g., 'ls -la'). Use standard shell pipelines (| grep, | head, | awk) for filtering."},
+                    "command": {"type": "string", "description": "The command string to execute (e.g., 'ls -la'). Use standard shell pipelines (| grep, | head, | awk) for filtering. Avoid '2>/dev/null' unless intentionally hiding errors."},
                     "session_id": session_id_param,
                     "wait_timeout": {"type": "number", "description": "Max seconds to wait for output (default 5.0). Set 0 for async start (returns once started)."},
                     "shell": {"type": "boolean", "description": "Boolean flag. TRUE for Linux shell (default), FALSE for native CLI (NDM)."},
@@ -320,8 +318,12 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "read",
             "description": (
-                "Read buffered output for a run on target server. If command is still running, waits up to wait_timeout seconds (default 5.0) for completion before returning. "
-                "Supports pagination via 'offset' and 'next_offset'. The server retains up to 2MB in memory without discarding (offset=0 rewinds to the beginning). "
+                "Read output from a terminal tab (session). "
+                "Use when a command in 'run' returned still_running=true, or to scroll through tab history. "
+                "If a command is still running, waits up to wait_timeout seconds (default 5.0) for completion before returning. "
+                "Do NOT call 'read' after 'run' if the command already completed. "
+                "Supports scrolling tab history: set offset=0 to rewind and read from the very beginning of the tab (useful if you forgot earlier context/output), "
+                "or use negative offset (e.g. -2000) for the tail. Use 'next_offset' for pagination. Retains up to 2MB in memory. "
                 "Statuses: 'completed', 'running', 'stalled', 'failed', 'dead'."
             ),
             "inputSchema": {
@@ -329,9 +331,8 @@ def tools_list() -> Dict[str, Any]:
                 "properties": {
                     "server": server_param,
                     "session_id": session_id_param,
-                    "run_id": {"type": "number", "description": "Optional specific run id. If omitted, uses the active or last run."},
-                    "wait_timeout": {"type": "number", "description": "Max seconds to wait for command completion if still running (default 5.0). Set 0 for instant read."},
-                    "offset": {"type": "number", "description": "Optional absolute offset for pagination. If omitted, shared cursor is used. Set 0 to rewind to beginning."},
+                    "wait_timeout": {"type": "number", "description": "Max seconds to wait for running command to finish (default 5.0). Set 0 for instant non-blocking read."},
+                    "offset": {"type": "number", "description": "Optional offset for tab history navigation. Set 0 to rewind to tab beginning (full history), negative (e.g. -2000) for buffer tail, or next_offset to paginate. If omitted, reads new unread output."},
                     "max_lines": {"type": "number", "description": "Max lines per page (default 1000)."},
                     "max_chars": {"type": "number", "description": "Max chars per page (default 50000)."},
                 },
@@ -354,8 +355,8 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "last_command_details",
             "description": (
-                "Returns FULL verbose metadata of the last tool call on target server. "
-                "Use this ONLY if you need deep details (timeouts, internal states, full memory info)."
+                "Get the exact command string, arguments, execution status, and raw output of the last executed tool call on target server or session. "
+                "Useful for troubleshooting and debugging."
             ),
             "inputSchema": {
                 "type": "object",
@@ -447,8 +448,7 @@ def run_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         if is_b is True:
             busy = session.busy_info() if callable(getattr(session, "busy_info", None)) else {}
             active_cmd = getattr(session, "last_command", "") or ""
-            rid = (busy.get("id") if isinstance(busy, dict) else "") or getattr(session, "active_run_id", "")
-            cmd_info = f" running '{active_cmd}' (run_id {rid})" if active_cmd else ""
+            cmd_info = f" running '{active_cmd}'" if active_cmd else ""
             return {
                 "success": False,
                 "error": (

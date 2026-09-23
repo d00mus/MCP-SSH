@@ -31,7 +31,7 @@ from src.config import (
 )
 from src.utils import (
     log_error, clamp_float, clamp_int, iso_now, json_line, safe_name,
-    find_prompt, parse_exit_marker, cleanup_dead_session_logs
+    find_prompt, parse_exit_marker, cleanup_dead_session_logs, clean_output
 )
 from src.security import check_command_security, escape_shell_path
 from src.ssh_state import RunState
@@ -39,8 +39,9 @@ from src.ssh_state import RunState
 _buffer_checker = None
 _total_buffer_getter = None
 
-_KEENETIC_PROMPT_LINE = re.compile(r"^(?:\([^)\r\n]*\))?>[ \t]*$")
-_POSIX_PROMPT_LINE = re.compile(r"^(?:.*\S+@\S+.*[#$][ \t]*|.*~[#$][ \t]*)$")
+_ROUTER_CLI_PROMPT_LINE = re.compile(r"^(?:[a-zA-Z0-9._-]*\([^)\r\n]*\)|[a-zA-Z0-9._-]*)>[ \t]*$")
+_KEENETIC_PROMPT_LINE = _ROUTER_CLI_PROMPT_LINE
+_POSIX_PROMPT_LINE = re.compile(r"^(?:.*[#$]|[#$])[ \t]*$")
 
 
 def banner_sets_posix_shell(text: Any) -> bool:
@@ -50,7 +51,7 @@ def banner_sets_posix_shell(text: Any) -> bool:
     if not isinstance(text, str) or not text:
         return False
     clean = ANSI_ESCAPE.sub("", text).replace("\r", "")
-    lines = [ln for ln in clean.split("\n") if ln.strip()]
+    lines = [ln.strip() for ln in clean.split("\n") if ln.strip()]
     if not lines:
         return False
     last = lines[-1]
@@ -181,6 +182,10 @@ class SSHSession:
         self.runs: Dict[int, RunState] = {}
         self.reader_threads: Dict[int, threading.Thread] = {}
 
+        self.scrollback_buffer: str = ""
+        self.scrollback_base_offset: int = 0
+        self.scrollback_cursor: int = 0
+
         self.lock = threading.Lock()
         self._connect_lock = threading.RLock()
         self._stdin_lock = threading.Lock()
@@ -221,6 +226,107 @@ class SSHSession:
             data["run_id"] = run_id
         data.update(payload)
         json_line(run.run_log_path, data)
+
+    def append_scrollback(self, chunk: str) -> None:
+        if not chunk:
+            return
+        with self.lock:
+            self.scrollback_buffer += chunk
+            overflow = len(self.scrollback_buffer) - MAX_BUFFER_CHARS
+            if overflow > 0:
+                self.scrollback_buffer = self.scrollback_buffer[overflow:]
+                self.scrollback_base_offset += overflow
+            if self.scrollback_cursor < self.scrollback_base_offset:
+                self.scrollback_cursor = self.scrollback_base_offset
+
+    def read_scrollback(
+        self,
+        offset: Optional[int],
+        max_lines: int,
+        max_chars: int,
+    ) -> Dict[str, Any]:
+        with self.lock:
+            if not self.scrollback_buffer and self.runs:
+                for r in sorted(self.runs.values(), key=lambda x: x.run_id):
+                    self.scrollback_buffer += r.output_buffer
+
+            total_len = len(self.scrollback_buffer)
+            base_offset = self.scrollback_base_offset
+            use_cursor = offset is None
+
+            if offset is None:
+                offset = self.scrollback_cursor
+            elif offset < 0:
+                chars_from_end = abs(offset)
+                offset = max(base_offset, base_offset + total_len - chars_from_end)
+
+            dropped_data = False
+            if offset < base_offset:
+                offset = base_offset
+                dropped_data = True
+
+            relative = max(0, offset - base_offset)
+            data = self.scrollback_buffer[relative:]
+
+            limited = False
+            if len(data) > max_chars:
+                data = data[:max_chars]
+                limited = True
+
+            if max_lines > 0:
+                lines = data.splitlines(keepends=True)
+                if len(lines) > max_lines:
+                    data = "".join(lines[:max_lines])
+                    limited = True
+
+            next_offset = offset + len(data)
+            if use_cursor:
+                self.scrollback_cursor = next_offset
+
+            active_r = self.runs.get(self.active_run_id) if self.active_run_id is not None else None
+            last_r = self.runs.get(self.last_run_id) if self.last_run_id is not None else None
+
+            if active_r and not active_r.done_event.is_set():
+                status = "running"
+                still_running = True
+                exit_status = None
+            elif last_r:
+                still_running = not last_r.done_event.is_set()
+                exit_status = last_r.exit_status
+                if last_r.done_event.is_set():
+                    if last_r.completion_method == "prompt_detected":
+                        status = "completed"
+                    elif last_r.completion_method == "interrupted":
+                        status = "interrupted"
+                    elif last_r.completion_method in {"exit_marker", "exit_status"}:
+                        status = "completed" if last_r.exit_status == 0 else "completed_nonzero"
+                    else:
+                        status = last_r.status
+                else:
+                    status = "running"
+            else:
+                status = "completed"
+                still_running = False
+                exit_status = None
+
+        cleaned_output = clean_output(data)
+        res = {
+            "success": True,
+            "session_id": f"{self.server_alias}/{self.id}",
+            "numeric_session_id": self.id,
+            "server": self.server_alias,
+            "status": status,
+            "output": cleaned_output,
+            "next_offset": next_offset,
+            "base_offset": base_offset,
+            "limited": limited,
+            "still_running": still_running,
+        }
+        if exit_status is not None:
+            res["exit_status"] = exit_status
+        if dropped_data:
+            res["dropped_data"] = True
+        return res
 
     def _invoke_shell_with_timeout(self, width: int = 220, height: int = 50, timeout: float = 15.0) -> paramiko.Channel:
         """Invokes SSH shell in a separate worker thread with strict timeout to avoid infinite hangs."""
@@ -689,6 +795,7 @@ class SSHSession:
 
                     chunk = decoder.decode(chunk_bytes)
                     run.append_output(chunk)
+                    self.append_scrollback(chunk)
                     self._log_run(run, "OUT", {"chunk": chunk})
 
                     # Read tail under lock to prevent race condition
@@ -719,6 +826,8 @@ class SSHSession:
                         if prompt:
                             run.prompt_detected = True
                             run.prompt_line = prompt
+                            if re.search(r"[#$][ \t]*$", prompt):
+                                self.in_shell = True
                             if run.interrupt_sent:
                                 run.mark_done(
                                     "interrupted",
@@ -843,6 +952,7 @@ class SSHSession:
                     elif chunk_bytes:
                         chunk = decoder_out.decode(chunk_bytes)
                         run.append_output(chunk)
+                        self.append_scrollback(chunk)
                         self._log_run(run, "OUT", {"chunk": chunk})
                         has_data = True
 
@@ -868,6 +978,7 @@ class SSHSession:
                     elif chunk_bytes:
                         chunk = decoder_err.decode(chunk_bytes)
                         run.append_output(chunk)
+                        self.append_scrollback(chunk)
                         self._log_run(run, "ERR", {"chunk": chunk})
                         has_data = True
 
@@ -1022,9 +1133,9 @@ class SSHSession:
                     return {
                         "success": False,
                         "error": (
-                            f"Session {self.server_alias}/{self.id} is busy{cmd_info} (run_id {r.run_id}). "
+                            f"Session {self.server_alias}/{self.id} is busy{cmd_info}. "
                             "An SSH session is a single shell terminal and cannot run commands in parallel. "
-                            f"Use 'new_session=true' to execute concurrently in a new session, or wait for run_id {r.run_id} to finish."
+                            "Use 'new_session=true' to execute concurrently in a new session, or wait for the active command to finish (or send signal 'ctrl_c')."
                         ),
                         "session_id": f"{self.server_alias}/{self.id}",
                         "numeric_session_id": self.id,
@@ -1159,6 +1270,7 @@ class SSHSession:
                         run.exec_stdin_closed = True
                     except Exception as exc:
                         log_error(f"Error closing exec stdin: {exc}")
+                self.append_scrollback(f"$ {command}\n")
                 self._start_exec_reader_thread(run)
         except Exception as exc:
             for stream in (run.exec_stdin, run.exec_stdout, run.exec_stderr):
@@ -1318,62 +1430,109 @@ class SSHSession:
     def read_run(self, run_id: Optional[int], offset: Optional[int], max_lines: int, max_chars: int, wait_timeout: float = 5.0) -> Dict[str, Any]:
         max_lines = clamp_int(max_lines, DEFAULT_READ_MAX_LINES, 1, MAX_READ_MAX_LINES)
         max_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 100, MAX_READ_MAX_CHARS)
-        selected = None
-        with self.lock:
-            if run_id is not None:
+
+        # 1. Explicit run_id provided (internal callers / backward-compat unit tests)
+        if run_id is not None:
+            selected = None
+            with self.lock:
                 selected = self.runs.get(run_id)
-            elif self.active_run_id is not None:
-                selected = self.runs.get(self.active_run_id)
-            elif self.last_run_id is not None:
-                selected = self.runs.get(self.last_run_id)
 
-        if not selected and run_id is not None:
-            selected = self._restore_run_from_disk(run_id)
+            if not selected:
+                selected = self._restore_run_from_disk(run_id)
 
-        if not selected:
-            return {"success": False, "error": "No run found", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
+            if not selected:
+                return {"success": False, "error": "No run found", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
 
-        if not selected.done_event.is_set() and wait_timeout and wait_timeout > 0:
-            selected.done_event.wait(timeout=wait_timeout)
+            if not selected.done_event.is_set() and wait_timeout and wait_timeout > 0:
+                selected.done_event.wait(timeout=wait_timeout)
 
-        snapshot = selected.read_slice(offset=offset, max_lines=max_lines, max_chars=max_chars)
-        status = selected.status
-        if selected.done_event.is_set():
-            if selected.completion_method == "prompt_detected":
-                status = "completed"
-            elif selected.completion_method == "interrupted":
-                status = "interrupted"
-            elif selected.completion_method in {"exit_marker", "exit_status"}:
-                status = "completed" if selected.exit_status == 0 else "completed_nonzero"
-        elif selected.quiet_event.is_set():
-            status = "stalled"
-        elif not selected.done_event.is_set():
-            status = "running"
+            snapshot = selected.read_slice(offset=offset, max_lines=max_lines, max_chars=max_chars)
+            status = selected.status
+            if selected.done_event.is_set():
+                if selected.completion_method == "prompt_detected":
+                    status = "completed"
+                elif selected.completion_method == "interrupted":
+                    status = "interrupted"
+                elif selected.completion_method in {"exit_marker", "exit_status"}:
+                    status = "completed" if selected.exit_status == 0 else "completed_nonzero"
+            elif selected.quiet_event.is_set():
+                status = "stalled"
+            elif not selected.done_event.is_set():
+                status = "running"
 
-        result = {
-            "success": True,
-            "session_id": f"{self.server_alias}/{self.id}",
-            "numeric_session_id": self.id,
-            "server": self.server_alias,
-            "run_id": selected.run_id,
-            "status": status,
-            "output": snapshot["output"],
-            "next_offset": snapshot["next_offset"],
-            "limited": snapshot["limited"],
-            "still_running": not selected.done_event.is_set(),
-        }
-        if selected.exit_status is not None:
-            result["exit_status"] = selected.exit_status
-        if snapshot.get("recv_paused"):
-            result["recv_paused"] = True
-            result["pause_reason"] = snapshot.get("pause_reason") or ""
-        if snapshot.get("dropped_data"):
-            result["dropped_data"] = True
-        # NOTE: Output buffer is intentionally retained in memory up to MAX_BUFFER_CHARS
-        # (2MB) without premature discard. We do NOT call discard_through here so clients
-        # can rewind and re-read from offset=0 or paginate freely. Old data is only evicted
-        # when the buffer exceeds MAX_BUFFER_CHARS (sliding window with dropped_data=True).
-        return result
+            result = {
+                "success": True,
+                "session_id": f"{self.server_alias}/{self.id}",
+                "numeric_session_id": self.id,
+                "server": self.server_alias,
+                "run_id": selected.run_id,
+                "status": status,
+                "output": snapshot["output"],
+                "next_offset": snapshot["next_offset"],
+                "limited": snapshot["limited"],
+                "still_running": not selected.done_event.is_set(),
+            }
+            if selected.exit_status is not None:
+                result["exit_status"] = selected.exit_status
+            if snapshot.get("recv_paused"):
+                result["recv_paused"] = True
+                result["pause_reason"] = snapshot.get("pause_reason") or ""
+            if snapshot.get("dropped_data"):
+                result["dropped_data"] = True
+            return result
+
+        # 2. run_id is None -> Tab-level read
+        active_r = None
+        with self.lock:
+            if self.active_run_id is not None:
+                active_r = self.runs.get(self.active_run_id)
+
+        if active_r is not None and not active_r.done_event.is_set() and wait_timeout and wait_timeout > 0:
+            active_r.done_event.wait(timeout=wait_timeout)
+
+        if offset is None:
+            target_r = active_r
+            if target_r is None:
+                with self.lock:
+                    if self.last_run_id is not None:
+                        target_r = self.runs.get(self.last_run_id)
+
+            if target_r is not None and target_r.shared_cursor < len(target_r.output_buffer):
+                snapshot = target_r.read_slice(offset=None, max_lines=max_lines, max_chars=max_chars)
+                status = target_r.status
+                if target_r.done_event.is_set():
+                    if target_r.completion_method == "prompt_detected":
+                        status = "completed"
+                    elif target_r.completion_method == "interrupted":
+                        status = "interrupted"
+                    elif target_r.completion_method in {"exit_marker", "exit_status"}:
+                        status = "completed" if target_r.exit_status == 0 else "completed_nonzero"
+                elif target_r.quiet_event.is_set():
+                    status = "stalled"
+                elif not target_r.done_event.is_set():
+                    status = "running"
+
+                result = {
+                    "success": True,
+                    "session_id": f"{self.server_alias}/{self.id}",
+                    "numeric_session_id": self.id,
+                    "server": self.server_alias,
+                    "status": status,
+                    "output": snapshot["output"],
+                    "next_offset": snapshot["next_offset"],
+                    "limited": snapshot["limited"],
+                    "still_running": not target_r.done_event.is_set(),
+                }
+                if target_r.exit_status is not None:
+                    result["exit_status"] = target_r.exit_status
+                if snapshot.get("recv_paused"):
+                    result["recv_paused"] = True
+                    result["pause_reason"] = snapshot.get("pause_reason") or ""
+                if snapshot.get("dropped_data"):
+                    result["dropped_data"] = True
+                return result
+
+        return self.read_scrollback(offset=offset, max_lines=max_lines, max_chars=max_chars)
 
     def begin_file_op(self) -> bool:
         with self.lock:

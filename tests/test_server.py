@@ -45,7 +45,7 @@ class TestServer(unittest.TestCase):
         }
         res = project_tool_result("run", raw)
         self.assertEqual(res["session_id"], 1)
-        self.assertEqual(res["run_id"], 5)
+        self.assertNotIn("run_id", res)
         self.assertEqual(res["status"], "completed_nonzero")
         self.assertIn("Command failed with exit status 127", res["error"])
         self.assertIn("[WARNING: Command execution failed", res["output"])
@@ -742,6 +742,25 @@ class TestServer(unittest.TestCase):
         self.assertNotIn("contains", props)
         self.assertNotIn("regex", props)
         self.assertNotIn("tail_lines", props)
+
+    def test_read_and_session_list_schemas_hide_internal_run_ids(self):
+        tools = tools_list()["result"]["tools"]
+        read_tool = next(tool for tool in tools if tool["name"] == "read")
+        self.assertIn("terminal tab", read_tool["description"])
+        self.assertIn("offset=0 to rewind", read_tool["description"])
+        read_props = read_tool["inputSchema"]["properties"]
+        self.assertNotIn("run_id", read_props)
+
+        session_list_tool = next(tool for tool in tools if tool["name"] == "session_list")
+        session_props = session_list_tool["inputSchema"]["properties"]
+        self.assertNotIn("include_active_ids", session_props)
+
+        # Ensure project_tool_result never leaks run_id for read or run
+        raw = {"success": True, "output": "ok", "session_id": "srv/1", "run_id": 42, "status": "completed"}
+        projected_read = project_tool_result("read", raw)
+        self.assertNotIn("run_id", projected_read)
+        projected_run = project_tool_result("run", raw)
+        self.assertNotIn("run_id", projected_run)
 
     def test_shutdown_closes_sessions_before_the_pool(self):
         import src.main as main_mod

@@ -132,17 +132,21 @@ docker build -t mcp-ssh-server .
 2. **Execute Commands (`run`):**
    - Explicit target: `run(server="keenetic", command="show interface", shell=false)`
    - Composite session ID: `run(session_id="nas/1", command="zpool status")`
-   - **Default Timeout (5.0s):** Commands taking longer return `still_running: true` without failing. The agent can poll remaining output via `read(run_id=...)`.
+   - **Direct Output:** For commands completing within 5.0s, output is returned directly in the response. Do NOT call `read` after a completed command!
+   - **Long-Running Commands:** Commands taking longer than 5.0s return `still_running: true` without failing. Read their remaining output via `read`.
+   - **Sequential vs Concurrent:** Pass `session_id` to run sequential commands in the same session. Omit `session_id` to start a new concurrent session.
    - **Async Execution:** Pass `wait_timeout: 0` for immediate confirmed start in background.
    - **Standard Shell Pipelines:** Use standard `| grep`, `| awk`, `| head` inside the command string for filtering.
    - **Multiline code / scripts:** For Python snippets (`python3 -c "..."`) or scripts with newlines, pass `use_pty: false` to avoid secondary prompt (`>`) issues in PTY.
 3. **Session Management (1 Session = 1 Terminal):**
    - An SSH session is a single terminal process (PTY). Never send concurrent commands to the same session.
-   - Run without `session_id` to execute commands in parallel in a new clean session.
+   - Reuse `session_id` for sequential steps; omit `session_id` (or pass `new_session: true`) to execute commands in parallel in a new clean session.
+   - Close temporary diagnostic sessions with `session_close` when done to free the session limit.
    - For Keenetic: keep NDM CLI (`shell: false`) and Linux shell (`shell: true`) in separate sessions.
-4. **Buffered Output & Rewind (`read`):**
-   - The gateway retains up to 2MB circular buffer per command.
-   - Call `read(offset=0)` to rewind and re-read the entire output from the beginning.
+4. **Buffered Output, Scrolling & Rewind (`read`):**
+   - Call `read` only if `run` returned `still_running: true` or to scroll through the terminal tab history.
+   - By default reads the latest command in the tab; neither `offset` nor any run identifier is required for standard reads.
+   - The gateway retains up to 2MB circular buffer per tab. If you experience context loss or amnesia, call `read(offset=0)` to rewind and re-read the entire tab history from the beginning, or pass negative offset (e.g. `offset=-2000`) for the buffer tail.
 5. **Interrupt Stuck Commands (`signal`):**
    - Call `signal(action="ctrl_c")` to immediately terminate a hanging command and free the session.
 6. **Register New Servers On The Fly:**
