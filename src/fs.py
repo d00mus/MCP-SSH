@@ -12,7 +12,7 @@ from src.utils import (
     apply_text_filters
 )
 from src.config import (
-    BUFFER_SIZE, DEFAULT_READ_MAX_LINES, MAX_READ_MAX_LINES,
+    DEFAULT_READ_MAX_LINES, MAX_READ_MAX_LINES,
     DEFAULT_READ_MAX_CHARS, MAX_READ_MAX_CHARS, MAX_BUFFER_CHARS,
     DEFAULT_FILE_INSPECT_MAX_BYTES, MAX_FILE_INSPECT_MAX_BYTES,
     DEFAULT_FILE_EDIT_MAX_BYTES, MAX_FILE_EDIT_MAX_BYTES,
@@ -132,7 +132,7 @@ def _read_remote_file_bytes(
         ):
             raise RuntimeError("exec_command not supported, falling back to sync_shell")
             
-        if exit_code == 0 or data:
+        if exit_code == 0:
             truncated = False
             if max_bytes is not None and len(data) > max_bytes:
                 data = data[:max_bytes]
@@ -249,22 +249,32 @@ def _write_remote_file_bytes(
     session: SSHSession,
     path: str,
     payload_bytes: bytes,
+    private_mode: bool = False,
 ) -> Dict[str, Any]:
     sftp = session.open_sftp()
     if sftp is not None:
         tmp_sftp = f"{path}.mcp_tmp.{int(time.time() * 1000)}_{os.getpid()}"
         try:
-            # T2.1/F6: write a sibling temp file and rename it over the target so a
-            # failed write can never leave a half-written file, and keep permissions.
-            original_mode = None
-            try:
-                mode = sftp.stat(path).st_mode
-                if isinstance(mode, int):
-                    original_mode = mode & 0o7777
-            except Exception:
-                pass
+            # T2.1/F6 & P0: Determine intended mode BEFORE rename.
+            # Preserve existing mode, or 0600 if private_mode is requested or file is new.
+            target_mode = 0o600 if private_mode else None
+            if target_mode is None:
+                try:
+                    mode = sftp.stat(path).st_mode
+                    if isinstance(mode, int):
+                        target_mode = mode & 0o7777
+                except Exception:
+                    target_mode = 0o600
+
             with sftp.file(tmp_sftp, "wb") as handle:
                 handle.write(payload_bytes)
+
+            # chmod MUST happen on temp file BEFORE posix_rename
+            try:
+                sftp.chmod(tmp_sftp, target_mode)
+            except Exception as exc:
+                raise PermissionError(f"chmod failed on temp file: {exc}")
+
             renamed = False
             try:
                 sftp.posix_rename(tmp_sftp, path)  # atomic overwrite (OpenSSH)
@@ -277,11 +287,6 @@ def _write_remote_file_bytes(
                     renamed = False
             if not renamed:
                 raise RuntimeError("sftp cannot overwrite atomically, falling back to shell")
-            if original_mode is not None:
-                try:
-                    sftp.chmod(path, original_mode)
-                except Exception as exc:
-                    log_error(f"sftp chmod restore failed for {path}: {exc}")
             return {"success": True, "method": "sftp"}
         except Exception as exc:
             log_error(f"sftp write failed, fallback shell: {exc}")
@@ -289,6 +294,8 @@ def _write_remote_file_bytes(
                 sftp.remove(tmp_sftp)
             except Exception:
                 pass
+            if isinstance(exc, PermissionError):
+                return {"success": False, "error": str(exc), "session_id": session.id}
         finally:
             try:
                 sftp.close()
@@ -346,8 +353,11 @@ def _write_remote_file_bytes(
             raise RuntimeError("exec_command not supported or unverified, falling back to sync_shell")
             
         if exit_code == 0 and cat_marker in out:
-            if original_mode:
-                _exec_simple(session, f"chmod {original_mode} '{safe_path}'")
+            # Same policy as the SFTP and base64/heredoc paths: keep the previous
+            # mode, but never create a world-readable file - a new file (or one
+            # written with private_mode) gets 0600 (review R5).
+            target_mode = original_mode or "600"
+            _exec_simple(session, f"chmod {target_mode} '{safe_path}'")
             return {"success": True, "method": "exec_cat"}
         else:
             rm_in = rm_out = rm_err = None
@@ -376,8 +386,9 @@ def _write_remote_file_bytes(
         # Write base64 content via single heredoc to tmp file (fast, avoids 100+ roundtrips, Fix M1)
         _sync_shell(session, f"cat << '{b64_delim}' > {tmp_path}\n{b64_content}\n{b64_delim}", timeout=15.0, internal=True)
             
+        target_perm = "600" if (private_mode or not shell_mode) else shell_mode
         decode_cmd = (
-            f"if base64 -d {tmp_path} > '{tmp_remote}' 2>/dev/null && mv -f '{tmp_remote}' '{safe_path}' && [ -f '{safe_path}' ]; then "
+            f"if base64 -d {tmp_path} > '{tmp_remote}' 2>/dev/null && chmod {target_perm} '{tmp_remote}' 2>/dev/null && mv -f '{tmp_remote}' '{safe_path}' && [ -f '{safe_path}' ]; then "
             f"rm -f {tmp_path}; echo '{marker_ok}'; "
             f"else rm -f {tmp_path} '{tmp_remote}'; fi"
         )
@@ -410,7 +421,7 @@ def _write_remote_file_bytes(
                 heredoc_delim += "_x"
             marker_hd_ok = f"MCP_HD_OK_{stamp}"
             heredoc_cmd = (
-                f"cat << '{heredoc_delim}' > '{tmp_remote}' && mv -f '{tmp_remote}' '{safe_path}'\n{raw_content}\n{heredoc_delim}\n"
+                f"cat << '{heredoc_delim}' > '{tmp_remote}' && chmod {target_perm} '{tmp_remote}' 2>/dev/null && mv -f '{tmp_remote}' '{safe_path}'\n{raw_content}\n{heredoc_delim}\n"
                 f"if [ $? -eq 0 ] && [ -f '{safe_path}' ]; then echo '{marker_hd_ok}'; else rm -f '{tmp_remote}'; fi"
             )
             write_res = _sync_shell(session, heredoc_cmd, timeout=15.0, internal=True)
@@ -776,7 +787,12 @@ def _file_dispatch_held(args: Dict[str, Any], session, node) -> Dict[str, Any]:
             )
             char_limited = True
 
-        return {
+        is_truncated = bool(
+            read_result.get("truncated", False)
+            or char_limited
+            or (window["line_end"] < window["total_lines"])
+        )
+        res_payload = {
             "success": True,
             "action": "read",
             "mode": "inspect",
@@ -789,13 +805,16 @@ def _file_dispatch_held(args: Dict[str, Any], session, node) -> Dict[str, Any]:
             "line_start": window["line_start"],
             "line_end": window["line_end"],
             "total_lines": window["total_lines"],
-            "truncated": bool(read_result.get("truncated", False) or char_limited),
+            "truncated": is_truncated,
             "session_id": sid_str,
             "numeric_session_id": session.id,
             "server": srv_str,
             "session_name": session.name,
             "status": "completed"
         }
+        if window["line_end"] < window["total_lines"] and not char_limited:
+            res_payload["next_offset_line"] = window["line_end"] + 1
+        return res_payload
 
     if action == "edit":
         if not path:
@@ -967,7 +986,7 @@ def _file_dispatch_held(args: Dict[str, Any], session, node) -> Dict[str, Any]:
 
         if create_backup:
             backup_path = f"{path}.mcp.bak"
-            backup_result = _write_remote_file_bytes(session, backup_path, original_bytes)
+            backup_result = _write_remote_file_bytes(session, backup_path, original_bytes, private_mode=True)
             if not backup_result.get("success", False):
                 return {"success": False, "error": f"failed to create backup at {backup_path}", "path": path, "session_id": sid_str, "server": srv_str, "session_name": session.name}
             result_payload["backup_path"] = backup_path

@@ -1,11 +1,11 @@
 import time
+import re
 import threading
-import codecs
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from src.utils import log_error, iso_now, json_line, clean_output
+from src.utils import log_error, iso_now, json_line, StreamCleaner
 
 
 class CharAccount:
@@ -110,6 +110,24 @@ class ChunkBuffer:
         self._account_delta(-dropped)
         return dropped
 
+    def truncate_tail(self, count: int) -> int:
+        """Drop up to count chars from the tail."""
+        want = max(0, count)
+        remaining = want
+        while remaining > 0 and self._chunks:
+            chunk = self._chunks[-1]
+            if len(chunk) <= remaining:
+                remaining -= len(chunk)
+                self._len -= len(chunk)
+                self._chunks.pop()
+            else:
+                self._chunks[-1] = chunk[:-remaining]
+                self._len -= remaining
+                remaining = 0
+        dropped = want - remaining
+        self._account_delta(-dropped)
+        return dropped
+
     def text(self) -> str:
         return "".join(self._chunks)
 
@@ -149,6 +167,86 @@ class ChunkBuffer:
         return "".join(reversed(parts))
 
 
+DEFAULT_MAX_LINE_CHARS = 1024
+
+
+def count_virtual_lines(text: str, start: int = 0, end: Optional[int] = None, max_line_chars: int = DEFAULT_MAX_LINE_CHARS) -> int:
+    """Count lines in text[start:end], where a line ends with '\\n' or every max_line_chars chars without '\\n'."""
+    if end is None:
+        end = len(text)
+    pos = max(0, start)
+    total = 0
+    while pos < end:
+        next_nl = text.find("\n", pos, end)
+        if next_nl == -1:
+            remaining = end - pos
+            total += (remaining + max_line_chars - 1) // max_line_chars
+            break
+        dist = next_nl - pos
+        chunks = dist // max_line_chars
+        total += chunks + 1
+        pos = next_nl + 1
+    return total
+
+
+def find_line_offset(text: str, target_line: int, max_line_chars: int = DEFAULT_MAX_LINE_CHARS) -> int:
+    """Find the character offset where target_line (0-indexed) starts."""
+    if target_line <= 0:
+        return 0
+    pos = 0
+    end = len(text)
+    lines_counted = 0
+    while pos < end and lines_counted < target_line:
+        next_nl = text.find("\n", pos, end)
+        if next_nl == -1:
+            remaining = end - pos
+            needed = target_line - lines_counted
+            chunks = needed * max_line_chars
+            if chunks >= remaining:
+                return end
+            return pos + chunks
+        dist = next_nl - pos
+        chunks = dist // max_line_chars
+        if lines_counted + chunks >= target_line:
+            needed = target_line - lines_counted
+            return pos + needed * max_line_chars
+        lines_counted += chunks + 1
+        pos = next_nl + 1
+    return pos
+
+
+def slice_virtual_lines(text: str, start_offset: int = 0, limit_lines: int = 200, max_line_chars: int = DEFAULT_MAX_LINE_CHARS) -> tuple[str, int]:
+    """Slice up to limit_lines starting at start_offset. Returns (sliced_text, next_char_offset)."""
+    start_pos = max(0, start_offset)
+    end = len(text)
+    if start_pos >= end or limit_lines <= 0:
+        return "", start_pos
+
+    pos = start_pos
+    lines_counted = 0
+    while pos < end and lines_counted < limit_lines:
+        next_nl = text.find("\n", pos, end)
+        if next_nl == -1:
+            remaining = end - pos
+            needed = limit_lines - lines_counted
+            max_can_take = needed * max_line_chars
+            if remaining <= max_can_take:
+                pos = end
+            else:
+                pos += max_can_take
+            break
+        dist = next_nl - pos
+        needed = limit_lines - lines_counted
+        chunks = dist // max_line_chars
+        if chunks >= needed:
+            pos += needed * max_line_chars
+            break
+        lines_counted += chunks + 1
+        pos = next_nl + 1
+
+    return text[start_pos:pos], pos
+
+
 @dataclass
 class RunState:
     run_id: int
@@ -170,7 +268,10 @@ class RunState:
     finish_reason: str = ""
     finished_at: Optional[float] = None
     error: str = ""
-    shared_cursor: int = 0
+    # Absolute offset (in this run's own cleaned buffer space) already copied into
+    # the session tab canvas. The tab is the single unread stream: reads page over
+    # the canvas, so a run keeps no read cursor of its own (m01215).
+    mirrored_upto: int = 0
     total_received_chars: int = 0
     last_data_at: float = field(default_factory=time.time)
     prompt_detected: bool = False
@@ -178,10 +279,9 @@ class RunState:
     recv_paused: bool = False
     pause_reason: str = ""
     completion_method: str = ""
-    stdin_writes: int = 0
     last_stdin_at: Optional[float] = None
     quiet_event: threading.Event = field(default_factory=threading.Event)
-    prompt_line: str = ""
+    _cleaner: StreamCleaner = field(default_factory=StreamCleaner)
 
     exec_channel: Optional[Any] = None
     exec_stdin: Optional[Any] = None
@@ -202,7 +302,9 @@ class RunState:
 
     @output_buffer.setter
     def output_buffer(self, text: str) -> None:
-        self._buf.replace(text or "")
+        cleaner = StreamCleaner()
+        cleaned = cleaner.feed(text or "") + cleaner.finalize()
+        self._buf.replace(cleaned)
 
     @property
     def buffer_base_offset(self) -> int:
@@ -216,6 +318,11 @@ class RunState:
     def buffer_len(self) -> int:
         return len(self._buf)
 
+    def output_end(self) -> int:
+        """Absolute offset just past the buffered output (lock-free snapshot:
+        readers use it to notice new data without taking self.lock)."""
+        return self._buf.base_offset + len(self._buf)
+
     def tail_locked(self, n: int) -> str:
         """Last n chars of the buffer. Caller must hold self.lock (or accept a race)."""
         return self._buf.tail(n)
@@ -223,28 +330,25 @@ class RunState:
     def discard_all_output(self) -> int:
         """Drop buffered output and advance base_offset. Caller must hold self.lock
         (or accept a benign race) - eviction and cleanup already do."""
-        dropped = self._buf.clear()
-        if self.shared_cursor < self._buf.base_offset:
-            self.shared_cursor = self._buf.base_offset
-        return dropped
+        return self._buf.clear()
 
-    def append_output(self, chunk: str) -> None:
+    def append_output(self, chunk: str) -> int:
+        """Store one cleaned chunk and return the buffer end offset it produced.
+
+        The caller hands that offset back to the session canvas, which mirrors the
+        same chunk: recording the exact end (not the end at some later moment) keeps
+        the mirror honest when a second channel appends in between (m01215)."""
         if not chunk:
-            return
+            return self.output_end()
         with self.lock:
-            self._buf.append(chunk)
             self.total_received_chars += len(chunk)
             self.last_data_at = time.time()
             self.quiet_event.clear()
-            if self.shared_cursor < self._buf.base_offset:
-                self.shared_cursor = self._buf.base_offset
-
-    def discard_through(self, next_offset: int) -> None:
-        """Drop the prefix the client has already been given. The unread tail stays."""
-        with self.lock:
-            if next_offset <= self._buf.base_offset:
-                return
-            self._buf.drop(min(next_offset - self._buf.base_offset, len(self._buf)))
+            cleaned = self._cleaner.feed(chunk)
+            if not cleaned:
+                return self.output_end()
+            self._buf.append(cleaned)
+            return self.output_end()
 
     def mark_done(
         self,
@@ -256,6 +360,18 @@ class RunState:
         with self.lock:
             if self.done_event.is_set():
                 return
+            final_tail = self._cleaner.finalize()
+            if final_tail:
+                self._buf.append(final_tail)
+            # Strip trailing exit marker from buffer tail if present
+            exit_token = getattr(self, "exit_marker_token", None)
+            if exit_token:
+                tail_str = self._buf.tail(500)
+                m = re.search(rf"\n?__MCP_EC_{re.escape(exit_token)}_\d+\s*$", tail_str)
+                if m:
+                    drop_len = len(tail_str) - m.start()
+                    self._buf.truncate_tail(drop_len)
+
             self.status = status
             self.finish_reason = reason
             self.error = error
@@ -286,68 +402,5 @@ class RunState:
 
     def register_stdin(self) -> None:
         with self.lock:
-            self.stdin_writes += 1
             self.last_stdin_at = time.time()
 
-    def read_slice(
-        self,
-        offset: Optional[int],
-        max_lines: int,
-        max_chars: int,
-    ) -> Dict[str, Any]:
-        with self.lock:
-            use_shared_cursor = offset is None
-            if offset is None:
-                offset = self.shared_cursor
-
-            dropped_data = False
-            if offset < self.buffer_base_offset:
-                offset = self.buffer_base_offset
-                dropped_data = True
-
-            relative = max(0, offset - self.buffer_base_offset)
-            available = max(0, len(self._buf) - relative)
-            char_cap = max(1, max_chars)
-            limited = available > char_cap
-            data = self._buf.window(relative, char_cap)
-
-            if max_lines > 0:
-                lines = data.splitlines(keepends=True)
-                if len(lines) > max_lines:
-                    data = "".join(lines[:max_lines])
-                    limited = True
-
-            next_offset = offset + len(data)
-            if use_shared_cursor:
-                self.shared_cursor = next_offset
-
-            base_offset = self.buffer_base_offset
-            status = self.status
-            done_set = self.done_event.is_set()
-            finish_reason = self.finish_reason
-            error = self.error
-            total_received_chars = self.total_received_chars
-            recv_paused = self.recv_paused
-            pause_reason = self.pause_reason
-            completion_method = self.completion_method
-
-        # clean_output outside lock to prevent blocking writer threads during large buffer reads
-        cleaned_output = clean_output(data)
-
-        return {
-            "offset_start": offset,
-            "next_offset": next_offset,
-            "base_offset": base_offset,
-            "output": cleaned_output,
-            "limited": limited,
-            "dropped_data": dropped_data,
-            "status": status,
-            "still_running": not done_set,
-            "output_complete": done_set,
-            "finish_reason": finish_reason,
-            "error": error,
-            "total_received_chars": total_received_chars,
-            "recv_paused": recv_paused,
-            "pause_reason": pause_reason,
-            "completion_method": completion_method,
-        }

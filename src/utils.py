@@ -269,7 +269,89 @@ def safe_name(text: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", text.strip())
     return cleaned[:80] if cleaned else "unnamed"
 
-def clean_output(text: str, remove_echo: bool = False) -> str:
+# A fragment held back by StreamCleaner must be a strict prefix of a real escape
+# sequence, otherwise a stray ESC would mute the stream forever (review D1):
+# a CSI without its final byte, an unterminated OSC/DCS/PM/APC payload (possibly
+# ending on the ESC that starts ST), or designator intermediates (ESC ( 0, ESC #):
+# ESC alone is covered too, because it is the prefix of everything.
+_PARTIAL_CSI = re.compile(r"^\x1b\[[0-?]*[ -/]*$")
+_PARTIAL_STR = re.compile(r"^\x1b(?:\][^\x07\x1b]*|[PX^_][^\x1b]*)(?:\x1b)?$")
+_PARTIAL_DESIGNATOR = re.compile(r"^\x1b[\x20-\x2f]*$")
+# An unterminated OSC/DCS payload can never grow without bound: past this size it
+# is flushed to the cleaner instead of being held (which also keeps feed() O(n)).
+MAX_PENDING_ESCAPE = 4096
+
+def is_partial_escape(tail: str) -> bool:
+    """True when ``tail`` (starting at an ESC) may still become a complete sequence."""
+    if len(tail) > MAX_PENDING_ESCAPE:
+        return False
+    return bool(
+        _PARTIAL_CSI.match(tail)
+        or _PARTIAL_STR.match(tail)
+        or _PARTIAL_DESIGNATOR.match(tail)
+    )
+
+class StreamCleaner:
+    """Incrementally cleans ANSI escapes and normalizes CRLF across streaming chunk boundaries."""
+    def __init__(self) -> None:
+        self._pending_escape = ""
+        self._pending_cr = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+
+        # 1. Prepend pending CR if previous chunk ended in \r
+        if self._pending_cr:
+            if chunk.startswith("\n"):
+                chunk = "\n" + chunk[1:]
+            else:
+                chunk = "\n" + chunk
+            self._pending_cr = False
+
+        if chunk.endswith("\r"):
+            self._pending_cr = True
+            chunk = chunk[:-1]
+
+        # 2. Prepend any pending escape fragment
+        if self._pending_escape:
+            chunk = self._pending_escape + chunk
+            self._pending_escape = ""
+
+        # 3. Hold back a trailing ESC only while it can still become a complete
+        #    sequence (see is_partial_escape).  Anything else - including ESC
+        #    followed by a letter, digit or space, which the old check treated as
+        #    "incomplete" - is emitted right away, so one stray ESC can never
+        #    swallow the rest of the stream (review D1).
+        last_esc = chunk.rfind("\x1b")
+        if last_esc != -1:
+            tail = chunk[last_esc:]
+            if is_partial_escape(tail):
+                self._pending_escape = tail
+                chunk = chunk[:last_esc]
+
+        # 4. Clean complete ANSI and control chars
+        chunk = ANSI_ESCAPE.sub("", chunk)
+        chunk = CONTROL_CHARS.sub("", chunk)
+        chunk = chunk.replace("\r\n", "\n").replace("\r", "\n")
+        return chunk
+
+    def finalize(self) -> str:
+        """Flush the stream tail: a pending CR becomes a newline.
+
+        A fragment still held at this point is an incomplete escape sequence
+        (is_partial_escape kept it back), so it has no rendered form and is
+        dropped - exactly what a terminal shows (review F7).  No further data
+        may be fed after finalize().
+        """
+        out = ""
+        if self._pending_cr:
+            out += "\n"
+            self._pending_cr = False
+        self._pending_escape = ""
+        return out
+
+def clean_output(text: str, remove_echo: bool = False, strip: bool = True) -> str:
     if not text:
         return ""
     text = ANSI_ESCAPE.sub("", text)
@@ -285,7 +367,7 @@ def clean_output(text: str, remove_echo: bool = False) -> str:
         cleaned_lines.append(line)
     text = "\n".join(cleaned_lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return text.strip() if strip else text
 
 def json_line(path: str, payload: Dict[str, Any]) -> None:
     if getattr(config, "LOG_OUTPUT", "meta") == "off":
@@ -515,13 +597,19 @@ def resolve_runtime_paths(
         "cache_root": cache_root,
     }
 
+# Known router CLI names/prefixes or established prompt keywords
+_KNOWN_ROUTER_PROMPT_PREFIX = r"(?:Keenetic(?:-[a-zA-Z0-9._-]+)?|Router|router|admin|Cisco|cisco)"
+
 COMPILED_PROMPT_PATTERNS = [
-    re.compile(r"(?:(?:\r?\n|\r|\A)\s*(?:[a-zA-Z0-9._-]+\s*)?|\s+)(\([^)]+\)\s*>[ \t]*)$"), # router (config)> or (config)>
-    re.compile(r"(?:(?:\r?\n|\r|\A)\s*)(>[ \t]*)$"),             # > alone on line
-    re.compile(r"(?:(?:\r?\n|\r|\A)\s*)([/~][^\s]*\s*#[ \t]*)$"), # /path #
-    re.compile(r"(?:(?:\r?\n|\r|\A)\s*)([/~][^\s]*\s*\$[ \t]*)$"), # /path $
-    re.compile(r"(?:(?:\r?\n|\r|\A)\s*)([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.*[#$][ \t]*)$"), # user@host:path$
-    re.compile(r"(?:(?:\r?\n|\r|\A)\s*)([#$][ \t]+)$"),           # # or $ alone on line (requires space/tab after symbol)
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)((?:[a-zA-Z0-9._-]{1,32}\s*)?\([^)\r\n]+\)>[ \t]*)$"), # router (config)> or router (config-if)>
+    re.compile(rf"(?:(?:\r?\n|\r|\A)[ \t]*)({_KNOWN_ROUTER_PROMPT_PREFIX}>[ \t]*)$"),                # Keenetic-Giga>, Keenetic>
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)(>[ \t]*)$"),                                              # > alone on line with or without space
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)([/~][^\s]*\s*#[ \t]*)$"),                                 # /path #
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)([/~][^\s]*\s*\$[ \t]*)$"),                                 # /path $
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+:.*[#$][ \t]*)$"),         # user@host:path$
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)(\[[^\]\r\n]+\][#$][ \t]*)$"),                             # [user@host /path]#
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)((?:root|admin|[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+)#[ \t]+)$"),  # root# or user@host# with trailing space
+    re.compile(r"(?:(?:\r?\n|\r|\A)[ \t]*)([#$][ \t]+)$"),                                           # # or $ alone on line with trailing space
 ]
 
 def find_prompt(output: str) -> Optional[str]:
@@ -547,9 +635,6 @@ def find_prompt(output: str) -> Optional[str]:
             return match.group(1)
             
     return None
-
-def has_prompt(output: str) -> bool:
-    return find_prompt(output) is not None
 
 def _sha256_hex(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()

@@ -40,6 +40,13 @@ def _write_response(response: dict) -> None:
 
 def process_request(req, manager, write_fn=_write_response) -> None:
     """Handle one parsed JSON-RPC request, send error or response via write_fn."""
+    if not isinstance(req, dict):
+        write_fn({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request: JSON-RPC request must be an object"},
+        })
+        return
     try:
         response = handle_request(req, manager)
         if response is not None:

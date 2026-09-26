@@ -13,7 +13,7 @@ import inspect
 from src.config import config
 from src.session import SSHSession, set_buffer_limit_checkers, format_export_path
 from src.ssh_state import RunState
-from src.utils import make_cache_dirs, json_line, find_prompt, parse_exit_marker, cleanup_old_logs
+from src.utils import make_cache_dirs, json_line, find_prompt, parse_exit_marker, cleanup_old_logs, StreamCleaner
 
 class TestSSH(unittest.TestCase):
     def setUp(self):
@@ -241,39 +241,26 @@ class TestSSH(unittest.TestCase):
             self.assertEqual(run.status, "failed")
             self.assertIn("Interactive prompt detected", run.error)
 
-    def test_restore_run_from_disk(self):
+    def test_run_output_without_live_feed_reaches_canvas(self):
+        """A run whose text only ever reached its own buffer (mocked reader, restored
+        run) must still land in the tab canvas - the single unread stream (m01215)."""
         session, _, _ = self._create_mock_session()
-        
-        # Let's generate a mock log file manually to simulate a run that completed but got garbage collected
-        run_id = 99
-        stamp = "20260526_120000"
-        log_filename = f"{session.project_tag}__s{session.id}__r{run_id}__{stamp}.log"
-        log_path = os.path.join(self.cache_dirs["runs_dir"], log_filename)
-        
-        # Write created, output, and done logs
-        events = [
-            {"ts": "2026-05-26T12:00:00.000", "dir": "SYS", "event": "run_created", "command": "cat secrets.txt", "mode": "sync", "started_at": time.time(), "wait_timeout": 20.0, "startup_wait": 2.0, "hard_timeout": 0.0},
-            {"ts": "2026-05-26T12:00:01.000", "dir": "OUT", "chunk": "super_secret_key_123\n"},
-            {"ts": "2026-05-26T12:00:02.000", "dir": "SYS", "event": "run_done", "run_id": run_id, "status": "completed", "reason": "prompt detected", "error": "", "completion_method": "prompt_detected", "exit_status": 0, "finished_at": time.time()}
-        ]
-        
-        for ev in events:
-            json_line(log_path, ev)
-            
-        # Verify the run is NOT in memory
-        self.assertNotIn(run_id, session.runs)
-        
-        # Try to read it - this should transparently trigger recovery
-        res = session.read_run(run_id=run_id, offset=None, max_lines=10, max_chars=1000)
-        
+        run = RunState(
+            run_id=99, session_id=session.id, command="cat secrets.txt", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "mirror.log"),
+        )
+        run.append_output("super_secret_key_123\n")
+        run.mark_done("completed", completion_method="prompt_detected")
+        session.runs[99] = run
+
+        res = session.read_canvas(limit=10, max_chars=1000, wait_timeout=0.0)
         self.assertTrue(res["success"])
-        self.assertEqual(res["run_id"], run_id)
-        self.assertEqual(res["status"], "completed")
-        self.assertEqual(res["output"], "super_secret_key_123")
-        
-        # Run should now be cached in memory
-        self.assertIn(run_id, session.runs)
-        self.assertEqual(session.runs[run_id].command, "cat secrets.txt")
+        self.assertEqual(res["output"], "super_secret_key_123\n")
+        self.assertEqual(res["has_more"], 0)
+        # Mirrored exactly once: a second read has nothing left.
+        again = session.read_canvas(limit=10, max_chars=1000, wait_timeout=0.0)
+        self.assertEqual(again["output"], "")
 
     def test_state_lost_warning(self):
         session, _, _ = self._create_mock_session()
@@ -286,7 +273,7 @@ class TestSSH(unittest.TestCase):
         # Flag should be reset
         self.assertFalse(session.state_lost)
 
-    def test_run_state_read_slice_cleans_output(self):
+    def test_run_state_append_output_stores_cleaned_text(self):
         log_path = os.path.join(self.cache_dirs["runs_dir"], "test_run.log")
         run = RunState(
             run_id=1,
@@ -300,10 +287,11 @@ class TestSSH(unittest.TestCase):
             max_buffer_chars=1000,
             run_log_path=log_path
         )
-        run.append_output("line 1\r\n\x1b[31mline 2\x1b[0m\r\n")
-        res = run.read_slice(offset=0, max_lines=10, max_chars=100)
-        self.assertEqual(res["output"], "line 1\nline 2")
-        self.assertEqual(res["next_offset"], len("line 1\r\n\x1b[31mline 2\x1b[0m\r\n"))
+        end = run.append_output("line 1\r\n\x1b[31mline 2\x1b[0m\r\n")
+        self.assertEqual(run.output_buffer, "line 1\nline 2\n")
+        # The returned end offset is what the canvas mirror records for this chunk.
+        self.assertEqual(end, len("line 1\nline 2\n"))
+        self.assertEqual(run.output_end(), len("line 1\nline 2\n"))
 
     def test_concurrent_run_command_busy_race(self):
         """Verify atomic busy reservation: concurrent calls on same session allow exactly 1 to run."""
@@ -335,32 +323,34 @@ class TestSSH(unittest.TestCase):
         self.assertEqual(success_count, 1, "Exactly one command must succeed")
         self.assertEqual(busy_count, 7, "All 7 concurrent callers must be rejected with busy error")
 
-    def test_restore_run_from_disk_huge_log_bounded(self):
-        """Verify memory bounded restoration from huge log files (> MAX_BUFFER_CHARS)."""
+    def test_trimmed_run_buffer_reports_lost_output(self):
+        """A run buffer trimmed before its text reached the canvas is reported as
+        dropped_data instead of silently swallowing the lost output (D5)."""
         from src.config import MAX_BUFFER_CHARS
         session, _, _ = self._create_mock_session()
-
-        run_id = 999
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(self.cache_dirs["runs_dir"], f"test_project__default__s1__r{run_id}__{stamp}.log")
 
         chunk_size = 100000
         num_chunks = 25  # 2,500,000 chars total, MAX_BUFFER_CHARS is 2,000,000
         total_chars = chunk_size * num_chunks
 
-        with open(log_file, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": "2026-09-20T00:00:00Z", "dir": "SYS", "event": "run_created", "command": "cat big"}) + "\n")
-            for i in range(num_chunks):
-                f.write(json.dumps({"ts": "2026-09-20T00:00:00Z", "dir": "OUT", "chunk": "x" * chunk_size}) + "\n")
-            f.write(json.dumps({"ts": "2026-09-20T00:00:01Z", "dir": "SYS", "event": "run_done", "status": "completed", "reason": "ok"}) + "\n")
+        run = RunState(
+            run_id=999, session_id=session.id, command="cat big", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=MAX_BUFFER_CHARS, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "big.log"),
+        )
+        for _ in range(num_chunks):
+            run.append_output("x" * chunk_size)
+        run.mark_done("completed", completion_method="exit_status")
+        session.runs[999] = run
 
-        run = session._restore_run_from_disk(run_id)
-        self.assertIsNotNone(run)
-        self.assertEqual(run.status, "completed")
+        # Memory stays bounded and the trim point is tracked in absolute offsets.
         self.assertEqual(run.total_received_chars, total_chars)
-        self.assertLessEqual(len(run.output_buffer), MAX_BUFFER_CHARS)
         self.assertEqual(len(run.output_buffer), MAX_BUFFER_CHARS)
         self.assertEqual(run.buffer_base_offset, total_chars - MAX_BUFFER_CHARS)
+
+        res = session.read_canvas(limit=0, max_chars=200000, wait_timeout=0.0)
+        self.assertTrue(res["success"])
+        self.assertTrue(res.get("dropped_data"), "trimmed-away output must be reported")
 
     def test_striped_locks_json_line_concurrency(self):
         """Verify striped locks prevent log file corruption under high thread contention."""
@@ -1066,20 +1056,18 @@ class TestSSH(unittest.TestCase):
         self.assertFalse(rejected["success"])
         self.assertIn("exec channel stdin is closed", rejected["error"])
 
-    def test_read_run_reports_dropped_data(self):
+    def test_read_reports_dropped_data(self):
+        """Unread canvas text that was trimmed away before the cursor reached it is
+        reported instead of silently skipped (D5)."""
         session, _, _ = self._create_mock_session()
-        run = RunState(
-            run_id=5, session_id=1, command="yes", mode="sync",
-            started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
-            max_buffer_chars=100, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "drop.log"),
-        )
-        run.output_buffer = "kept"
-        run.buffer_base_offset = 20
-        run.mark_done("completed", completion_method="exit_status")
-        run.exit_status = 0
-        session.runs[5] = run
-        result = session.read_run(5, offset=0, max_lines=10, max_chars=100)
+        session.scrollback.append("kept")
+        # Simulate eviction: the canvas now starts at an absolute offset the unread
+        # cursor never reached.
+        session.scrollback.base_offset = 20
+        session.scrollback_cursor = 0
+        result = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
         self.assertTrue(result["dropped_data"])
+        self.assertEqual(result["output"], "kept")
 
     def test_channel_eof_marks_session_dead(self):
         session, _, channel = self._create_mock_session()
@@ -1479,7 +1467,8 @@ class TestSSH(unittest.TestCase):
         self.assertIn("was lost", user["error"])
         self.assertFalse(session.state_lost)
 
-    def test_read_run_reports_recv_paused(self):
+    def test_read_reports_recv_paused(self):
+        """A tab whose receiver is paused reports why it went quiet on read."""
         session, _, _ = self._create_mock_session()
         run = RunState(
             run_id=9, session_id=1, command="yes", mode="sync",
@@ -1488,7 +1477,8 @@ class TestSSH(unittest.TestCase):
         )
         run.set_recv_paused(True, "memory_limit")
         session.runs[9] = run
-        result = session.read_run(9, 0, 50, 1000)
+        session.active_run_id = 9
+        result = session.read_canvas(limit=50, max_chars=1000, wait_timeout=0.0)
         self.assertTrue(result["recv_paused"])
         self.assertEqual(result["pause_reason"], "memory_limit")
 
@@ -1684,7 +1674,10 @@ class TestSSH(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.8)
         self.assertLess(elapsed, 2.5)
 
-    def test_either_silence_returns_running_and_stays_busy(self):
+    def test_either_silence_returns_stalled_and_stays_busy(self):
+        # A6: PTY silent-from-zero is honest stalled (quiet idle, no marker), not
+        # a full-wait running. The tab stays busy either way: a second command
+        # must fail with a busy error until the first is reaped.
         session, _, channel = self._create_mock_session()
         session.in_shell = False
         channel.closed = False
@@ -1697,10 +1690,11 @@ class TestSSH(unittest.TestCase):
         )
         try:
             self.assertTrue(result["success"], result)
-            self.assertEqual(result["status"], "running")
-            self.assertTrue(result["still_running"])
+            self.assertEqual(result["status"], "stalled")
+            self.assertTrue(result["unconfirmed_completion"])
+            self.assertNotIn("run_id", result.get("hint", ""))
             run = session.runs[result["run_id"]]
-            self.assertFalse(run.quiet_event.is_set())
+            self.assertTrue(run.quiet_event.is_set())
             self.assertEqual(session.active_run_id, result["run_id"])
             second = session.run_command(
                 command="echo hi", mode="sync", shell=False, wait_timeout=0.3,
@@ -1737,7 +1731,9 @@ class TestSSH(unittest.TestCase):
         finally:
             set_buffer_limit_checkers(lambda _size: True, lambda: 0)
 
-    def test_read_run_retains_buffer_for_rewind(self):
+    def test_read_canvas_rewind_keeps_history_readable(self):
+        """Reading does not consume the canvas: offset=0 rewinds and returns the same
+        window again (the unread cursor only moves on a paging read)."""
         session, _, _ = self._create_mock_session()
         run = RunState(
             run_id=3, session_id=1, command="yes", mode="sync",
@@ -1746,13 +1742,11 @@ class TestSSH(unittest.TestCase):
         )
         run.output_buffer = ("A" * 50) + ("B" * 150)
         session.runs[3] = run
-        result = session.read_run(3, 0, 50, 100)
+        result = session.read_canvas(limit=50, max_chars=100, wait_timeout=0.0)
         self.assertEqual(result["output"], ("A" * 50) + ("B" * 50))
-        # Buffer is NOT discarded on read: base offset remains 0 so client can re-read or rewind
-        self.assertEqual(run.buffer_base_offset, 0)
-        self.assertEqual(run.output_buffer, ("A" * 50) + ("B" * 150))
-        # Re-reading from offset 0 still works!
-        reread = session.read_run(3, 0, 50, 100)
+        self.assertTrue(result["has_more"], "the rest of the canvas is still unread")
+        # Rewind: the history is intact, the same window comes back.
+        reread = session.read_canvas(limit=50, offset=0, max_chars=100, wait_timeout=0.0)
         self.assertEqual(reread["output"], ("A" * 50) + ("B" * 50))
 
     def test_exit_marker_resilience(self):
@@ -1874,35 +1868,29 @@ class TestSSH(unittest.TestCase):
         self.assertIn("Warning: Connection for session", res_linux["error"])
         self.assertIn("reset", res_linux["error"].lower())
 
-    def test_restore_run_from_disk_evicts_old_runs(self):
-        """Verify that restoring multiple runs from disk evicts older runs to respect the 10-run limit."""
+    def test_evicted_runs_are_mirrored_before_buffers_are_freed(self):
+        """Eviction frees old run buffers; their not-yet-mirrored text must reach the
+        canvas first, otherwise unread output would disappear without a trace."""
         session, _, _ = self._create_mock_session()
-        stamp = "20260922_120000"
-        
-        # Create 15 run logs on disk
         for rid in range(1, 16):
-            log_filename = f"{session.project_tag}__{session.server_alias}__s{session.id}__r{rid}__{stamp}.log"
-            log_path = os.path.join(self.cache_dirs["runs_dir"], log_filename)
-            events = [
-                {"ts": "2026-09-22T12:00:00.000", "dir": "SYS", "event": "run_created", "command": f"echo {rid}"},
-                {"ts": "2026-09-22T12:00:01.000", "dir": "OUT", "chunk": f"output_{rid}\n"},
-                {"ts": "2026-09-22T12:00:02.000", "dir": "SYS", "event": "run_done", "status": "completed", "exit_status": 0}
-            ]
-            for ev in events:
-                json_line(log_path, ev)
+            run = RunState(
+                run_id=rid, session_id=session.id, command=f"echo {rid}", mode="sync",
+                started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
+                max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], f"evict{rid}.log"),
+            )
+            run.append_output(f"output_{rid}\n")
+            run.mark_done("completed", completion_method="exit_status")
+            session.runs[rid] = run
+            session._cleanup_old_runs()
 
-        # Restore all 15 runs one by one
-        for rid in range(1, 16):
-            res = session.read_run(run_id=rid, offset=None, max_lines=10, max_chars=100)
-            self.assertTrue(res["success"])
-            self.assertEqual(res["run_id"], rid)
-
-        # In-memory runs must be bounded to at most 10
         with session.lock:
             self.assertLessEqual(len(session.runs), 10)
             self.assertNotIn(1, session.runs)
-            self.assertNotIn(2, session.runs)
             self.assertIn(15, session.runs)
+        # Evicted output is not lost: it was mirrored into the single unread stream.
+        res = session.read_canvas(limit=100, max_chars=8192, wait_timeout=0.0)
+        self.assertIn("output_1\n", res["output"])
+        self.assertIn("output_15\n", res["output"])
 
     def test_resolve_local_path_windows_drive_case_normalization(self):
         """Verify resolve_local_path handles different drive letter casing on Windows without throwing ValueError."""
@@ -2014,14 +2002,18 @@ class TestSSH(unittest.TestCase):
         mock_transport.close.assert_called_once()
 
     def test_read_run_wait_timeout_waits_for_completion(self):
-        """Verify read_run with wait_timeout waits for running command done_event."""
+        """read_run waits for the run to finish while the stream is silent.
+
+        Nothing is buffered, so the read has nothing to hand back and must block
+        until done_event (review R6: only 'finish OR produce output' ends the
+        wait - the mirror case is test_read_run_returns_immediately_when_output_is_waiting).
+        """
         session, _, _ = self._create_mock_session()
         run = RunState(
             run_id=5, session_id=session.id, command="sleep 0.1", mode="sync",
             started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
             max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "test.log")
         )
-        run.output_buffer = "hello\n"
         session.runs[5] = run
         session.active_run_id = 5
 
@@ -2035,17 +2027,51 @@ class TestSSH(unittest.TestCase):
         t = threading.Thread(target=finish)
         t.start()
 
-        res = session.read_run(run_id=5, offset=None, max_lines=100, max_chars=1000, wait_timeout=1.0)
+        started = time.time()
+        res = session.read_canvas(limit=100, max_chars=1000, wait_timeout=1.0)
+        elapsed = time.time() - started
         t.join()
 
         self.assertTrue(res["success"])
+        # It must really have waited for the done_event, not returned at once.
+        self.assertGreaterEqual(elapsed, 0.04)
         self.assertEqual(res["status"], "completed")
         self.assertFalse(res["still_running"])
         self.assertEqual(res["exit_status"], 0)
 
-    def test_fully_consumed_run_buffer_is_freed(self):
-        """T2.4/F7: once the client read everything the buffer goes back to the pool
-        (discard_through used to be dead code); rewind then reports dropped_data."""
+    def test_read_run_returns_immediately_when_output_is_waiting(self):
+        """A poll that already has unread output must not burn wait_timeout (R6).
+
+        The tool describes wait_timeout as 'finish or produce output'; waiting the
+        whole window while bytes are sitting in the buffer made every poll of a
+        long-running command cost DEFAULT_WAIT_TIMEOUT seconds.
+        """
+        session, _, _ = self._create_mock_session()
+        run = RunState(
+            run_id=6, session_id=session.id, command="tail -f /var/log/syslog", mode="sync",
+            started_at=time.time(), wait_timeout=30.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "test.log")
+        )
+        run.output_buffer = "line-1\n"
+        session.runs[6] = run
+        session.active_run_id = 6
+
+        started = time.time()
+        res = session.read_canvas(limit=100, max_chars=1000, wait_timeout=1.0)
+        elapsed = time.time() - started
+
+        self.assertTrue(res["success"])
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(res["output"], "line-1\n")
+        self.assertEqual(res["status"], "running")
+        self.assertTrue(res["still_running"])
+
+    def test_fully_consumed_run_buffer_can_be_freed_from_the_canvas(self):
+        """The canvas is the source of truth: freeing a run buffer keeps its text.
+
+        Review #2 D5: the old path freed the buffer and then reported the whole output
+        as lost, so rewind had nothing left to hand back. Now the text is mirrored into
+        the tab canvas first, and discarding the run buffer only frees memory."""
         session, _, _ = self._create_mock_session()
         run = RunState(
             run_id=7, session_id=1, command="echo x", mode="sync",
@@ -2055,15 +2081,159 @@ class TestSSH(unittest.TestCase):
         run.output_buffer = "payload\n"
         run.mark_done("completed")
         session.runs[7] = run
-        res = session.read_run(run_id=7, offset=None, max_lines=100, max_chars=1000, wait_timeout=0)
+        res = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0)
         self.assertEqual(res["output"].strip(), "payload")
-        self.assertEqual(run.buffer_len, 0, "fully consumed buffer must be freed")
-        rewind = session.read_run(run_id=7, offset=0, max_lines=100, max_chars=1000, wait_timeout=0)
-        self.assertTrue(rewind.get("dropped_data"))
-        self.assertEqual(rewind["output"], "")
+        self.assertEqual(res["has_more"], 0, "the only line was handed back")
+        with run.lock:
+            run.discard_all_output()
+        self.assertEqual(run.buffer_len, 0, "the run buffer can be freed once mirrored")
+        rewind = session.read_canvas(limit=100, offset=0, max_chars=1000, wait_timeout=0)
+        self.assertEqual(rewind["output"].strip(), "payload", "the canvas still holds the text")
 
-    def test_read_run_on_dead_session_returns_buffered_output(self):
-        """Verify that read_run can read outputs from dead/closed sessions."""
+    def test_run_display_status_resolver(self):
+        """_run_display_status: one resolver for run/read/scrollback (P3 stalled symmetry)."""
+        from src.session import _run_display_status
+        mk = lambda: RunState(
+            run_id=1, session_id=1, command="c", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.05, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "resolver.log"),
+        )
+        # done + prompt -> completed
+        r = mk(); r.completion_hint = "either"; r.mark_done("completed", completion_method="prompt_detected"); r.exit_status = 0
+        self.assertEqual(_run_display_status(r), "completed")
+        # done + exit non-zero -> completed_nonzero
+        r = mk(); r.completion_hint = "either"; r.mark_done("completed_nonzero", completion_method="exit_status"); r.exit_status = 1
+        self.assertEqual(_run_display_status(r), "completed_nonzero")
+        # done + interrupt -> interrupted
+        r = mk(); r.completion_hint = "either"; r.mark_done("interrupted", completion_method="interrupted")
+        self.assertEqual(_run_display_status(r), "interrupted")
+        # unfinished + PTY quiet idle -> stalled
+        r = mk(); r.completion_hint = "either"; r.quiet_event.set()
+        self.assertEqual(_run_display_status(r), "stalled")
+        # unfinished + explicit quiet hint + quiet idle -> stalled
+        r = mk(); r.completion_hint = "quiet"; r.quiet_event.set()
+        self.assertEqual(_run_display_status(r), "stalled")
+        # unfinished + exit marker token -> running (marker expected, not idle fallback)
+        r = mk(); r.completion_hint = "either"; r.exit_marker_token = "MCP_ABC"; r.quiet_event.set()
+        self.assertEqual(_run_display_status(r), "running")
+        # unfinished + exec channel -> running even when quiet fired (exit_status authoritative)
+        r = mk(); r.completion_hint = "either"; r.exec_channel = MagicMock(); r.quiet_event.set()
+        self.assertEqual(_run_display_status(r), "running")
+        # unfinished + no quiet -> running
+        r = mk(); r.completion_hint = "either"
+        self.assertEqual(_run_display_status(r), "running")
+
+    def test_stalled_hint_shape(self):
+        """_stalled_hint carries the resume recipe with run_id + offset (P3)."""
+        from src.session import _stalled_hint
+        run = RunState(
+            run_id=7, session_id=1, command="c", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.05, hard_timeout=0.0,
+            max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "hint.log"),
+        )
+        run.completion_hint = "either"; run.quiet_complete_timeout = 0.5
+        hint = _stalled_hint("keenetic", 1, run)
+        self.assertNotIn("run_id", hint)
+        self.assertIn("read(session_id='keenetic/1')", hint)
+        self.assertIn("No completion marker seen", hint)
+        self.assertIn("new_session=true", hint)
+
+    def test_run_max_lines_zero_means_all(self):
+        """max_lines=0 means all lines (P4): 300 lines survive (default 200 would cut)."""
+        session, _, channel = self._create_mock_session()
+        channel.closed = False
+        channel.recv_ready.return_value = False
+        session.in_shell = True
+        big = "".join(f"line-{i:04d}\n" for i in range(300))
+        def fill(run):
+            run.append_output(big)
+            run.mark_done("completed", completion_method="prompt_detected")
+        session._start_reader_thread = fill
+        res = session.run_command(
+            command="seq 1 300", mode="sync", shell=True,
+            wait_timeout=2.0, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.5,
+            max_chars=200000, max_lines=0,
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "completed")
+        self.assertIn("line-0000", res["output"])
+        self.assertIn("line-0299", res["output"])
+        self.assertEqual(res["output"].count("line-"), 300)
+
+    def test_exit_shell_slow_ndm_prompt_still_recovers(self):
+        """P0 live repro: NDM answers AFTER the old 0.8s window (~1.2s). Must still exit."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        session._is_subshell = True
+        # silence for ~1.2s, then the NDM prompt arrives late
+        calls = {"n": 0}
+        def ready():
+            calls["n"] += 1
+            return calls["n"] > 24  # 24 * 0.05s ~= 1.2s
+        mock_channel.recv_ready.side_effect = ready
+        session._drain_ready = MagicMock(return_value="(config)> ")
+        self.assertTrue(session._exit_shell())
+        self.assertFalse(session.in_shell)
+
+    def test_exit_shell_loose_ndm_tail_recovers(self):
+        """P0: late NDM banner without strict prompt shape still counts as exited."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        session._is_subshell = True
+        mock_channel.recv_ready.side_effect = [True, False]
+        session._drain_ready = MagicMock(return_value="leaving shell\n(config) stuff")
+        self.assertTrue(session._exit_shell())
+        self.assertFalse(session.in_shell)
+
+    def test_exit_shell_unknown_interpreter_invalidates_pty(self):
+        """P0: exit failure = UNKNOWN interpreter. PTY invalidated, no trusted in_shell."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        session._is_subshell = True
+        mock_channel.recv_ready.return_value = False
+        start = time.time()
+        self.assertFalse(session._exit_shell())
+        self.assertLess(time.time() - start, 7.5)
+        # the lie is gone: in_shell is NOT trusted anymore (PTY killed)
+        self.assertFalse(session.in_shell)
+        self.assertIsNone(session.channel)
+        # shell=false in this fresh-unknown session is refused deterministically with the
+        # recipe: the command must not run (no silent POSIX-into-NDM with in_shell trusted).
+        session.ensure_alive = MagicMock(return_value=None)
+        res = session.run_command(
+            command="show version", mode="sync", shell=False,
+            wait_timeout=2.0, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.5,
+        )
+        self.assertFalse(res["success"])
+        self.assertIn("new_session=true", res["error"])
+        self.assertEqual(res.get("status"), "failed")
+        self.assertNotIn("run_id", res)
+
+        # The real (unmocked) ensure_alive gives the same recipe on the second attempt.
+        del session.ensure_alive
+        res_real = session.run_command(
+            command="show version", mode="sync", shell=False,
+            wait_timeout=2.0, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.5,
+        )
+        self.assertFalse(res_real["success"])
+        self.assertIn("new_session=true", res_real["error"])
+
+    def test_exit_shell_ok_clears_sticky(self):
+        """A successful 'exit' exits the Linux subshell and returns to NDM CLI."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        session._is_subshell = True
+        mock_channel.recv_ready.side_effect = [True, False]
+        session._drain_ready = MagicMock(return_value="(config)> ")
+        self.assertTrue(session._exit_shell())
+        self.assertFalse(session.in_shell)
+        self.assertFalse(session._is_subshell)
+
+    def test_read_on_dead_session_returns_buffered_output(self):
+        """Buffered output of a dead/closed session must stay readable (mirrored to canvas)."""
         session, _, _ = self._create_mock_session()
         run = RunState(
             run_id=1, session_id=session.id, command="echo dead", mode="sync",
@@ -2075,20 +2245,25 @@ class TestSSH(unittest.TestCase):
         run.completion_method = "exit_status"
         run.done_event.set()
         session.runs[1] = run
+        session.last_run_id = 1  # read_canvas reports the newest run's status/exit_status
 
         # Session dies
         session.close(permanent=True)
         self.assertTrue(session.is_dead)
 
         # Output must still be readable!
-        res = session.read_run(run_id=1, offset=None, max_lines=100, max_chars=1000, wait_timeout=0)
+        res = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0)
         self.assertTrue(res["success"])
         self.assertEqual(res["output"].strip(), "output before death")
         self.assertEqual(res["status"], "completed")
         self.assertEqual(res["exit_status"], 0)
 
-    def test_terminal_tab_scrollback_and_amnesia_rewind(self):
-        """Verify unified tab scrollback: rewind to start (offset=0), negative offset (tail), and pagination without run_id."""
+    def test_terminal_tab_canvas_rewind_peek_and_paging(self):
+        """The tab canvas is one line-based stream: rewind (offset=0), peek (offset<0), paging.
+
+        Review m01215: rewind(session_id, offset=0) reads history from the very first
+        line and leaves the cursor at the end of the returned window; a NEGATIVE offset
+        is the non-consuming peek; plain reads continue from the single unread cursor."""
         session, _, _ = self._create_mock_session()
 
         # Simulate terminal activity across multiple sequential commands
@@ -2099,31 +2274,1148 @@ class TestSSH(unittest.TestCase):
         session.append_scrollback(cmd2)
         session.append_scrollback(cmd3)
 
-        # 1. Full rewind (offset=0) to solve agent context loss / amnesia
-        res_rewind = session.read_run(run_id=None, offset=0, max_lines=1000, max_chars=50000)
+        # 1. Peek beginning (offset=0) to solve agent context loss / amnesia: inspects whole history without moving cursor
+        res_rewind = session.read_canvas(limit=1000, offset=0, max_chars=50000)
         self.assertTrue(res_rewind["success"])
         self.assertNotIn("run_id", res_rewind)
         self.assertIn("first line output", res_rewind["output"])
         self.assertIn("second line output", res_rewind["output"])
         self.assertIn("third line output", res_rewind["output"])
+        self.assertEqual(res_rewind["has_more"], 6, "peek from start does not consume unread lines")
 
-        # 2. Negative offset (tail buffer)
-        res_tail = session.read_run(run_id=None, offset=-50, max_lines=1000, max_chars=50000)
-        self.assertTrue(res_tail["success"])
-        self.assertNotIn("run_id", res_tail)
-        self.assertIn("third line output", res_tail["output"])
-        self.assertNotIn("first line output", res_tail["output"])
-
-        # 3. Pagination across pages using next_offset
-        page1 = session.read_run(run_id=None, offset=0, max_lines=1000, max_chars=100)
+        # 2. Paging over the whole canvas, one line per page: advances the cursor
+        page1 = session.read_canvas(limit=1, max_chars=50000)
         self.assertTrue(page1["success"])
-        self.assertTrue(page1["limited"])
-        self.assertEqual(page1["next_offset"], 100)
+        self.assertEqual(page1["has_more"], 5, "five lines are still unread")
+        page2 = session.read_canvas(limit=1, max_chars=50000)
+        self.assertEqual(page2["has_more"], 4)
+        self.assertNotEqual(page1["output"], page2["output"], "each page advances the cursor")
 
-        page2 = session.read_run(run_id=None, offset=page1["next_offset"], max_lines=1000, max_chars=50000)
-        self.assertTrue(page2["success"])
-        self.assertIn("second line output", page2["output"])
-        self.assertIn("third line output", page2["output"])
+        # 3. Peek negative (offset=-2): inspect lines above cursor without consuming
+        res_peek = session.read_canvas(limit=2, offset=-2, max_chars=50000)
+        self.assertTrue(res_peek["success"])
+        self.assertEqual(res_peek["has_more"], 4, "a peek consumes nothing")
+
+        # 4. Continuation resumes exactly at page3 (4 unread lines left)
+        page3 = session.read_canvas(limit=1, max_chars=50000)
+        self.assertEqual(page3["has_more"], 3)
+
+    def test_find_prompt_keenetic_and_router_prompts(self):
+        """Bug A repro: find_prompt must recognize Keenetic top-level prompts like Keenetic-Giga> and router>."""
+        from src.utils import find_prompt
+        # The captured text IS the contract: the match must be the prompt itself, not an
+        # arbitrary substring (nine bare assertIsNotNone proved nothing - review 6).
+        for prompt in (
+            "Keenetic-Giga> ",                  # standard Keenetic prompts
+            "Keenetic> ",
+            "router> ",
+            "admin> ",
+            "Keenetic (config)> ",
+            "Keenetic-Ultra (config-if)> ",
+            "root# ",                           # busybox / root / prompt variants
+            "root@switch# ",
+            "[admin@router /opt]# ",
+        ):
+            self.assertEqual(find_prompt(prompt), prompt, f"{prompt!r} must be recognized as prompt")
+
+    def test_paging_after_a_second_command_never_repeats_the_first(self):
+        """Review m01215: one canvas cursor means paging past command 1 lands in command 2.
+
+        Review #2 Bug B was an offset-space mismatch: read() continued in the scrollback
+        offset space while the hint came from the run buffer. Both are now the same
+        stream, so the first page of command 2 is the next unread line, not command 1."""
+        session, _, _ = self._create_mock_session()
+        session.in_shell = True
+
+        # Run 1: 500 chars of output. The canvas gets the chunk in the SAME call that
+        # appends it to the run buffer, so the mirror does not copy it a second time.
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r1.log")
+        )
+        out1 = "COMMAND_ONE_OUTPUT_" * 25
+        mirrored1 = r1.append_output(out1)
+        session.append_scrollback(f"$ cmd1\n{out1}", run=r1, mirrored_to=mirrored1)
+        r1.mark_done("completed", completion_method="prompt_detected")
+        session.last_run_id = 1
+
+        # Run 2: 500 chars of output.
+        r2 = session.runs[2] = RunState(
+            run_id=2, session_id=session.id, command="cmd2", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r2.log")
+        )
+        out2 = "COMMAND_TWO_OUTPUT_" * 25
+        mirrored2 = r2.append_output(out2)
+        session.append_scrollback(f"$ cmd2\n{out2}", run=r2, mirrored_to=mirrored2)
+        r2.mark_done("completed", completion_method="prompt_detected")
+        session.last_run_id = 2
+
+        # First page ends inside command 1 and says how much is left.
+        first = session.read_canvas(limit=200, max_chars=100, wait_timeout=0.0)
+        self.assertTrue(first["has_more"] > 0, "unread output must be advertised for paging")
+
+        # Continue with the single cursor: the very next unread lines, no offset math.
+        paged = session.read_canvas(limit=200, max_chars=8192, wait_timeout=0.0)
+        self.assertIn("COMMAND_TWO", paged["output"], "the page must reach command 2!")
+
+        # Rewind and compare: pages concatenated must equal the whole stream exactly.
+        everything = session.read_canvas(limit=0, offset=0, max_chars=100000, wait_timeout=0.0)
+        self.assertEqual(first["output"] + paged["output"], everything["output"])
+        self.assertEqual(everything["output"].count("COMMAND_ONE_OUTPUT_"), 25)
+        self.assertEqual(everything["output"].count("COMMAND_TWO_OUTPUT_"), 25)
+
+    def test_exit_shell_failure_blocks_false_state_lost_autorecovery(self):
+        """Bug repro: PTY invalidation on _exit_shell must not trigger misleading state_lost auto-recovery advice."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        session._is_subshell = True
+        mock_channel.recv_ready.return_value = False
+
+        # 1. Trigger _exit_shell failure -> invalidates PTY
+        res1 = session.run_command(
+            command="show version", mode="sync", shell=False,
+            wait_timeout=1.0, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.5
+        )
+        self.assertFalse(res1["success"])
+        self.assertIn("new_session=true", res1["error"])
+        self.assertIn("session_close", res1["error"])
+        self.assertEqual(res1.get("mode"), "unknown")
+        self.assertIsNone(res1.get("in_shell"))
+
+        # 2. Subsequent command on this invalidated session
+        res2 = session.run_command(
+            command="ls -la", mode="sync", shell=True,
+            wait_timeout=1.0, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.5
+        )
+        self.assertFalse(res2["success"])
+        self.assertNotIn("was lost and auto-recovered", res2["error"])
+        self.assertNotIn("cd <dir>", res2["error"])
+        self.assertIn("new_session=true", res2["error"])
+        self.assertIn("session_close", res2["error"])
+
+    def test_exit_shell_slow_ndm_prompt_at_3_2s(self):
+        """Review Bug 1 repro: Keenetic 'exit' taking 3.2s must send exactly ONE exit and succeed."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        session._is_subshell = True
+        mock_channel.send = MagicMock()
+        calls = {"n": 0}
+        def ready():
+            calls["n"] += 1
+            # 64 calls * 0.05s ~= 3.2s
+            return calls["n"] > 64
+        mock_channel.recv_ready.side_effect = ready
+        session._drain_ready = MagicMock(return_value="Keenetic-Giga> ")
+        self.assertTrue(session._exit_shell(), "_exit_shell must succeed when Keenetic responds after 3.2s!")
+        self.assertFalse(session.in_shell)
+        self.assertEqual(mock_channel.send.call_count, 1, "Must send exactly ONE exit command, never duplicate retry!")
+        mock_channel.send.assert_called_once_with("exit\n")
+
+    def test_trimmed_run_buffer_is_reported_as_dropped(self):
+        """Review Bug 3(a): a run whose start was trimmed must not pretend the loss away.
+
+        mirrored_upto (the old per-run shared cursor) is compared with buffer_base_offset:
+        anything below the base is gone, and the read admits it instead of silently
+        starting in the middle."""
+        session, _, _ = self._create_mock_session()
+        r = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="big_cmd", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r3a.log")
+        )
+        session.append_scrollback("$ big_cmd\nSCROLLBACK_HISTORY")
+        # Simulate a run where 1000 bytes were previously discarded from the start
+        r.buffer_base_offset = 1000
+        r.append_output("REMAINING_BUFFER_OUTPUT")
+        session.last_run_id = 1
+        r.mark_done("completed", completion_method="prompt_detected")
+
+        # The canvas holds the surviving text; the trimmed prefix is reported as lost.
+        res = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0.0)
+        self.assertIn("REMAINING_BUFFER_OUTPUT", res["output"])
+        self.assertIn("SCROLLBACK_HISTORY", res["output"], "the canvas is one stream - history comes first")
+        self.assertTrue(res.get("dropped_data"), "text trimmed below the retained base must be reported")
+
+    def test_read_at_end_of_stream_returns_nothing_not_history(self):
+        """Review Bug 3(b,c): a read at the end of the stream is EOF, never a history dump.
+
+        The whole tab is ONE stream now: the first read hands back history plus the run
+        output in order, and the read after it returns nothing at all."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("$ old_cmd\nOLD_SCROLLBACK_HISTORY\n")
+        r = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r3bc.log")
+        )
+        r.append_output("CMD1_OUTPUT\n")
+        r.mark_done("completed", completion_method="prompt_detected")
+        session.last_run_id = 1
+
+        first = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0.0)
+        self.assertEqual(first["output"], "$ old_cmd\nOLD_SCROLLBACK_HISTORY\nCMD1_OUTPUT\n")
+        self.assertEqual(first["has_more"], 0, "everything unread was handed back")
+
+        eof = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0.0)
+        self.assertEqual(eof["output"], "", "at the end of the stream there is nothing to hand back")
+        self.assertEqual(eof["has_more"], 0)
+        self.assertNotIn("OLD_SCROLLBACK_HISTORY", eof["output"], "history must not be replayed at EOF")
+
+    def test_paginated_read_preserves_newline_and_indentation(self):
+        """P0: paging across a char boundary must not lose a newline or leading indentation."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("A" * 99 + "\n  port forward 123")
+
+        page1 = session.read_canvas(limit=0, max_chars=100, wait_timeout=0.0)
+        self.assertEqual(page1["output"], "A" * 99 + "\n", "the page must stop at the char cap")
+        self.assertTrue(page1["has_more"] > 0, "the rest of the line is still unread")
+
+        page2 = session.read_canvas(limit=0, max_chars=10000, wait_timeout=0.0)
+        reconstructed = page1["output"] + page2["output"]
+        self.assertIn("\n  port forward 123", reconstructed)
+
+        # Single-page read of the same text:
+        whole = session.read_canvas(limit=0, offset=0, max_chars=10000, wait_timeout=0.0)
+        self.assertEqual(reconstructed, whole["output"], "paging must not drop newline or indentation!")
+
+    def test_paging_across_cleaned_ansi_and_crlf_matches_single_output(self):
+        """P0: ANSI/CRLF are cleaned once on the way into the canvas, so paging cannot split them."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("0123456789" + "\x1b[31mRed\x1b[0m\r\nNextLine")
+
+        whole = session.read_canvas(limit=0, offset=0, max_chars=10000, wait_timeout=0.0)
+        self.assertEqual(whole["output"], "0123456789Red\nNextLine")
+        self.assertNotIn("[31m", whole["output"], "ANSI must never reach the caller as raw text")
+
+        # Cut at 11 chars, then continue: the boundary falls inside the old escape, but
+        # the escape was already removed when the chunk entered the canvas.
+        page1 = session.read_canvas(limit=0, max_chars=11, wait_timeout=0.0)
+        page2 = session.read_canvas(limit=0, max_chars=10000, wait_timeout=0.0)
+        self.assertEqual(page1["output"] + page2["output"], whole["output"],
+                         "concatenated pages must equal the single cleaned output")
+
+    def test_paging_keeps_reading_the_canvas_not_the_last_run(self):
+        """Paging over the tab canvas must never switch to the last run's private buffer."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("HIST_PAGE1_HIST_PAGE2")
+        # Run 1 exists and is finished; its output is a plain canvas append.
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r1.log")
+        )
+        mirrored = r1.append_output("RUN1_OUTPUT\n")
+        session.append_scrollback("RUN1_OUTPUT\n", run=r1, mirrored_to=mirrored)
+        r1.mark_done("completed", completion_method="prompt_detected")
+        session.last_run_id = 1
+
+        # Read canvas page 1, then continue with the single unread cursor.
+        page1 = session.read_canvas(limit=0, max_chars=10, wait_timeout=0.0)
+        self.assertEqual(page1["output"], "HIST_PAGE1", "the first page starts at the beginning of the stream")
+        self.assertTrue(page1["has_more"] > 0)
+
+        page2 = session.read_canvas(limit=0, max_chars=100, wait_timeout=0.0)
+        self.assertIn("HIST_PAGE2", page2["output"], "paging continues in the canvas history")
+        self.assertIn("RUN1_OUTPUT", page2["output"],
+                      "the run output joins the same stream, in order - it is not a second view")
+        self.assertEqual(
+            page1["output"] + page2["output"], "HIST_PAGE1_HIST_PAGE2RUN1_OUTPUT\n",
+            "paging must resume exactly where the previous page stopped",
+        )
+
+    def test_stalled_zero_output_read_reports_stalled_and_unread_history(self):
+        """P1: a stalled active run reports the honest status and the unread tab history."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("OLD_HISTORY_LINE_1\nOLD_HISTORY_LINE_2\n")
+        # Active run 2 is running, 0 bytes produced so far, quiet event set (stalled)
+        r2 = session.runs[2] = RunState(
+            run_id=2, session_id=session.id, command="sleep 60", mode="sync",
+            started_at=time.time(), wait_timeout=0.1, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r2.log")
+        )
+        r2.quiet_event.set()
+        session.active_run_id = 2
+
+        # The run produced nothing, so the unread history is all there is to hand back.
+        res = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
+        self.assertEqual(res["status"], "stalled", "a quiet unfinished run is honestly uncertain")
+        self.assertEqual(res["output"], "OLD_HISTORY_LINE_1\nOLD_HISTORY_LINE_2\n")
+        self.assertEqual(res["has_more"], 0)
+        self.assertTrue(res["still_running"])
+        self.assertTrue(res["unconfirmed_completion"])
+
+    def test_first_read_reports_overflow_loss(self):
+        """P0: the first read of a buffer that overflowed before it was read reports dropped_data."""
+        session, _, _ = self._create_mock_session()
+        r = session.runs[1] = RunState(
+            run_id=1, session_id=1, command="flood", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=10, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "t_flood.log")
+        )
+        r.append_output("1234567890EXTRA")  # 15 chars, cap is 10, drops the first 5 chars
+        r.mark_done("completed", completion_method="prompt_detected")
+        self.assertEqual(r.buffer_base_offset, 5)
+        self.assertEqual(r.total_received_chars, 15)
+
+        # The buffer keeps the LAST 10 chars of the 15 fed in: '12345' was dropped.
+        self.assertEqual(r.output_buffer, "67890EXTRA")
+        self.assertEqual(r.output_end(), 15)
+
+        res = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
+        self.assertEqual(res["output"], "67890EXTRA")
+        self.assertTrue(res["dropped_data"], "the first read MUST report that unread text was dropped!")
+        self.assertEqual(r.buffer_base_offset, 5)
+        self.assertEqual(r.total_received_chars, 15)
+
+        # Reported exactly once: the canvas already gave up those chars (D6).
+        second = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
+        self.assertNotIn("dropped_data", second)
+
+    def test_invalidated_pty_is_broken_not_idle_ndm(self):
+        """P0: Invalidated PTY session must report broken/unknown and not be treated as idle NDM."""
+        session, _, _ = self._create_mock_session()
+        session._invalidate_pty("exit failed")
+        self.assertTrue(session._pty_invalidated)
+        self.assertFalse(session.is_alive())
+
+        # Check node list_sessions representation
+        from src.manager import ServerNode
+        cfg = MagicMock()
+        cfg.alias = "test_server"
+        node = ServerNode(cfg, cache_dirs=self.cache_dirs, project_tag="test_p")
+        node.sessions[session.id] = session
+
+        sessions = node.list_sessions()
+        self.assertEqual(len(sessions), 1)
+        s_info = sessions[0]
+        self.assertEqual(s_info["status"], "broken")
+        self.assertEqual(s_info["mode"], "unknown")
+        self.assertIsNone(node._find_first_idle_alive_session_locked())
+
+        # Mutation-K pin (src/manager.py:284): the flag is authoritative even when the
+        # transport still answers is_alive()=True. Without the clause session 1 reads "idle".
+        def fake_session(sid, invalidated, busy):
+            s = MagicMock(id=sid, is_dead=False, is_busy=lambda: busy, in_shell=True, _pty_invalidated=invalidated)
+            s.is_alive = lambda: True
+            s.info.return_value = {"dead": False, "alive": True, "in_shell": True}
+            return s
+
+        node2 = ServerNode(cfg, cache_dirs=self.cache_dirs, project_tag="test_p")
+        node2.sessions[1] = fake_session(1, invalidated=True, busy=False)
+        node2.sessions[2] = fake_session(2, invalidated=False, busy=False)
+        rows = {row["numeric_session_id"]: row for row in node2.list_sessions()}
+        self.assertEqual(rows[1]["status"], "broken")
+        self.assertEqual(rows[1]["mode"], "unknown")
+        self.assertEqual(rows[2]["status"], "idle")
+        self.assertEqual(rows[2]["mode"], "linux_shell")
+
+    def test_trailing_space_data_line_is_not_ndm_prompt(self):
+        """P1/F: data lines ending in '>' or '#' must never be read as a prompt."""
+        from src.utils import find_prompt
+        # Ordinary output (with and without a trailing space) is not a prompt:
+        for data_line in (
+            "Memory usage: Total> ",
+            "Data stream chunk more> ",
+            "build# ",
+            "Total>",
+            "more>",
+            "build#",
+            "status#",
+        ):
+            self.assertIsNone(find_prompt(data_line), f"{data_line!r} must not be treated as a prompt")
+        # Legitimate prompts on the same surface must match verbatim:
+        for raw, expected in (
+            ("Keenetic-Giga> ", "Keenetic-Giga> "),
+            ("Keenetic> ", "Keenetic> "),
+            ("router (config)> ", "router (config)> "),
+            ("> ", "> "),
+        ):
+            self.assertEqual(find_prompt(raw), expected, f"{raw!r} must be recognized as prompt")
+
+    def test_known_ndm_prompt_without_trailing_space_completes(self):
+        """P1/F: standalone '>' matches verbatim, but data lines ending in '>' must not (mutation F)."""
+        from src.utils import find_prompt
+        self.assertEqual(find_prompt("\n>"), ">")
+        self.assertEqual(find_prompt("\n> "), "> ")
+        # The pre-fix pattern set accepted ordinary output ending in '>' as a prompt:
+        self.assertIsNone(find_prompt("Memory usage: Total> "))
+        self.assertIsNone(find_prompt("Data stream chunk more> "))
+
+    def test_cancelled_old_request_cannot_interrupt_new_exec_run(self):
+        """P0: Cancellation of an old request must not kill a newer run on the session."""
+        session, _, _ = self._create_mock_session()
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r1.log"),
+            req_id="req_1"
+        )
+        session.inflight_by_req["req_1"] = 1
+        session.active_run_id = 1
+
+        # Run 1 completes
+        r1.mark_done("completed")
+
+        # Run 2 starts with different request
+        r2 = session.runs[2] = RunState(
+            run_id=2, session_id=session.id, command="cmd2", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r2.log"),
+            req_id="req_2"
+        )
+        mock_exec_channel = MagicMock()
+        mock_exec_channel.closed = False
+        r2.exec_channel = mock_exec_channel
+        session.inflight_by_req["req_2"] = 2
+        session.active_run_id = 2
+
+        # Old cancellation arrives for req_1: it must be a no-op - not even a signal attempt.
+        with patch.object(session, "send_signal", wraps=session.send_signal) as send_spy:
+            cancel_res = session.cancel_run_for_request("req_1")
+        send_spy.assert_not_called()
+        self.assertTrue(cancel_res["success"])
+        self.assertEqual(cancel_res.get("message"), "nothing to cancel: request already finished")
+        self.assertEqual(session.active_run_id, 2, "The newer run must stay the active one!")
+        self.assertFalse(r2.done_event.is_set(), "New run must not be interrupted by old cancellation!")
+        self.assertFalse(mock_exec_channel.close.called, "New exec channel must not be closed!")
+
+    def test_old_reader_finally_does_not_replace_new_last_run_id(self):
+        """P1: Old reader thread finally must NOT overwrite last_run_id if a newer run was reserved."""
+        session, _, _ = self._create_mock_session()
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r1.log")
+        )
+        r2 = session.runs[2] = RunState(
+            run_id=2, session_id=session.id, command="cmd2", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r2.log")
+        )
+        # Reservation of run 2 has set last_run_id = 2 and active_run_id = 2
+        session.active_run_id = 2
+        session.last_run_id = 2
+
+        # Reader 1 runs and terminates (r1 is marked done immediately)
+        r1.mark_done("completed")
+        session._reader_loop(r1)
+        self.assertEqual(session.last_run_id, 2, "last_run_id must remain 2 after reader 1 terminates!")
+
+    def test_pending_stdin_cannot_cross_run_boundary(self):
+        """P1: Pending uncommitted stdin from run 1 must not be sent to run 2."""
+        session, _, mock_channel = self._create_mock_session()
+        mock_channel.send = MagicMock()
+        mock_channel.closed = False
+
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r1.log")
+        )
+        session.active_run_id = 1
+        # Send buffered input with press_enter=False
+        res = session.send_signal("stdin", text="STALE", press_enter=False)
+        self.assertTrue(res["success"])
+
+        # Run 1 finishes and Run 2 starts
+        r1.mark_done("completed")
+        r2 = session.runs[2] = RunState(
+            run_id=2, session_id=session.id, command="cmd2", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r2.log")
+        )
+        session.active_run_id = 2
+
+        # Send fresh input with press_enter=True
+        session.send_signal("stdin", text="fresh", press_enter=True)
+        # Exactly one payload, and it is the fresh one - the stale buffer never crosses runs.
+        mock_channel.send.assert_called_once_with(b"fresh\n")
+
+    def test_queued_worker_after_shutdown_does_not_connect_or_recreate_nodes(self):
+        """P1: after close_all() a queued worker must not reconnect, recreate nodes or take work."""
+        from src.manager import MultiServerManager
+        cfg = MagicMock()
+        cfg.alias = "srv1"
+        cfg.max_sessions = 10
+        mgr = MultiServerManager(registry=MagicMock(), cache_dirs=self.cache_dirs, project_tag="p")
+        mgr.registry.get.return_value = cfg
+        node = mgr.get_or_create_node(cfg)
+        self.assertIsNotNone(node)
+
+        mgr.close_all()
+
+        # 1. A worker resolving its node after shutdown gets nothing (no reconnect, no new node)
+        self.assertIsNone(mgr.get_or_create_node(cfg), "get_or_create_node after close_all must return None!")
+        self.assertEqual(len(mgr.nodes), 0)
+
+        # 2. A worker holding a node handle from before shutdown is rejected without touching SSH
+        with patch("src.manager.SSHSession") as session_cls:
+            res = node.open_session(name="queued_work")
+        self.assertFalse(res["success"])
+        self.assertIn("closed", res["error"])
+        session_cls.assert_not_called()
+
+    def test_read_line_based_unread_paging_and_has_more(self):
+        """Line-based unread pagination: default read returns next lines and tracks has_more count."""
+        session, _, _ = self._create_mock_session()
+        # 500 lines
+        lines = [f"line_{i:03d}" for i in range(500)]
+        full_text = "\n".join(lines) + "\n"
+
+        session.append_scrollback(full_text)
+        # Session canvas now has 500 lines.
+        # Page 1: read default (limit=200)
+        p1 = session.read_canvas(limit=200)
+        p1_lines = p1["output"].splitlines()
+        self.assertEqual(len(p1_lines), 200)
+        self.assertEqual(p1_lines[0], "line_000")
+        self.assertEqual(p1_lines[-1], "line_199")
+        self.assertTrue(p1["has_more"], "300 lines are still unread")
+
+        # Page 2: read next 200 lines
+        p2 = session.read_canvas(limit=200)
+        p2_lines = p2["output"].splitlines()
+        self.assertEqual(len(p2_lines), 200)
+        self.assertEqual(p2_lines[0], "line_200")
+        self.assertEqual(p2_lines[-1], "line_399")
+        self.assertTrue(p2["has_more"], "100 lines are still unread")
+
+        # Page 3: read remaining 100 lines
+        p3 = session.read_canvas(limit=200)
+        p3_lines = p3["output"].splitlines()
+        self.assertEqual(len(p3_lines), 100)
+        self.assertEqual(p3_lines[0], "line_400")
+        self.assertEqual(p3_lines[-1], "line_499")
+        self.assertFalse(p3["has_more"], "the canvas is fully read")
+
+        # Page 4: subsequent read is empty, has_more is false
+        p4 = session.read_canvas(limit=200)
+        self.assertEqual(p4["output"], "")
+        self.assertFalse(p4["has_more"])
+
+        # Reconstructed text exactly equals original!
+        reconstructed = p1["output"] + p2["output"] + p3["output"]
+        self.assertEqual(reconstructed, full_text)
+
+    def test_virtual_lines_chunking_1024_chars_preserves_original_stream(self):
+        """Virtual lines: lines > 1024 chars without \\n are counted as virtual lines without buffer mutation."""
+        session, _, _ = self._create_mock_session()
+        raw_stream = "A" * 3000
+        session.append_scrollback(raw_stream)
+
+        # 3000 chars without \n = 2 full virtual lines of 1024 + 1 partial line of 952 = 3 lines total.
+        # Read limit=2 virtual lines -> 2048 chars, more stays unread
+        p1 = session.read_canvas(limit=2)
+        self.assertEqual(len(p1["output"]), 2048)
+        self.assertEqual(p1["output"], "A" * 2048)
+        self.assertTrue(p1["has_more"])
+
+        # Read next -> remaining 952 chars, nothing left
+        p2 = session.read_canvas(limit=2)
+        self.assertEqual(len(p2["output"]), 952)
+        self.assertEqual(p2["output"], "A" * 952)
+        self.assertFalse(p2["has_more"])
+
+        # Exact lossless reconstruction without any injected newlines!
+        self.assertEqual(p1["output"] + p2["output"], raw_stream)
+
+    def test_read_tail_advances_cursor_to_end(self):
+        """tail parameter reads last N lines and moves unread cursor to end."""
+        session, _, _ = self._create_mock_session()
+        lines = [f"line_{i:03d}" for i in range(100)]
+        session.append_scrollback("\n".join(lines) + "\n")
+
+        tail_res = session.read_canvas(tail=20)
+        tail_lines = tail_res["output"].splitlines()
+        self.assertEqual(len(tail_lines), 20)
+        self.assertEqual(tail_lines[0], "line_080")
+        self.assertEqual(tail_lines[-1], "line_099")
+        self.assertFalse(tail_res["has_more"])
+
+        # Cursor is now at the end: next default read returns empty
+        next_res = session.read_canvas()
+        self.assertEqual(next_res["output"], "")
+        self.assertFalse(next_res["has_more"])
+
+    def test_read_negative_offset_peeks_history_without_moving_cursor(self):
+        """Negative offset peeks N lines back from cursor without moving the unread cursor."""
+        session, _, _ = self._create_mock_session()
+        lines = [f"line_{i:03d}" for i in range(100)]
+        session.append_scrollback("\n".join(lines) + "\n")
+
+        # Read all 100 lines so cursor reaches end
+        all_read = session.read_canvas(limit=100)
+        self.assertFalse(all_read["has_more"])
+
+        # Peek 30 lines back from cursor, take 10 lines
+        peek = session.read_canvas(offset=-30, limit=10)
+        peek_lines = peek["output"].splitlines()
+        self.assertEqual(len(peek_lines), 10)
+        self.assertEqual(peek_lines[0], "line_070")
+        self.assertEqual(peek_lines[-1], "line_079")
+
+        # Unread cursor did NOT move: normal read still returns empty
+        fresh = session.read_canvas()
+        self.assertEqual(fresh["output"], "")
+        self.assertFalse(fresh["has_more"])
+
+    def test_read_offset_is_peek_and_never_advances_cursor(self):
+        """Any offset (offset=0, positive or negative) is a non-consuming peek: it inspects history without moving the unread cursor."""
+        session, _, _ = self._create_mock_session()
+        lines = [f"line_{i:03d}" for i in range(100)]
+        session.append_scrollback("\n".join(lines) + "\n")
+
+        # 1. Read the first 50 lines: unread cursor advances to line 50, leaving 50 unread lines.
+        first = session.read_canvas(limit=50)
+        self.assertEqual(first["output"].splitlines()[:3], ["line_000", "line_001", "line_002"])
+        self.assertEqual(first["has_more"], 50)
+
+        # 2. Peek beginning (offset=0): inspect first 5 lines from start of history.
+        # MUST NOT move the cursor: unread count stays 50!
+        peek_start = session.read_canvas(offset=0, limit=5)
+        self.assertEqual(peek_start["output"].splitlines(), ["line_000", "line_001", "line_002", "line_003", "line_004"])
+        self.assertEqual(peek_start["has_more"], 50, "peek from start must not consume or reset the unread backlog")
+
+        # 3. Peek arbitrary line (offset=20): inspect 5 lines from line 20.
+        # MUST NOT move the cursor: unread count stays 50!
+        peek_mid = session.read_canvas(offset=20, limit=5)
+        self.assertEqual(peek_mid["output"].splitlines(), ["line_020", "line_021", "line_022", "line_023", "line_024"])
+        self.assertEqual(peek_mid["has_more"], 50, "peek from line 20 must not consume unread lines")
+
+        # 4. Peek negative (offset=-5): 5 lines above cursor (lines 45..49).
+        peek_neg = session.read_canvas(offset=-5, limit=5)
+        self.assertEqual(peek_neg["output"].splitlines(), ["line_045", "line_046", "line_047", "line_048", "line_049"])
+        self.assertEqual(peek_neg["has_more"], 50, "negative peek must not consume unread lines")
+
+        # 5. Normal unread read resumes EXACTLY from line 50!
+        nxt = session.read_canvas(limit=5)
+        self.assertEqual(nxt["output"].splitlines(), ["line_050", "line_051", "line_052", "line_053", "line_054"])
+        self.assertEqual(nxt["has_more"], 45, "paging continues from line 50 where the cursor was left")
+
+    def test_stream_cleaner_keeps_streaming_after_lone_escape(self):
+        """D1: a stray ESC must not mute the tab stream for the rest of the session."""
+        cleaner = StreamCleaner()
+        self.assertEqual(cleaner.feed("BEFORE\x1b"), "BEFORE")
+        # ESC c (RIS) is a generic two-byte sequence: the pending ESC resolves with
+        # the next character and the rest of the stream keeps flowing.
+        self.assertEqual(cleaner.feed("cTAIL-ONE\nMORE-TAIL\n"), "TAIL-ONE\nMORE-TAIL\n")
+
+        # A string sequence (ESC X payload) is held while it may still be completed,
+        # but never without bound: past the cap it is flushed instead of swallowing
+        # the rest of the session forever.
+        stuck = StreamCleaner()
+        self.assertEqual(stuck.feed("\x1bXpayload"), "")
+        self.assertEqual(stuck.feed("P" * 4096), "")
+        self.assertEqual(stuck.feed("AFTER-CAP\n"), "AFTER-CAP\n", "A held escape must not mute the stream forever!")
+
+    def test_stream_cleaner_joins_escapes_split_across_chunks(self):
+        """D1/D3: CSI, OSC and DCS sequences split across feeds are still stripped."""
+        csi = StreamCleaner()
+        self.assertEqual(csi.feed("x\x1b[3"), "x")
+        self.assertEqual(csi.feed("2mY\x1b[0m"), "Y")
+
+        osc = StreamCleaner()
+        self.assertEqual(osc.feed("\x1b]0;my-title"), "")
+        self.assertEqual(osc.feed("\x07hello\n"), "hello\n")
+
+        dcs = StreamCleaner()
+        self.assertEqual(dcs.feed("\x1bPsome payload"), "")
+        self.assertEqual(dcs.feed("\x1b\\tail"), "tail")
+
+    def test_stream_cleaner_finalize_flushes_cr_and_drops_partial_escape(self):
+        """F7: finalize() turns a held CR into a newline and drops an unfinished escape."""
+        cr = StreamCleaner()
+        self.assertEqual(cr.feed("abc\r"), "abc")
+        self.assertEqual(cr.finalize(), "\n")
+        self.assertEqual(cr.finalize(), "", "finalize() must be idempotent")
+
+        partial = StreamCleaner()
+        self.assertEqual(partial.feed("more\x1b["), "more")
+        self.assertEqual(partial.finalize(), "", "An unfinished escape is dropped, not emitted")
+
+    def test_read_canvas_max_chars_caps_the_window(self):
+        """R4: a line-based canvas read must respect max_chars, not dump megabytes."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("".join(("B" * 400) + "\n" for _ in range(20)))
+
+        res = session.read_canvas(limit=20, max_chars=100)
+        self.assertEqual(len(res["output"]), 100)
+        self.assertTrue(res["has_more"], "unread text must still be reported as has_more")
+        self.assertIn("truncated", res.get("hint", ""), "a cut window must say so")
+
+    def test_read_canvas_peek_reports_unread_lines_not_window_tail(self):
+        """R1: has_more of a peek is what is still unread, not what follows the window."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("".join("line-%03d\n" % i for i in range(100)))
+
+        first = session.read_canvas(limit=10)
+        self.assertTrue(first["has_more"])
+
+        peek = session.read_canvas(offset=-10, limit=5)
+        self.assertEqual(peek["output"].count("\n"), 5)
+        self.assertTrue(peek["has_more"], "A peek must report unread output, not what follows the window!")
+
+    def test_read_canvas_tail_reports_dropped_data(self):
+        """R2: jumping to the tail with unread output must admit the loss."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("".join("line-%03d\n" % i for i in range(50)))
+        session.read_canvas(limit=10)
+
+        res = session.read_canvas(tail=5)
+        self.assertEqual(res["output"].count("\n"), 5)
+        self.assertTrue(res.get("dropped_data"), "Skipped unread output must be reported!")
+        self.assertFalse(res["has_more"], "tail= jumped to the end of the buffer")
+
+    def test_scrollback_cursor_is_absolute_after_eviction(self):
+        """D2: the unread cursor is an absolute stream offset, never a relative index."""
+        session, _, _ = self._create_mock_session()
+        session.scrollback.max_chars = 1000
+        session.append_scrollback("A" * 1000)
+        session.append_scrollback("B" * 500)
+        self.assertEqual(session.scrollback.base_offset, 500, "Setup: 500 chars must be evicted")
+
+        # The cursor is clamped to the live buffer start, so the window opens at the
+        # 500-char mark of the stream (buffer start), not at the buffer's zero index.
+        page = session.read_canvas(limit=1, max_chars=100)
+        self.assertEqual(page["output"], "A" * 100)
+        self.assertEqual(session.scrollback_cursor, 600, "Cursor must be absolute (base_offset + window end)!")
+
+        nxt = session.read_canvas(limit=0, max_chars=50)
+        self.assertEqual(nxt["output"], "A" * 50, "The unread read must continue from the canvas cursor, not from the buffer start!")
+
+    def test_run_history_is_backfilled_into_scrollback_only_once(self):
+        """D7: a cleared canvas must not silently refill from run buffers again."""
+        session, _, _ = self._create_mock_session()
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="history", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "hist.log")
+        )
+        r1.append_output("RUN-1-HISTORY")
+        r1.mark_done("completed", completion_method="prompt_detected")
+        session.last_run_id = 1
+
+        first = session.read_canvas(limit=10)
+        self.assertIn("RUN-1-HISTORY", first["output"])
+
+        session.scrollback.clear()
+        session.scrollback_cursor = 0
+        second = session.read_canvas(limit=10)
+        self.assertEqual(second["output"], "", "Run buffers must be backfilled exactly once (D7)!")
+
+    def test_finalize_scrollback_flushes_held_tail_once(self):
+        """D8/F10: the tab-stream cleaner is finalized when the session ends."""
+        session, _, _ = self._create_mock_session()
+        session.append_scrollback("abc\r")
+        self.assertEqual(session.read_canvas(offset=0, limit=10)["output"], "abc")
+
+        session._finalize_scrollback()
+        self.assertEqual(session.read_canvas(offset=0, limit=10)["output"], "abc\n")
+
+        session._finalize_scrollback()
+        self.assertEqual(session.read_canvas(offset=0, limit=10)["output"], "abc\n", "finalize must be idempotent!")
+
+    def test_pending_stdin_limit_refuses_unbounded_growth(self):
+        """F5: buffered stdin without press_enter must not grow forever."""
+        session, _, _ = self._create_mock_session()
+        session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cat", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "stdin.log")
+        )
+        session.active_run_id = 1
+
+        res = session.send_signal("stdin", "x" * 70000, press_enter=False)
+        self.assertFalse(res["success"])
+        self.assertIn("65536", res["error"])
+        self.assertEqual(session._pending_stdin, "", "A refused buffer must be dropped, not kept")
+
+    def test_cancellation_identity_race_with_handoff_lock(self):
+        """§5.1: cancel_run_for_request must not interrupt newer run if old run finished before lock."""
+        session, _, mock_channel = self._create_mock_session()
+        r1 = session.runs[1] = RunState(
+            run_id=1, session_id=session.id, command="cmd1", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r1.log"),
+            req_id="req_1"
+        )
+        session.inflight_by_req["req_1"] = 1
+        session.active_run_id = 1
+
+        r2 = session.runs[2] = RunState(
+            run_id=2, session_id=session.id, command="cmd2", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r2.log"),
+            req_id="req_2"
+        )
+        mock_exec_channel = MagicMock()
+        mock_exec_channel.closed = False
+        r2.exec_channel = mock_exec_channel
+
+        # Simulate race: right after cancel_run_for_request checks req_1 / run 1,
+        # but before send_signal delivers the signal, run 1 finishes and run 2 becomes active.
+        orig_ensure_alive = session.ensure_alive
+        def race_trigger(*args, **kwargs):
+            r1.mark_done("completed")
+            session.active_run_id = 2
+            return orig_ensure_alive(*args, **kwargs)
+
+        with patch.object(session, "ensure_alive", side_effect=race_trigger):
+            cancel_res = session.cancel_run_for_request("req_1")
+
+        self.assertFalse(r2.done_event.is_set(), "Run 2 must NOT be marked done by late cancellation of req_1!")
+        self.assertFalse(mock_exec_channel.close.called, "Run 2 exec channel must NOT be closed!")
+
+    def test_interactive_prompt_abort_invalidates_pty(self):
+        """§5.7: Aborting on interactive prompt (Password:) must invalidate the PTY."""
+        session, _, mock_channel = self._create_mock_session()
+        session.in_shell = True
+        run = RunState(
+            run_id=10, session_id=session.id, command="sudo su", mode="sync",
+            started_at=time.time() - 2.0, wait_timeout=5.0, startup_wait=0.1, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "r10.log")
+        )
+        run.completion_hint = "either"
+        run.quiet_complete_timeout = 0.1
+        run.append_output("Password: ")
+        run.last_data_at = time.time() - 1.0  # quiet after output
+        session.runs[10] = run
+        session.active_run_id = 10
+
+        # Run reader loop step for interactive check
+        # Mock channel.recv_ready as False
+        mock_channel.recv_ready.return_value = False
+
+        # The reader loop must finish on its own: no data + quiet timeout => interactive abort.
+        # A bounded join proves it terminates; no time.sleep side effect is needed to break out.
+        reader = threading.Thread(target=session._reader_loop, args=(run,), daemon=True)
+        reader.start()
+        reader.join(timeout=5.0)
+        self.assertFalse(reader.is_alive(), "reader loop must terminate after the interactive abort")
+
+        self.assertEqual(run.status, "failed")
+        self.assertEqual(run.finish_reason, "interactive_prompt_detected")
+        self.assertTrue(session._pty_invalidated, "PTY must be invalidated when interactive prompt is aborted!")
+        self.assertFalse(session.is_alive())
+        self.assertEqual(session.get_mode(), "unknown")
+
+    def test_append_output_updates_accounting_for_partial_escape_or_cr(self):
+        """F3: append_output must update total_received_chars and clear quiet_event even if cleaned is empty."""
+        run = RunState(
+            run_id=1, session_id=1, command="cmd", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "rf3.log")
+        )
+        run.quiet_event.set()
+        run.last_data_at = time.time() - 5.0
+        stale_timestamp = run.last_data_at
+
+        # Feed incomplete escape sequence "\x1b["
+        run.append_output("\x1b[")
+        self.assertEqual(run.total_received_chars, 2, "total_received_chars must increase by raw chunk length!")
+        self.assertFalse(run.quiet_event.is_set(), "quiet_event must be cleared!")
+        self.assertGreater(
+            run.last_data_at, stale_timestamp,
+            "last_data_at must be refreshed even when StreamCleaner withholds the partial escape!",
+        )
+        self.assertEqual(len(run._buf), 0, "the incomplete escape must not reach the visible buffer yet")
+
+    def test_session_get_mode_returns_unknown_when_pty_invalidated(self):
+        """F6: get_mode() must return 'unknown' when PTY is invalidated instead of claiming 'ndm_cli'."""
+        session, _, _ = self._create_mock_session()
+        session.in_shell = False
+        self.assertEqual(session.get_mode(), "ndm_cli")
+
+        session.in_shell = True
+        self.assertEqual(session.get_mode(), "linux_shell")
+
+        session._invalidate_pty("test invalidation")
+        self.assertEqual(session.get_mode(), "unknown")
+
+class TestScrollbackEvictionSemantics(unittest.TestCase):
+    """D5/D6 and cover gaps from review #2: eviction must be reported, not hidden."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.cache_dirs = make_cache_dirs(self.test_dir)
+        config.PROJECT_ROOT = self.test_dir
+        config.PROJECT_TAG = "test_project"
+        config.CACHE_DIRS = self.cache_dirs
+        config.READ_ONLY = False
+        config.COMMAND_BLACKLIST = []
+        set_buffer_limit_checkers(lambda size: True, lambda: 0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _run_state(self, max_buffer_chars=100000, log_name="evict.log"):
+        return RunState(
+            run_id=1, session_id=1, command="cmd", mode="sync",
+            started_at=time.time(), wait_timeout=1.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=max_buffer_chars,
+            run_log_path=os.path.join(self.cache_dirs["runs_dir"], log_name)
+        )
+
+    def _mock_session(self):
+        mock_client = MagicMock()
+        mock_channel = MagicMock()
+        mock_client.invoke_shell.return_value = mock_channel
+        mock_channel.recv_ready.return_value = False
+        session = SSHSession(session_id=1, name="evict_session", cache_dirs=self.cache_dirs, project_tag="test_project")
+        session.client = mock_client
+        session.channel = mock_channel
+        session.in_shell = True
+        session.ensure_alive = MagicMock(return_value=None)
+        session.check_health = MagicMock(return_value=True)
+        return session
+
+    def test_discarded_unread_output_is_reported_as_dropped(self):
+        """D5: evicting a run with unread output must admit the loss once.
+
+        The run buffer is only a staging area for the tab canvas. When it is freed
+        before its text ever reached the canvas, the read has to say that unread
+        output was lost instead of quietly starting later."""
+        run = self._run_state()
+        run.append_output("STILL-UNREAD")
+        run.mark_done("completed", completion_method="prompt_detected")
+        with run.lock:
+            run.discard_all_output()
+
+        session = self._mock_session()
+        session.runs[1] = run
+        res = session.read_canvas(limit=0, max_chars=100, wait_timeout=0.0)
+        self.assertTrue(res["dropped_data"], "Unread output dropped by eviction must be reported, not hidden!")
+        self.assertEqual(res["output"], "", "the discarded bytes are gone - no phantom text")
+        # ... and only once: the following read is clean.
+        self.assertFalse(
+            session.read_canvas(limit=0, max_chars=100, wait_timeout=0.0).get("dropped_data"),
+            "the loss must be reported exactly once",
+        )
+
+    def test_dropped_data_is_reported_once(self):
+        """D6: the sticky loss flag must not survive a later valid read."""
+        run = self._run_state(max_buffer_chars=1000, log_name="d6.log")
+        run.append_output("A" * 1000)
+        run.append_output("B" * 500)
+        self.assertEqual(run.buffer_base_offset, 500)
+        self.assertEqual(run.buffer_len, 1000)
+
+        session = self._mock_session()
+        session.runs[1] = run
+        first = session.read_canvas(limit=0, max_chars=10, wait_timeout=0.0)
+        self.assertTrue(first["dropped_data"], "Reading below the retained base must report the eviction!")
+        self.assertEqual(first["output"], "A" * 10)
+        second = session.read_canvas(limit=0, max_chars=10, wait_timeout=0.0)
+        self.assertFalse(second.get("dropped_data"), "A valid read must not repeat a stale drop flag!")
+        self.assertEqual(second["output"], "A" * 10)
+
+    def test_read_canvas_reports_evicted_unread_data(self):
+        """A canvas window that starts below the retained base must admit the loss."""
+        session = self._mock_session()
+        session.append_scrollback("ABCDEFGHIJ")
+        dropped = session.scrollback.drop(6)
+        self.assertEqual(dropped, 6)
+        self.assertEqual(session.scrollback.base_offset, 6)
+        session.scrollback_cursor = 0
+
+        res = session.read_canvas(limit=0, max_chars=100, wait_timeout=0.0)
+        self.assertTrue(res["success"])
+        self.assertTrue(res["dropped_data"], "Evicted scrollback must be reported as dropped_data!")
+        self.assertEqual(res["output"], "GHIJ")
+
+    def test_clean_output_keeps_whitespace_when_strip_is_false(self):
+        """clean_output(strip=False) strips escapes but keeps the surrounding whitespace."""
+        from src.utils import clean_output
+        raw = "  \x1b[31mspaced\x1b[0m  \r\nnext\r\n"
+        self.assertEqual(clean_output(raw), "spaced  \nnext")
+        self.assertEqual(clean_output(raw, strip=False), "  spaced  \nnext\n")
+
+
+class TestReadStateContract(unittest.TestCase):
+    """The read answer reports state, not bookkeeping (contract m01215).
+
+    A read/run answer carries exactly two state fields: has_more - the NUMBER of
+    unread LINES still left in the tab stream (0 = all caught up) - and still_running
+    (the command is still in flight). Positional bookkeeping (next_offset,
+    base_offset, total_chars, total_lines, next_line, limited, next_cursor) must
+    never reach the agent surface: it is plumbing the caller did not ask for.
+    """
+
+    PLUMBING = ("next_offset", "base_offset", "total_chars", "total_lines", "next_line", "limited", "next_cursor")
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.cache_dirs = make_cache_dirs(self.test_dir)
+        config.PROJECT_ROOT = self.test_dir
+        config.PROJECT_TAG = "test_project"
+        config.CACHE_DIRS = self.cache_dirs
+        config.READ_ONLY = False
+        config.COMMAND_BLACKLIST = []
+        set_buffer_limit_checkers(lambda size: True, lambda: 0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _mock_session(self):
+        mock_client = MagicMock()
+        mock_channel = MagicMock()
+        mock_client.invoke_shell.return_value = mock_channel
+        mock_channel.recv_ready.return_value = False
+        session = SSHSession(session_id=1, name="state_session", cache_dirs=self.cache_dirs, project_tag="test_project")
+        session.client = mock_client
+        session.channel = mock_channel
+        session.in_shell = True
+        session.ensure_alive = MagicMock(return_value=None)
+        session.check_health = MagicMock(return_value=True)
+        return session
+
+    def _new_run(self, session, run_id, text="", log_name="state.log"):
+        run = RunState(
+            run_id=run_id, session_id=session.id, command="cmd", mode="sync",
+            started_at=time.time(), wait_timeout=30.0, startup_wait=0.01, hard_timeout=0.0,
+            max_buffer_chars=100000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], log_name)
+        )
+        run.output_buffer = text
+        session.runs[run_id] = run
+        session.active_run_id = run_id
+        return run
+
+    def _assert_state_only(self, res):
+        for key in self.PLUMBING:
+            self.assertNotIn(key, res, "'%s' is bookkeeping and must not be in the answer" % key)
+        unread = res["has_more"]
+        self.assertIsInstance(unread, int, "has_more must be an int of unread LINES")
+        self.assertNotIsInstance(unread, bool, "has_more is a LINE COUNT, not a flag (m01215)")
+        self.assertGreaterEqual(unread, 0, "has_more counts unread lines and never goes negative")
+        self.assertIsInstance(res["still_running"], bool, "still_running must be a plain boolean")
+
+    def test_read_canvas_answer_is_state_only(self):
+        session = self._mock_session()
+        session.append_scrollback("".join("line-%03d\n" % i for i in range(10)))
+
+        res = session.read_canvas(limit=5)
+        self._assert_state_only(res)
+        self.assertEqual(res["has_more"], 5, "5 of 10 lines stay unread")
+        self.assertFalse(res["still_running"], "no command is running")
+
+        rest = session.read_canvas(limit=50)
+        self._assert_state_only(rest)
+        self.assertEqual(rest["has_more"], 0, "nothing is left unread")
+
+    def test_read_canvas_has_more_runs_out_when_everything_is_read(self):
+        session = self._mock_session()
+        text = "".join("row-%03d\n" % i for i in range(100))
+        session.append_scrollback(text)
+
+        collected = []
+        counts = []
+        for _ in range(20):
+            res = session.read_canvas(limit=30)
+            self._assert_state_only(res)
+            collected.append(res["output"])
+            counts.append(res["has_more"])
+            if not res["has_more"]:
+                break
+        else:
+            self.fail("has_more never reached 0 - the loop would read the canvas forever")
+        self.assertEqual("".join(collected), text)
+        self.assertEqual(counts, sorted(counts, reverse=True), "the unread count must only go down")
+        self.assertEqual(counts[-1], 0, "the last read leaves nothing unread")
+
+    def test_read_canvas_peek_does_not_consume_unread(self):
+        session = self._mock_session()
+        text = "".join("row-%03d\n" % i for i in range(20))
+        session.append_scrollback(text)
+
+        first = session.read_canvas(limit=3)
+        self.assertEqual(first["has_more"], 17, "three of twenty lines were consumed")
+
+        # A NEGATIVE offset is the peek: it re-reads lines above the cursor and
+        # leaves the unread backlog untouched (offset=0 would be a rewind).
+        peek = session.read_canvas(offset=-3, limit=2)
+        self._assert_state_only(peek)
+        self.assertEqual(peek["output"].splitlines(), ["row-000", "row-001"])
+        self.assertEqual(peek["has_more"], 17, "a peek must not consume the unread backlog")
+
+        nxt = session.read_canvas(limit=50)
+        self.assertEqual(nxt["output"], "".join("row-%03d\n" % i for i in range(3, 20)),
+                         "the unread read still starts at the cursor")
+
+    def test_read_canvas_tail_leaves_nothing_unread(self):
+        session = self._mock_session()
+        session.append_scrollback("".join("row-%03d\n" % i for i in range(50)))
+
+        res = session.read_canvas(tail=5)
+        self._assert_state_only(res)
+        self.assertEqual(res["output"].count("\n"), 5)
+        self.assertEqual(res["has_more"], 0, "the cursor jumped to the end of the buffer")
+        self.assertTrue(res.get("dropped_data"), "skipped unread output must be admitted")
+
+    def test_read_answer_is_state_only_and_tracks_completion(self):
+        session = self._mock_session()
+        run = self._new_run(session, 11, text="one\ntwo\n")
+
+        first = session.read_canvas(limit=100, max_chars=4, wait_timeout=0)
+        self._assert_state_only(first)
+        self.assertEqual(first["output"], "one\n")
+        self.assertEqual(first["has_more"], 1, "the second line is still unread")
+        self.assertTrue(first["still_running"], "the command has not finished")
+
+        rest = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0)
+        self._assert_state_only(rest)
+        self.assertEqual(rest["output"], "two\n")
+        self.assertEqual(rest["has_more"], 0, "everything buffered was handed back")
+        self.assertTrue(rest["still_running"])
+
+        run.exit_status = 0
+        run.mark_done("completed", completion_method="prompt_detected")
+        final = session.read_canvas(limit=100, max_chars=1000, wait_timeout=0)
+        self._assert_state_only(final)
+        self.assertFalse(final["still_running"], "a finished command is not running")
+        self.assertEqual(final["status"], "completed")
+
+    def test_run_tool_answer_is_state_only(self):
+        """The run tool answers with the same two flags - no paging bookkeeping."""
+        session = self._mock_session()
+
+        def fill(run):
+            run.append_output("first line\nsecond line\n")
+
+        session._start_reader_thread = fill
+        res = session.run_command(
+            command="seq 1 2", mode="sync", shell=True,
+            wait_timeout=0.05, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.5,
+            max_chars=6,
+        )
+        self._assert_state_only(res)
+        self.assertEqual(res["output"], "first ")
+        self.assertEqual(res["has_more"], 2, "the window was cut - two lines remain unread")
+        self.assertTrue(res["still_running"], "the run was never completed")
+
+    def test_read_page_and_peek_answers_are_state_only(self):
+        session = self._mock_session()
+        session.append_scrollback("first\nsecond\n")
+
+        page = session.read_canvas(limit=1, max_chars=1000)
+        self._assert_state_only(page)
+        self.assertEqual(page["output"], "first\n")
+        self.assertEqual(page["has_more"], 1, "one unread line is left")
+
+        peek = session.read_canvas(offset=-1, limit=1, max_chars=1000)
+        self._assert_state_only(peek)
+        self.assertEqual(peek["output"], "first\n", "the peek re-reads above the cursor")
+        self.assertEqual(peek["has_more"], 1, "a peek consumes nothing")
+
+        full = session.read_canvas(limit=100, max_chars=1000)
+        self._assert_state_only(full)
+        self.assertEqual(full["output"], "second\n")
+        self.assertEqual(full["has_more"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

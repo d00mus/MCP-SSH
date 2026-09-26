@@ -1,18 +1,16 @@
 import os
 import re
 import json
+import math
 import time
 import threading
 from typing import Any, Dict, Optional
 from src.config import (
     DEFAULT_WAIT_TIMEOUT, DEFAULT_STARTUP_WAIT, DEFAULT_HARD_TIMEOUT,
     DEFAULT_QUIET_COMPLETE_TIMEOUT, DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_CHARS,
-    MAX_READ_MAX_CHARS, MAX_SERVERS, config
+    MAX_SERVERS, config
 )
-from src.utils import (
-    log_error, to_bool, clamp_int, iso_now,
-    resolve_local_path, apply_text_filters, clean_output
-)
+from src.utils import log_error, to_bool
 from src.fs import file_dispatch
 
 def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -28,7 +26,10 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     projected = {}
     
     if not success:
-        # For MCP-level errors (not command errors)
+        # For MCP-level errors (not command errors). in_shell/mode are kept
+        # because they matter most exactly here: the agent is confused about
+        # which interpreter it is in (e.g. _exit_shell отказ), and the hint
+        # recipe (new_session=true + shell=false vs shell=true) keys off them.
         projected["error"] = result.get("error", "unknown error")
         projected["success"] = False
         if result.get("error_code"):
@@ -37,15 +38,36 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
             if result.get(extra):
                 projected[extra] = result[extra]
         if session_id is not None: projected["session_id"] = session_id
+        for extra in ("in_shell", "mode", "status", "completion_method"):
+            if result.get(extra) is not None and result.get(extra) != "":
+                projected[extra] = result[extra]
+        # run_id is internal-only (session tabs): never on the agent surface,
+        # even on errors - paging is read(session_id).
         return projected
 
     # If we are here, success is True.
-    # Command might have failed (status="failed") or session died (status="dead").
-    
+    # Only transport/tool failures (status="failed"/"dead") are errors. A normal
+    # non-zero process exit (status="completed_nonzero") is a valid result.
     exit_status = result.get("exit_status")
-    is_failed = (status in {"failed", "dead"} or status == "completed_nonzero" or (exit_status is not None and exit_status != 0))
-    
+    # MCP framing: only transport/tool failures are errors. A normal process
+    # exit with a non-zero code (grep/test/ipset/diff -> 1) is a valid result,
+    # reported via status="completed_nonzero" + exit_status, not via "error".
+    is_failed = (status in {"failed", "dead"})
+
     # 1. Output/Error (First field)
+    # A2: hard_timeout frames as isError at the JSON-RPC layer (handle_request)
+    # but arrives here with success=True, so synthesize a one-line diagnosis -
+    # otherwise the agent gets isError:true with no error text at all.
+    if status == "hard_timeout" and not is_failed:
+        projected["error"] = result.get("error") or (
+            f"Command hit hard timeout ({result.get('hard_timeout', 'see hard_timeout param')}s) and was interrupted; "
+            "partial output kept - re-run with a bigger hard_timeout or in background."
+        )
+        projected["output"] = result.get("output", "")
+        if result.get("hint"):
+            projected["hint"] = result["hint"]
+        if result.get("error_code"):
+            projected["error_code"] = result["error_code"]
     if is_failed:
         # T3.3/F9: never invent an exit code ("exit status 1" for an unknown code was
         # a lie) and never wrap output in decorative banners - one honest error line
@@ -98,6 +120,8 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
                     projected["line_end"] = result["line_end"]
                 if "total_lines" in result:
                     projected["total_lines"] = result["total_lines"]
+                if "next_offset_line" in result:
+                    projected["next_offset_line"] = result["next_offset_line"]
                 if "truncated" in result:
                     projected["truncated"] = result["truncated"]
         elif action in {"write", "edit"}:
@@ -118,6 +142,8 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
             projected["servers"] = result.get("servers", [])
         if "reload" in result:
             projected["reload"] = result.get("reload")
+        if "reload_error" in result:
+            projected["reload_error"] = result.get("reload_error")
         if "message" in result:
             projected["message"] = result.get("message")
     elif tool_name == "session_list":
@@ -131,6 +157,21 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
     # 2. Server & IDs
     if "server" in result and result["server"]:
         projected["server"] = result["server"]
+    # run_id is internal (one session = one terminal tab, sequential runs). It is
+    # deliberately stripped from the agent surface: paging is session-level via
+    # read(session_id). Internal callers/tests still use it.
+    if tool_name in {"run", "read"} and "completion_method" in result and result["completion_method"]:
+        projected["completion_method"] = result["completion_method"]
+    # A1: in_shell/mode belong to the session (run/read) surface only. The file
+    # tool reuses "mode" for its own discriminator (download/binary_hidden), so
+    # it must never be overwritten here. Prefer a ready result["mode"], derive
+    # from in_shell only as fallback.
+    if tool_name in {"run", "read"} and "in_shell" in result and result["in_shell"] is not None:
+        projected["in_shell"] = result["in_shell"]
+        if result.get("mode") in ("linux_shell", "ndm_cli"):
+            projected["mode"] = result["mode"]
+        else:
+            projected["mode"] = "linux_shell" if result["in_shell"] else "ndm_cli"
     if session_id is not None:
         projected["session_id"] = session_id
         if "session_name" in result:
@@ -141,24 +182,24 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
         projected["status"] = status
     
     # Add extra useful fields for some tools if they exist
-    if tool_name in {"read", "run"} and "next_offset" in result:
-        projected["next_offset"] = result["next_offset"]
+    if tool_name in {"read", "run"} and "has_more" in result:
+        # has_more is the number of unread LINES left in the tab stream (m01215),
+        # never a boolean: 0 means the caller has seen everything so far.
+        unread = result["has_more"]
+        projected["has_more"] = unread if isinstance(unread, bool) else int(unread or 0)
+        if unread:
+            projected.setdefault("hint", "unread output remains - read again with read(session_id)")
     if tool_name in {"run", "read"} and "still_running" in result:
         projected["still_running"] = result["still_running"]
-    if result.get("limited"):
-        projected["limited"] = True
-        projected.setdefault("hint", "output truncated - page with offset/next_offset or raise max_chars")
-    if "total_chars" in result:
-        projected["total_chars"] = result["total_chars"]
+    if result.get("dropped_data"):
+        projected["dropped_data"] = True
     
     if "exit_status" in result and result["exit_status"] is not None:
         projected["exit_status"] = result["exit_status"]
-    if "bytes_written" in result:
-        projected["bytes_written"] = result["bytes_written"]
-    if "bytes_sent" in result:
-        projected["bytes_sent"] = result["bytes_sent"]
     if result.get("filtered"):
         projected["matched_lines"] = result.get("matched_lines")
+    if result.get("unconfirmed_completion"):
+        projected["unconfirmed_completion"] = True
     
     return projected
 
@@ -173,7 +214,6 @@ def make_response(req_id: Any, result: Dict[str, Any], is_error: bool = False) -
 
 # Everyday tool surface (T3.2/F10). Admin/diagnostic tools ship only in 'full'.
 LEAN_TOOLS = {"server_list", "run", "read", "signal", "file", "session_close"}
-ADMIN_TOOLS = {"server_add", "session_update", "last_command_details"}
 
 
 def tools_list() -> Dict[str, Any]:
@@ -195,6 +235,7 @@ def tools_list() -> Dict[str, Any]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "server": server_param,
                     "reload": {"type": "boolean"}
                 },
             },
@@ -264,7 +305,8 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "session_list",
             "description": (
-                "List active sessions (id, status) across servers; filter with 'server'. "
+                "List active sessions (id, status, in_shell/mode) across servers; filter with 'server'. "
+                "mode is linux_shell (shell:true or entered via 'shell') or ndm_cli (native Keenetic CLI). "
                 "Rarely needed: run() reports session_id and reuses idle sessions."
             ),
             "inputSchema": {
@@ -307,24 +349,29 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "run",
             "description": (
-                "Run a command on a server. Output returns directly when it finishes within "
-                "wait_timeout (default 5s) - call 'read' only when still_running=true. Without "
-                "session_id an idle session is reused with UNKNOWN state (pwd/env); pass session_id "
-                "to preserve state, or new_session=true for a clean shell - "
-                "one terminal runs one command at a time."
+                "Run a command in a session tab (one command at a time). "
+                "The first max_lines (default 200) lines come back when it finishes within "
+                "wait_timeout (default 5s); the rest stays in the tab stream, counted by has_more - "
+                "continue with read(session_id). "
+                "Call 'read' only when still_running=true or status=stalled (quiet idle, "
+                "unconfirmed_completion=true). Without session_id an idle session is reused with "
+                "UNKNOWN state (pwd/env); pass session_id to preserve state, or new_session=true "
+                "for a clean shell."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "server": server_param,
-                    "command": {"type": "string", "description": "Command to run (filter with | grep, | head)."},
+                    "command": {"type": "string", "description": "Command to run (filter with | grep, | head). Non-zero exit (grep/ipset test/diff -> 1) is a normal result with status completed_nonzero, not a tool error."},
                     "session_id": session_id_param,
                     "wait_timeout": {"type": "number", "description": "Seconds to wait for output (default 5; 0=async)."},
                     "hard_timeout": {"type": "number", "description": "Interrupt after N seconds (0=off)."},
-                    "shell": {"type": "boolean", "description": "true=Linux shell, false=NDM CLI; omit=auto."},
+                    "shell": {"type": "boolean", "description": "true=Linux shell, false=NDM CLI; omit=auto. Do NOT call ndmc from a Linux shell while an NDM CLI session holds the configurator (0xcffd0062) - run NDM commands with shell=false instead."},
                     "new_session": {"type": "boolean", "description": "Force opening a clean session with default state."},
                     "session_name": {"type": "string"},
-                    "use_pty": {"type": "boolean", "description": "true (default); false for multiline scripts."},
+                    "use_pty": {"type": "boolean", "description": "true (default, supports heredoc/stdin via signal); false=exec channel for single commands only (stdin is closed, no heredoc)."},
+                    "max_chars": {"type": "number", "description": "Max output chars returned inline (default 8192, max 200000). Raise for long outputs like show running-config."},
+                    "max_lines": {"type": "number", "description": "Max output lines returned inline (default 200, max 5000; 0=all lines). Anything beyond it stays in the tab stream and is counted by has_more - continue with read(session_id)."},
                 },
                 "required": ["command"],
             },
@@ -332,19 +379,28 @@ def tools_list() -> Dict[str, Any]:
         {
             "name": "read",
             "description": (
-                "Read terminal output/history. Use after run returns still_running=true (it waits "
-                "up to wait_timeout), or to page: offset 0 rewinds to the start, negative = tail. "
-                "Do NOT call after a completed run - its output already came back."
+                "Read the session tab's unread output. run and read page over ONE stream (the tab "
+                "scrollback canvas) with one line-based cursor, so output is never delivered twice. "
+                "A plain read(session_id) returns the next unread lines up to limit (default 200) and advances "
+                "the cursor; tail=N returns the last N lines and moves the cursor to the end of the stream; "
+                "offset peeks session history without moving the unread cursor: offset>=0 reads from that line forward (offset=0 = the very beginning of "
+                "the buffered history); offset<0 peeks limit lines starting that many lines ABOVE the cursor. "
+                "wait_timeout blocks only while the stream is silent - output already buffered comes back at once. "
+                "Returns output plus has_more - the NUMBER of unread LINES still left (0 = all caught up; read "
+                "again to continue) - and still_running (true while a command is in flight); plus status, mode "
+                "and, when relevant, dropped_data, exit_status and a hint."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "server": server_param,
                     "session_id": session_id_param,
-                    "wait_timeout": {"type": "number", "description": "Max seconds to wait for running command to finish (default 5.0). Set 0 for instant non-blocking read."},
-                    "offset": {"type": "number", "description": "0=rewind, negative=tail, else next_offset."},
-                    "max_lines": {"type": "number"},
-                    "max_chars": {"type": "number"},
+                    "limit": {"type": "integer", "description": "Max lines to return (default 200, max 5000; 0=all lines up to max_chars). Not combined with tail."},
+                    "tail": {"type": "integer", "description": "Return the last N lines and move the cursor to the end of the stream; unread lines skipped on the way are reported as dropped_data."},
+                    "offset": {"type": "number", "description": "LINE number in the tab stream (the only unit offsets use). Any offset is a non-consuming peek: inspects history without moving the unread cursor. offset>=0 reads from that line forward (0=the very first line of history). offset<0 peeks: limit lines starting that many lines ABOVE the cursor. Omit for normal paging through unread output."},
+                    "wait_timeout": {"type": "number", "description": "Max seconds to wait for a running command to finish or produce output (default 5.0). Blocks only while the stream is silent; set 0 for an instant non-blocking read."},
+                    "max_lines": {"type": "number", "description": "Line cap for this window; used when limit is absent."},
+                    "max_chars": {"type": "number", "description": "Max output chars returned inline (default 8192, up to 200000). A truncated window is reported through has_more and a hint."},
                 },
             },
         },
@@ -391,7 +447,12 @@ def tools_list() -> Dict[str, Any]:
                     "content": {"type": "string"},
                     "is_base64": {"type": "boolean"},
                     "max_bytes": {"type": "number"},
+                    "offset_line": {"type": "number", "description": "1-based line number to start reading from (pagination)."},
+                    "limit_lines": {"type": "number", "description": "Max lines to return (default 200)."},
+                    "max_chars": {"type": "number", "description": "Max characters to return before eliding middle lines."},
                     "edits": {"type": "array", "description": "edit: [{old_text,new_text,replace_all}]."},
+                    "dry_run": {"type": "boolean", "description": "For edit: preview diff without applying changes."},
+                    "create_backup": {"type": "boolean", "description": "For edit: create a private .mcp.bak copy."},
                     "expected_sha256": {
                         "type": "string",
                         "description": "sha256 as read; conflict if changed.",
@@ -454,8 +515,15 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
     background = to_bool(args.get("background", False))
     use_pty = to_bool(args.get("use_pty", True))
+    run_max_chars = args.get("max_chars", DEFAULT_READ_MAX_CHARS)
+    run_max_lines = args.get("max_lines", DEFAULT_READ_MAX_LINES)
+    try: run_max_chars = int(run_max_chars)
+    except (ValueError, TypeError): run_max_chars = DEFAULT_READ_MAX_CHARS
+    try: run_max_lines = int(run_max_lines)
+    except (ValueError, TypeError): run_max_lines = DEFAULT_READ_MAX_LINES
     # Internal knobs are deliberately not agent-facing (T3.1): fixed sane defaults
     # here; the file tool reaches the full run_command surface internally.
+    # max_chars/max_lines ARE agent-facing: they only size the inline slice.
     mode = "sync"
     startup_wait = DEFAULT_STARTUP_WAIT
     completion_hint = "either"
@@ -476,7 +544,7 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
         if session is None:
             return {
                 "success": False,
-                "error": f"Session {target_sid} not found on server '{target_manager.alias}'. Use 'run' without session_id to open a new session, or check active sessions with 'session_list'.",
+                "error": f"Session {target_sid} not found on server '{target_manager.alias}'. Use 'run' without session_id to open a new session, or check active sessions with 'server_list' / 'session_list'.",
                 "server": target_manager.alias
             }
         alive_error = session.ensure_alive() if callable(getattr(session, "ensure_alive", None)) else None
@@ -531,6 +599,7 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
         command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
         startup_wait=startup_wait, hard_timeout=hard_timeout,
         completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
+        max_chars=run_max_chars, max_lines=run_max_lines,
         background=background, use_pty=use_pty, req_id=req_id
     )
 
@@ -545,6 +614,7 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
                     command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
                     startup_wait=startup_wait, hard_timeout=hard_timeout,
                     completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
+                    max_chars=run_max_chars, max_lines=run_max_lines,
                     background=background, use_pty=use_pty, req_id=req_id
                 )
                 result = retry_result
@@ -570,13 +640,38 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
             )
     return result
 
+def coerce_int_arg(value: Any) -> Optional[int]:
+    """Coerce a JSON number or numeric string to int.
+
+    Plain int() truncates toward zero, so offset=-0.5 silently became 0 (a jump to
+    the start of the buffer instead of one line back). Negative floats are floored
+    here; anything non-numeric yields None for the caller to reject (review R9)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return math.floor(value) if value < 0 else int(value)
+    if isinstance(value, str):
+        try:
+            return coerce_int_arg(float(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
 def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     node, numeric_sid, _, err_resp = manager.resolve_target_for_args(args)
     if err_resp:
         return err_resp
 
-    run_id = args.get("run_id")
+    # Everything is session-level (m01215): run and read page over the tab canvas
+    # through one line-based cursor, so there is no run selector on this surface.
     offset = args.get("offset")
+    limit = args.get("limit")
+    tail = args.get("tail")
     max_lines = args.get("max_lines", DEFAULT_READ_MAX_LINES)
     max_chars = args.get("max_chars", DEFAULT_READ_MAX_CHARS)
     wait_timeout = args.get("wait_timeout", DEFAULT_WAIT_TIMEOUT)
@@ -585,11 +680,33 @@ def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         except (ValueError, TypeError): wait_timeout = DEFAULT_WAIT_TIMEOUT
 
     if offset is not None:
-        try: offset = int(offset)
-        except (ValueError, TypeError): return {"success": False, "error": "offset must be number"}
-    if run_id is not None:
-        try: run_id = int(run_id)
-        except (ValueError, TypeError): return {"success": False, "error": "run_id must be number"}
+        offset = coerce_int_arg(offset)
+        if offset is None: return {"success": False, "error": "offset must be number"}
+    if limit is not None:
+        limit = coerce_int_arg(limit)
+        if limit is None: return {"success": False, "error": "limit must be number"}
+    if tail is not None:
+        tail = coerce_int_arg(tail)
+        if tail is None: return {"success": False, "error": "tail must be number"}
+    if max_lines is not None:
+        max_lines = coerce_int_arg(max_lines)
+        if max_lines is None: return {"success": False, "error": "max_lines must be number"}
+    if max_chars is not None:
+        max_chars = coerce_int_arg(max_chars)
+        if max_chars is None: return {"success": False, "error": "max_chars must be number"}
+    if args.get("run_id") is not None:
+        return {
+            "success": False,
+            "error": "The 'run_id' parameter was removed - run and read page over one unread stream: read(session_id) continues it",
+        }
+    if args.get("cursor") is not None:
+        # Opaque continuation tokens went away with the bookkeeping fields they were
+        # minted from (review m01029): the unread position is server-side, so a plain
+        # read again is all the continuation a caller needs.
+        return {
+            "success": False,
+            "error": "The 'cursor' parameter was removed - read again with read(session_id) to continue with unread output",
+        }
 
     target_manager = node
     session = target_manager.get_session(numeric_sid)
@@ -605,7 +722,16 @@ def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         else:
             return {"success": False, "error": f"Multiple sessions exist on server '{target_manager.alias}'. Please specify 'session_id'.", "server": target_manager.alias}
 
-    return session.read_run(run_id=run_id, offset=offset, max_lines=max_lines, max_chars=max_chars, wait_timeout=wait_timeout)
+    effective_limit = limit if limit is not None else max_lines
+    if effective_limit is None:
+        effective_limit = DEFAULT_READ_MAX_LINES
+    return session.read_canvas(
+        limit=effective_limit,
+        tail=tail,
+        offset=offset,
+        wait_timeout=wait_timeout,
+        max_chars=max_chars,
+    )
 
 def signal_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     node, numeric_sid, _, err_resp = manager.resolve_target_for_args(args)
@@ -825,9 +951,13 @@ def server_add_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     }
 
 def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]:
+    if not isinstance(request, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request: request must be an object"}}
+
     method = request.get("method")
     params = request.get("params", {})
-    req_id = request.get("id", 1)
+    has_id = "id" in request
+    req_id = request.get("id")
 
     if isinstance(method, str) and method.startswith("notifications/"):
         # Notifications get no response. Cancellation must actually stop work (T1.4).
@@ -836,15 +966,22 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
             manager.cancel_request(cancel_params.get("requestId"))
         return None
 
+    # Any JSON-RPC request without an id is a notification and expects NO response
+    if not has_id:
+        return None
+
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
     if method == "initialize":
         requested_version = params.get("protocolVersion") if isinstance(params, dict) else None
+        # Supported MCP protocol versions
+        supported_versions = {"2024-11-05"}
+        version = requested_version if requested_version in supported_versions else "2024-11-05"
         return {
             "jsonrpc": "2.0", "id": req_id,
             "result": {
-                "protocolVersion": requested_version if isinstance(requested_version, str) and requested_version else "2024-11-05",
+                "protocolVersion": version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "ssh-mcp-vnext", "version": "6.0.0"},
             },
@@ -866,7 +1003,8 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
         try:
             if tool_name == "server_list":
                 reload_flag = to_bool(args.get("reload", False))
-                result = manager.list_all_servers(reload=reload_flag)
+                server_filter = args.get("server")
+                result = manager.list_all_servers(reload=reload_flag, server_filter=server_filter)
             elif tool_name == "server_add":
                 result = server_add_dispatch(args, manager)
             elif tool_name == "session_list":
@@ -904,11 +1042,12 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
                 manager.record_tool_result(server_alias=server_alias, tool_name=str(tool_name), args=args, result=result)
             projected = project_tool_result(tool_name=str(tool_name), result=result)
             status = result.get("status") if isinstance(result, dict) else None
-            exit_status = result.get("exit_status") if isinstance(result, dict) else None
+            # MCP framing: completed_nonzero / exit_status != 0 is a normal process
+            # result (grep/test/ipset/diff -> 1). isError is reserved for transport
+            # and tool failures: success=false, failed, dead, hard_timeout.
             is_error = (
                 not result.get("success", False)
-                or status in {"failed", "dead", "completed_nonzero", "hard_timeout"}
-                or (exit_status is not None and exit_status != 0)
+                or status in {"failed", "dead", "hard_timeout"}
             )
             return make_response(req_id, projected, is_error=is_error)
         except Exception as exc:

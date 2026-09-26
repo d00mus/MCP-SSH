@@ -34,7 +34,9 @@ class TestServer(unittest.TestCase):
         self.assertEqual(res["error"], "connection timeout")
 
     def test_project_tool_result_completed_nonzero(self):
-        # A known non-zero exit status is reported honestly, output stays raw (T3.3/F9)
+        # A known non-zero exit status is a normal result, not a tool error:
+        # no synthesized "error", honest status + exit_status, raw output kept.
+        # run_id is internal (session tabs only): stripped from the agent surface.
         raw = {
             "success": True,
             "status": "completed_nonzero",
@@ -47,7 +49,8 @@ class TestServer(unittest.TestCase):
         self.assertEqual(res["session_id"], 1)
         self.assertNotIn("run_id", res)
         self.assertEqual(res["status"], "completed_nonzero")
-        self.assertIn("Command failed with exit status 127", res["error"])
+        self.assertNotIn("error", res)
+        self.assertEqual(res["exit_status"], 127)
         self.assertEqual(res["output"], "bash: command not found")
 
     def test_project_tool_result_never_invents_exit_status(self):
@@ -105,7 +108,7 @@ class TestServer(unittest.TestCase):
             "jsonrpc": "2.0",
             "id": 123,
             "method": "initialize",
-            "params": {}
+            "params": {"protocolVersion": "2024-11-05"}
         }
         res = handle_request(req, mock_manager)
         self.assertEqual(res["id"], 123)
@@ -294,12 +297,34 @@ class TestServer(unittest.TestCase):
         self.assertIn("too large", written[0]["error"]["message"])
 
     def test_ping_and_protocol_version(self):
-        """T1.4/F12: ping must answer, initialize must echo the client's protocol version."""
+        """T1.4/F12: ping must answer with request id, initialize must negotiate supported protocol version."""
         resp = handle_request({"jsonrpc": "2.0", "id": 5, "method": "ping"}, MagicMock())
         self.assertEqual(resp["result"], {})
+        self.assertEqual(resp["id"], 5)
+
+        # Ping as notification (no id) must return None (no response)
+        resp_notify = handle_request({"jsonrpc": "2.0", "method": "ping"}, MagicMock())
+        self.assertIsNone(resp_notify, "id-less notification ping must return no response!")
+
+        # Initialize with supported version
         init = handle_request({"jsonrpc": "2.0", "id": 6, "method": "initialize",
-                               "params": {"protocolVersion": "2025-06-18"}}, MagicMock())
-        self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")
+                               "params": {"protocolVersion": "2024-11-05"}}, MagicMock())
+        self.assertEqual(init["result"]["protocolVersion"], "2024-11-05")
+
+        # Initialize with unsupported arbitrary client version negotiates supported default
+        init_unsupported = handle_request({"jsonrpc": "2.0", "id": 7, "method": "initialize",
+                                           "params": {"protocolVersion": "9999-99-99"}}, MagicMock())
+        self.assertEqual(init_unsupported["result"]["protocolVersion"], "2024-11-05")
+
+    def test_invalid_json_rpc_array_gets_invalid_request_id_null(self):
+        """P2: Non-dict request shape gets JSON-RPC -32600 with id: null."""
+        from src.main import process_line
+        captured = []
+        process_line("[]", MagicMock(), write_fn=captured.append)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["jsonrpc"], "2.0")
+        self.assertIsNone(captured[0]["id"])
+        self.assertEqual(captured[0]["error"]["code"], -32600)
 
     def test_cancelled_notification_returns_no_response(self):
         """T1.4/F12: notifications get no response, but cancellation must be forwarded."""
@@ -587,12 +612,15 @@ class TestServer(unittest.TestCase):
         with patch(dispatch_name, return_value=result):
             return handle_request(request, manager)
 
-    def test_dispute_nonzero_and_interrupt_are_mcp_errors(self):
-        for status in ("completed_nonzero", "hard_timeout", "failed", "dead"):
+    def test_dispute_transport_failures_set_mcp_error_flag(self):
+        # completed_nonzero is a normal process result (grep/ipset test/diff -> 1),
+        # not a tool error: isError stays false. Only transport/tool failures
+        # (hard_timeout/failed/dead) set isError.
+        for status in ("hard_timeout", "failed", "dead"):
             response = self._tools_call("run", {"command": "false", "server": "srv"}, {
                 "success": True,
                 "status": status,
-                "exit_status": 1 if status == "completed_nonzero" else None,
+                "exit_status": 1 if status in ("failed", "dead", "hard_timeout") else None,
                 "output": "nope",
                 "session_id": "srv/1",
                 "server": "srv",
@@ -601,7 +629,7 @@ class TestServer(unittest.TestCase):
             body = json.loads(response["result"]["content"][0]["text"])
             self.assertEqual(body.get("status"), status)
             self.assertIn("nope", body.get("output", ""))
-        for status in ("interrupted", "stalled", "running", "completed"):
+        for status in ("interrupted", "stalled", "running", "completed", "completed_nonzero"):
             response = self._tools_call("run", {"command": "true", "server": "srv"}, {
                 "success": True,
                 "status": status,
@@ -728,7 +756,7 @@ class TestServer(unittest.TestCase):
             dead.is_dead = False
             node.sessions[1] = dead
             node.next_session_id = 2
-            with patch.object(SSHSession, "connect", fake_connect), patch.object(SSHSession, "ensure_alive", return_value=None):
+            with patch.object(SSHSession, "connect", fake_connect):
                 recovered = run_dispatch({
                     "server": "rec",
                     "session_id": "rec/1",
@@ -873,8 +901,7 @@ class TestServer(unittest.TestCase):
             "run_id": 1,
             "status": "completed",
             "still_running": False,
-            "limited": True,
-            "next_offset": 48000,
+            "has_more": True,
             "session_id": "box/1",
             "server": "box",
         }
@@ -886,13 +913,11 @@ class TestServer(unittest.TestCase):
         result = run_dispatch({"command": "yes", "session_id": "box/1", "regex": "hit"}, manager)
         self.assertTrue(result["success"], result)
         self.assertLessEqual(len(result["output"]), DEFAULT_READ_MAX_CHARS)
-        self.assertTrue(result["limited"])
-        self.assertEqual(result["next_offset"], 48000)
-        self.assertNotEqual(result["next_offset"], len(result["output"]))
+        self.assertTrue(result["has_more"], "a cut window must advertise unread output")
+        self.assertLess(len(result["output"]), len(page), "the answer is a window, not the whole buffer")
         self.assertNotIn("ONLY_IN_BUFFER", result["output"])
         projected = project_tool_result("run", result)
-        self.assertTrue(projected.get("limited"))
-        self.assertIn("next_offset", projected)
+        self.assertTrue(projected.get("has_more"))
         self.assertIn("still_running", projected)
 
     def test_run_tool_description_and_schema(self):
@@ -901,15 +926,19 @@ class TestServer(unittest.TestCase):
         description = run_tool["description"]
         # T3.1/F10: descriptions stay compact - every char is paid per request
         self.assertLessEqual(len(description), 500, "run description must stay compact for small models")
-        self.assertIn("one terminal runs one command at a time", description)
-        self.assertIn("new_session=true", description)
-        self.assertIn("still_running", description)
+        # Contract, not prose: the schema names the parameters the agent may pass...
         props = run_tool["inputSchema"]["properties"]
+        self.assertEqual(run_tool["inputSchema"]["required"], ["command"])
+        for name in ("session_id", "new_session", "wait_timeout", "hard_timeout", "max_chars", "max_lines"):
+            self.assertIn(name, props, f"run schema must expose '{name}'")
+        self.assertEqual(props["new_session"]["type"], "boolean")
+        self.assertEqual(props["wait_timeout"]["type"], "number")
+        # ...and never leaks internal run handles or removed aliases.
+        self.assertNotIn("run_id", props)
         self.assertNotIn("background", props)
         self.assertNotIn("contains", props)
         self.assertNotIn("regex", props)
         self.assertNotIn("tail_lines", props)
-        self.assertIn("hard_timeout", props)
 
     def test_tool_profile_lean_shows_only_everyday_tools(self):
         """T3.2/F10: the lean catalog keeps small-model prompts small."""
@@ -925,24 +954,79 @@ class TestServer(unittest.TestCase):
         finally:
             cfg.TOOL_PROFILE = previous
 
-    def test_read_and_session_list_schemas_hide_internal_run_ids(self):
+    def test_read_schema_hides_run_id_session_tabs_only(self):
+        # run_id is internal (one session = one terminal tab, sequential runs).
+        # The agent pages the session: read(session_id, limit/tail/offset), one cursor.
         tools = tools_list()["result"]["tools"]
         read_tool = next(tool for tool in tools if tool["name"] == "read")
-        self.assertIn("terminal", read_tool["description"])
-        self.assertIn("0 rewinds", read_tool["description"])
         read_props = read_tool["inputSchema"]["properties"]
         self.assertNotIn("run_id", read_props)
+        self.assertIn("offset", read_props)
+        # Continuation contract: every offset is a LINE number (m01215) - the tab is
+        # ONE stream read through one line-based cursor, so has_more counts lines.
+        self.assertIn("LINE number", read_props["offset"]["description"])
+        self.assertNotIn("CHARACTER offset", read_props["offset"]["description"])
+        self.assertIn("NUMBER of unread LINES", read_tool["description"])
+        # Tab/paging contract lives in the schemas, not in description prose:
+        # run addresses the terminal tab by name, read pages it by limit/tail/offset.
+        run_tool = next(tool for tool in tools if tool["name"] == "run")
+        run_props = run_tool["inputSchema"]["properties"]
+        self.assertIn("session_name", run_props)
+        self.assertNotIn("run_id", run_props)
+        self.assertIn("limit", read_props)
+        self.assertIn("tail", read_props)
+        self.assertNotIn("cursor", read_props, "opaque cursors were removed")
+        self.assertEqual(read_props["limit"]["type"], "integer")
 
         session_list_tool = next(tool for tool in tools if tool["name"] == "session_list")
         session_props = session_list_tool["inputSchema"]["properties"]
         self.assertNotIn("include_active_ids", session_props)
 
-        # Ensure project_tool_result never leaks run_id for read or run
+        # Ensure project_tool_result strips run_id from the agent surface
         raw = {"success": True, "output": "ok", "session_id": "srv/1", "run_id": 42, "status": "completed"}
         projected_read = project_tool_result("read", raw)
         self.assertNotIn("run_id", projected_read)
         projected_run = project_tool_result("run", raw)
         self.assertNotIn("run_id", projected_run)
+
+    def test_lean_server_list_exposes_live_session_ids_and_modes(self):
+        """P1: server_list under lean profile derives active_sessions from the live session state."""
+        import threading
+        from src.manager import MultiServerManager, ServerNode
+
+        cfg = MagicMock(alias="srv1", host="1.2.3.4", port=22, user="root", description="", read_only=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dirs = make_cache_dirs(tmp)
+            # Real ServerNode.list_sessions computes status/mode; only the sessions are fakes.
+            node = ServerNode(cfg, cache_dirs, "test_p")
+            s1 = MagicMock(id=1, is_dead=False, is_alive=lambda: True, is_busy=lambda: False, in_shell=False, _pty_invalidated=False)
+            s1.info.return_value = {"dead": False, "alive": True, "in_shell": False}
+            s2 = MagicMock(id=2, is_dead=False, is_alive=lambda: True, is_busy=lambda: True, in_shell=True, _pty_invalidated=False)
+            s2.info.return_value = {"dead": False, "alive": True, "in_shell": True}
+            s3 = MagicMock(id=3, is_dead=True, is_alive=lambda: False, is_busy=lambda: False, in_shell=False, _pty_invalidated=False)
+            s3.info.return_value = {"dead": True, "alive": False, "in_shell": False}
+            node.sessions = {1: s1, 2: s2, 3: s3}
+            self.assertEqual(
+                [row["status"] for row in node.list_sessions()], ["idle", "busy", "broken"],
+            )
+
+            manager = MagicMock()
+            manager.registry.list_all.return_value = [cfg]
+            manager.registry.find_by_prefix.return_value = [cfg]
+            manager.nodes = {"srv1": node}
+            manager.lock = threading.Lock()
+            manager.check_reload.return_value = {}
+
+            resp = MultiServerManager.list_all_servers(manager, reload=False)
+
+        self.assertTrue(resp["success"])
+        srv_entry = resp["servers"][0]
+        self.assertEqual(srv_entry["sessions"], 3)
+        self.assertIn("active_sessions", srv_entry)
+        # The broken/dead session must be reported in the count but kept out of active_sessions.
+        self.assertEqual(len(srv_entry["active_sessions"]), 2)
+        self.assertEqual(srv_entry["active_sessions"][0], {"session_id": "srv1/1", "status": "idle", "mode": "ndm_cli"})
+        self.assertEqual(srv_entry["active_sessions"][1], {"session_id": "srv1/2", "status": "busy", "mode": "linux_shell"})
 
     def test_shutdown_closes_sessions_before_the_pool(self):
         import src.main as main_mod
@@ -1104,19 +1188,20 @@ class TestServer(unittest.TestCase):
         node.open_session.assert_called_once()
 
     def test_read_dispatch_wait_timeout_passes_to_session(self):
-        """Test that wait_timeout is parsed and passed to session.read_run."""
+        """Test that wait_timeout is parsed and passed to session.read_canvas."""
         node = MagicMock()
         node.alias = "srv1"
         mock_sess = MagicMock()
-        mock_sess.read_run.return_value = {"success": True, "output": "done", "status": "completed"}
+        mock_sess.read_canvas.return_value = {"success": True, "output": "done", "status": "completed"}
         node.get_session.return_value = mock_sess
         manager = MagicMock()
         manager.resolve_target_for_args.return_value = (node, 1, False, None)
 
         res = read_dispatch({"server": "srv1", "session_id": "srv1/1", "wait_timeout": 3.5}, manager)
         self.assertTrue(res["success"])
-        mock_sess.read_run.assert_called_once_with(
-            run_id=None, offset=None, max_lines=200, max_chars=8192, wait_timeout=3.5
+        # One stream, one cursor: the tab canvas is the only read path (m01215).
+        mock_sess.read_canvas.assert_called_once_with(
+            limit=200, tail=None, offset=None, wait_timeout=3.5, max_chars=8192
         )
 
     def test_security_case_insensitive_blacklist_and_readonly(self):
@@ -1188,6 +1273,170 @@ class TestServer(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_project_tool_result_keeps_shell_context_on_error(self):
+        """P1: success=false keeps in_shell/mode/status (exit_shell recipe keys off them)."""
+        raw = {"success": False, "error": "exit stuck", "session_id": "keenetic/1",
+               "in_shell": True, "mode": "linux_shell", "run_id": 3,
+               "status": "failed", "completion_method": "failed"}
+        res = project_tool_result("run", raw)
+        self.assertFalse(res["success"])
+        self.assertTrue(res["in_shell"])
+        self.assertEqual(res["mode"], "linux_shell")
+        self.assertNotIn("run_id", res)
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["completion_method"], "failed")
+
+    def test_project_tool_result_keeps_unconfirmed_completion(self):
+        """P1: stalled uncertainty flag survives the lean projection."""
+        raw = {"success": True, "output": "uptime...", "session_id": "keenetic/1",
+               "run_id": 7, "status": "stalled", "unconfirmed_completion": True,
+               "hint": "No completion marker seen"}
+        res = project_tool_result("run", raw)
+        self.assertEqual(res["status"], "stalled")
+        self.assertTrue(res["unconfirmed_completion"])
+
+    def test_run_schema_max_lines_zero_is_passed_through_unclamped(self):
+        """P4/P7: max_lines=0 means 'no line cap' and must reach the session unclamped."""
+        tools = tools_list()["result"]["tools"]
+        run_tool = next(tool for tool in tools if tool["name"] == "run")
+        run_props = run_tool["inputSchema"]["properties"]
+        self.assertIn("max_lines", run_props)
+        self.assertEqual(run_props["max_lines"]["type"], "number")
+        self.assertNotIn("run_id", run_props)
+        read_tool = next(tool for tool in tools if tool["name"] == "read")
+        offset_desc = read_tool["inputSchema"]["properties"]["offset"]["description"]
+        self.assertIn("LINE number", offset_desc)
+        self.assertNotIn("CHARACTER offset", offset_desc, "offsets are always line numbers now")
+        self.assertIn("scrollback", read_tool["description"])
+        self.assertNotIn("run_id", read_tool["inputSchema"]["properties"])
+
+        # Behavioural pin: an explicit 0 must not be replaced by the default page cap.
+        node = MagicMock()
+        node.alias = "srv1"
+        mock_sess = MagicMock()
+        mock_sess.ensure_alive.return_value = None
+        mock_sess.is_dead = False
+        mock_sess.is_busy.return_value = False
+        mock_sess.run_command.return_value = {
+            "success": True, "output": "all lines", "status": "completed", "session_id": "srv1/1",
+        }
+        node.get_session.return_value = mock_sess
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, 1, False, None)
+
+        res = run_dispatch({"server": "srv1", "command": "cat big", "max_lines": 0}, manager)
+        self.assertTrue(res["success"], res)
+        self.assertEqual(mock_sess.run_command.call_args.kwargs["max_lines"], 0)
+
+    def test_project_tool_result_hard_timeout_has_error_text(self):
+        """A2: hard_timeout isError=true must carry an error line, not an empty shell."""
+        raw = {"success": True, "status": "hard_timeout", "output": "partial...",
+               "session_id": "srv/1", "server": "srv"}
+        res = project_tool_result("run", raw)
+        self.assertIn("error", res)
+        self.assertIn("hard timeout", res["error"].lower())
+        self.assertIn("partial...", res.get("output", ""))
+
+    def test_project_tool_result_file_mode_survives(self):
+        """A1: the file tool's own mode (binary_hidden/download) is never overwritten."""
+        raw = {"success": True, "action": "read", "mode": "binary_hidden",
+               "message": "File is binary. Content hidden.", "size": 10,
+               "sha256": "abc", "in_shell": True}
+        res = project_tool_result("file", raw)
+        self.assertEqual(res.get("mode"), "binary_hidden")
+
+    def test_completed_nonzero_exit_one_is_not_mcp_error_and_hard_timeout_is(self):
+        """P0: exit status 1 (completed_nonzero) is a normal completed result, not MCP error."""
+        raw_exit_1 = {
+            "success": True, "output": "file not found", "session_id": "srv/1",
+            "server": "srv", "status": "completed_nonzero", "exit_status": 1
+        }
+        res_exit_1 = project_tool_result("run", raw_exit_1)
+        self.assertEqual(res_exit_1["status"], "completed_nonzero")
+        self.assertEqual(res_exit_1["exit_status"], 1)
+        self.assertNotIn("error", res_exit_1)
+
+        raw_timeout = {
+            "success": True, "output": "partial", "session_id": "srv/1",
+            "server": "srv", "status": "hard_timeout"
+        }
+        res_timeout = project_tool_result("run", raw_timeout)
+        self.assertIn("error", res_timeout)
+        self.assertNotIn("in_shell", res_timeout)
+
+    def test_completed_zero_exit_is_protected(self):
+        """A8: success=True + completed + exit_status=1 stays a normal result (intent lock)."""
+        res = project_tool_result("run", {
+            "success": True, "status": "completed", "exit_status": 1,
+            "output": "x", "session_id": "srv/1", "server": "srv",
+        })
+        self.assertNotIn("error", res)
+        self.assertEqual(res.get("exit_status"), 1)
+        self.assertEqual(res.get("status"), "completed")
+
+    def test_run_schema_has_no_run_id(self):
+        """Agent surface: run takes no run_id; paging is session-level."""
+        tools = tools_list()["result"]["tools"]
+        run_tool = next(tool for tool in tools if tool["name"] == "run")
+        self.assertNotIn("run_id", run_tool["inputSchema"]["properties"])
+
+    def test_read_dispatch_rejects_removed_cursor_parameter(self):
+        """Opaque cursors are gone: read(session_id) continues with unread output instead."""
+        node = MagicMock()
+        node.alias = "srv1"
+        node.get_session.return_value = MagicMock()
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, 1, False, None)
+
+        res = read_dispatch({"cursor": "abc123"}, manager)
+        self.assertFalse(res["success"])
+        self.assertIn("cursor", res["error"])
+        self.assertIn("read again", res["error"])
+        node.get_session.assert_not_called()
+
+    def test_read_projection_reports_state_not_bookkeeping(self):
+        """The agent surface carries has_more/still_running, never offsets or cursors."""
+        raw = {
+            "success": True, "status": "running", "output": "tail -f output",
+            "session_id": "srv/1", "server": "srv",
+            "has_more": True, "still_running": True,
+            "next_offset": 10, "base_offset": 0, "total_chars": 100, "total_lines": 5,
+            "next_line": 2, "limited": True, "next_cursor": "b3BhcXVl",
+        }
+        res = project_tool_result("read", raw)
+        for key in ("next_offset", "base_offset", "total_chars", "total_lines", "next_line", "limited", "next_cursor"):
+            self.assertNotIn(key, res, "'%s' must not reach the agent surface" % key)
+        self.assertIs(res["has_more"], True)
+        self.assertIs(res["still_running"], True)
+        self.assertEqual(res["output"], "tail -f output")
+
+    def test_read_schema_documents_state_and_has_no_cursor(self):
+        """The schema must describe the two state flags instead of the removed paging fields."""
+        tools = tools_list()["result"]["tools"]
+        read_tool = next(tool for tool in tools if tool["name"] == "read")
+        props = read_tool["inputSchema"]["properties"]
+        self.assertNotIn("cursor", props, "the opaque cursor input is gone")
+        self.assertIn("limit", props)
+        self.assertIn("tail", props)
+        self.assertIn("offset", props)
+        desc = read_tool["description"]
+        self.assertIn("has_more", desc)
+        self.assertIn("still_running", desc)
+        for gone in ("next_offset", "next_line", "next_cursor", "total_chars", "total_lines", "limited"):
+            self.assertNotIn(gone, desc, "the schema still advertises the removed field '%s'" % gone)
+
+    def test_coerce_int_arg_normalises_numbers(self):
+        """R9: -0.5 floors to -1, 0.5 truncates to 0, bools/NaN/Inf are rejected as None."""
+        from src.server import coerce_int_arg
+        self.assertEqual(coerce_int_arg(-0.5), -1)
+        self.assertEqual(coerce_int_arg(0.5), 0)
+        self.assertEqual(coerce_int_arg("5"), 5)
+        self.assertEqual(coerce_int_arg(" -3 "), -3)
+        self.assertIsNone(coerce_int_arg(True))
+        self.assertIsNone(coerce_int_arg("abc"))
+        self.assertIsNone(coerce_int_arg(float("nan")))
+        self.assertIsNone(coerce_int_arg(float("inf")))
 
 if __name__ == "__main__":
     unittest.main()

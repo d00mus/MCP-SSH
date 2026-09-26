@@ -17,7 +17,7 @@ import codecs
 import re
 import glob
 from datetime import datetime
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 import paramiko
 
 from src.config import (
@@ -25,16 +25,17 @@ from src.config import (
     DEFAULT_WAIT_TIMEOUT, MAX_WAIT_TIMEOUT, DEFAULT_STARTUP_WAIT, MAX_STARTUP_WAIT,
     DEFAULT_HARD_TIMEOUT, MAX_HARD_TIMEOUT, MAX_BUFFER_CHARS,
     DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_CHARS, MAX_READ_MAX_LINES, MAX_READ_MAX_CHARS,
-    DEFAULT_QUIET_COMPLETE_TIMEOUT, MAX_QUIET_COMPLETE_TIMEOUT, MAX_DOWNLOAD_BYTES,
-    config, DEFAULT_PATH,
+    DEFAULT_QUIET_COMPLETE_TIMEOUT, MAX_QUIET_COMPLETE_TIMEOUT,
+    MAX_PENDING_STDIN, config, DEFAULT_PATH,
     COMPILED_PAGER_REGEXES, COMPILED_INTERACTIVE_PATTERNS, ServerTargetConfig, ANSI_ESCAPE
 )
 from src.utils import (
     log_error, clamp_float, clamp_int, iso_now, json_line, safe_name,
-    find_prompt, parse_exit_marker, cleanup_dead_session_logs, clean_output
+    find_prompt, parse_exit_marker, cleanup_dead_session_logs,
+    StreamCleaner
 )
 from src.security import check_command_security, escape_shell_path
-from src.ssh_state import RunState, ChunkBuffer, CHARS_ACCOUNT
+from src.ssh_state import RunState, ChunkBuffer, CHARS_ACCOUNT, count_virtual_lines, find_line_offset, slice_virtual_lines
 
 _buffer_checker = None
 _total_buffer_getter = None
@@ -64,9 +65,6 @@ def set_buffer_limit_checkers(checker_func, getter_func=None):
     _buffer_checker = checker_func
     _total_buffer_getter = getter_func
 
-def set_buffer_limit_checker(checker_func):
-    global _buffer_checker
-    _buffer_checker = checker_func
 
 def format_export_path(path: str) -> Optional[str]:
     """Single-quote a PATH value so metacharacters cannot run as shell."""
@@ -87,10 +85,16 @@ def wrap_posix_exit_marker(command: str) -> tuple:
 
 
 def _silence_may_finish(run) -> bool:
-    """Quiet completion is only for an explicit quiet hint with no end-of-command marker."""
-    if getattr(run, "completion_hint", "either") != "quiet":
+    """Quiet idle fallback is for PTY runs with no end-of-command marker (NDM CLI
+    has no printf marker). Both explicit "quiet" and default "either" qualify:
+    shell PTY runs carry an exit marker and are unaffected, NDM PTY runs get an
+    honest idle fallback. Exec-channel runs are excluded: exit_status there is
+    authoritative, so an idle fallback would return a bogus stalled early."""
+    if getattr(run, "completion_hint", "either") not in ("quiet", "either"):
         return False
     if getattr(run, "exit_marker_token", None):
+        return False
+    if getattr(run, "exec_channel", None) is not None:
         return False
     return True
 
@@ -154,6 +158,89 @@ def _interrupt_fields_for(run: Any) -> Dict[str, Any]:
     }
 
 
+def _run_display_status(run: Any) -> str:
+    """Single status resolver for run/read/scrollback paths.
+
+    done_event is authoritative: prompt/interrupt/exit map to terminal
+    statuses, otherwise the raw run.status is kept. An unfinished run whose
+    quiet idle flag fired (PTY-only, no marker) is 'stalled' - honest
+    uncertainty, not a false completed. Everything else unfinished is
+    'running'."""
+    if run.done_event.is_set():
+        cm = run.completion_method or ""
+        if cm == "prompt_detected":
+            return "completed"
+        if cm == "interrupted":
+            return "interrupted"
+        if cm in {"exit_marker", "exit_status"}:
+            if run.exit_status is None:
+                return run.status if run.status in {"completed", "completed_nonzero", "interrupted"} else "completed"
+            return "completed" if run.exit_status == 0 else "completed_nonzero"
+        return run.status
+    if _silence_may_finish(run) and run.quiet_event.is_set():
+        return "stalled"
+    return "running"
+
+
+def _wait_for_run(run: Any, wait_timeout: float, known_end: int) -> None:
+    """Wait for a run to finish or to produce new output, whichever comes first.
+
+    The full wait_timeout is only spent while the stream stays silent: a reader
+    that already has bytes waiting (or that gets them during the wait) returns
+    immediately instead of burning the whole window (review R6)."""
+    if not wait_timeout or wait_timeout <= 0:
+        return
+    if run.output_end() > known_end:
+        return
+    deadline = time.time() + wait_timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        run.done_event.wait(timeout=min(0.05, remaining))
+        if run.done_event.is_set() or run.output_end() > known_end:
+            return
+
+
+def _stalled_hint(session_alias: str, sid: int, run: Any) -> str:
+    qt = getattr(run, "quiet_complete_timeout", DEFAULT_QUIET_COMPLETE_TIMEOUT)
+    try:
+        qt_s = f"{float(qt):.1f}"
+    except Exception:
+        qt_s = str(qt)
+    return (
+        f"No completion marker seen; output idle for {qt_s}s. "
+        f"This session tab remains busy until the command completes or is released. "
+        f"Continue with read(session_id='{session_alias}/{sid}'), "
+        f"release with signal 'ctrl_c', or run concurrently with new_session=true."
+    )
+
+
+def _apply_run_hints(resp: Dict[str, Any], status: str, server_alias: str, session_id: int, snapshot: Dict[str, Any], run: Any) -> None:
+    if status == "stalled":
+        resp["unconfirmed_completion"] = True
+        resp["hint"] = _stalled_hint(server_alias, session_id, run)
+    elif status == "running":
+        resp["hint"] = (
+            f"Command still running - read again with read(session_id='{server_alias}/{session_id}') "
+            f"once it produces output."
+        )
+    elif snapshot.get("limited"):
+        resp["hint"] = "output truncated - raise max_chars/max_lines or read again for the rest."
+
+    out = snapshot.get("output", "")
+    if "0xcffd0062" in out or "Cli::Main" in out:
+        ndmc_note = (
+            "ndmc failed (0xcffd0062 / Cli::Main): the NDM configurator is busy - this SSH "
+            "connection itself is an NDM CLI session. Do NOT use ndmc from a Linux shell; "
+            "run NDM commands with shell=false instead."
+        )
+        if resp.get("hint"):
+            resp["hint"] = resp["hint"] + " " + ndmc_note
+        else:
+            resp["hint"] = ndmc_note
+
+
 class SSHSession:
     def __init__(self, session_id: int, name: str, cache_dirs: Dict[str, str], project_tag: str, server_config: Optional[ServerTargetConfig] = None):
         self.id = session_id
@@ -185,8 +272,10 @@ class SSHSession:
         self.death_time: Optional[datetime] = None
         self.in_shell = False
         self._is_subshell = False
+        self._pty_invalidated = False
         self.state_lost = False
         self._pending_stdin = ""
+        self._pending_stdin_run_id: Optional[int] = None
         self._file_op_active = False
 
         self.last_command = ""
@@ -202,10 +291,17 @@ class SSHSession:
 
         self.scrollback = ChunkBuffer(MAX_BUFFER_CHARS, account=CHARS_ACCOUNT)
         self.scrollback_cursor: int = 0
+        self._scrollback_cleaner = StreamCleaner()
+        # The lazy run-buffer backfill happens at most once per session (review D7).
+        # Set when unread canvas text had to be dropped (trim or mirror gap):
+        # the next read reports it once as dropped_data.
+        self._canvas_dropped = False
 
         self.lock = threading.Lock()
+        self._restore_lock = threading.Lock()
         self._connect_lock = threading.RLock()
         self._stdin_lock = threading.Lock()
+        self._handoff_lock = threading.Lock()
 
         self.session_log_path = self._build_session_log_path()
         json_line(
@@ -248,102 +344,251 @@ class SSHSession:
         data.update(payload)
         json_line(run.run_log_path, data)
 
-    def append_scrollback(self, chunk: str) -> None:
+    def append_scrollback(self, chunk: str, run: Any = None, mirrored_to: Optional[int] = None) -> None:
+        """Feed one raw chunk into the tab canvas, the single unread stream (m01215).
+
+        When the caller passes the run that produced the chunk, it also passes the
+        buffer end that chunk produced (RunState.append_output): the canvas now
+        carries exactly that text, so _mirror_runs will not copy it a second time."""
         if not chunk:
             return
         with self.lock:
-            self.scrollback.append(chunk)
-            if self.scrollback_cursor < self.scrollback.base_offset:
-                self.scrollback_cursor = self.scrollback.base_offset
+            cleaned = self._scrollback_cleaner.feed(chunk)
+            if cleaned:
+                self.scrollback.append(cleaned)
+                self._clamp_canvas_cursor()
+            if run is not None:
+                end = run.output_end() if mirrored_to is None else mirrored_to
+                if end > run.mirrored_upto:
+                    run.mirrored_upto = end
 
-    def read_scrollback(
-        self,
-        offset: Optional[int],
-        max_lines: int,
-        max_chars: int,
-    ) -> Dict[str, Any]:
+    def _finalize_scrollback(self) -> None:
+        """Flush what the tab-stream cleaner still holds when the stream ends.
+
+        A trailing CR becomes a newline and an unfinished escape is dropped (F7),
+        so a session that dies mid-line no longer keeps that last partial line out
+        of the canvas forever (review D8/F10). Idempotent: a second call is a no-op."""
+        self._mirror_runs()
         with self.lock:
-            if not len(self.scrollback) and self.runs:
-                for r in sorted(self.runs.values(), key=lambda x: x.run_id):
-                    with r.lock:
-                        self.scrollback.append(r.output_buffer)
+            tail = self._scrollback_cleaner.finalize()
+            if not tail:
+                return
+            self.scrollback.append(tail)
+            self._clamp_canvas_cursor()
 
-            total_len = len(self.scrollback)
+    def _mirror_runs(self) -> None:
+        """Fold each run's not-yet-seen output into the tab canvas.
+
+        The canvas is the single unread stream, so every run has to end up in it.
+        Live readers mark a run as mirrored while they feed the canvas, which makes
+        this a no-op in the normal path; it covers output that only ever reached a
+        run buffer (restored runs, mocked readers) and text produced while a read
+        was waiting. Already-cleaned text is appended verbatim: running it through
+        the canvas cleaner again could swallow a trailing partial escape (m01215)."""
+        with self.lock:
+            for run in sorted(self.runs.values(), key=lambda r: r.run_id):
+                self._mirror_run(run)
+            self._clamp_canvas_cursor()
+
+    def _mirror_run(self, run: Any) -> None:
+        """Mirror ONE run's not-yet-seen output into the canvas (call under self.lock).
+
+        Called for the runs being evicted too: their buffers go away, but their text
+        must reach the canvas first, otherwise unread output would vanish silently."""
+        with run.lock:
+            start = run.mirrored_upto
+            end = run.output_end()
+            if start < run.buffer_base_offset:
+                # The run buffer was trimmed before its text reached the canvas: record
+                # the loss once and skip past the bytes that are gone for good.
+                self._canvas_dropped = True
+                start = run.buffer_base_offset
+                run.mirrored_upto = start
+            if end <= start:
+                run.mirrored_upto = max(start, end)
+                return
+            tail = run.output_buffer[start - run.buffer_base_offset:]
+            run.mirrored_upto = end
+        if tail:
+            self.scrollback.append(tail)
+
+    def _clamp_canvas_cursor(self) -> None:
+        """Keep the single unread cursor inside the canvas (call under self.lock).
+
+        A cursor left behind the canvas start means unread text was trimmed away
+        before it was ever read: clamping it silently would hide that loss, so the
+        drop is recorded and the next read reports dropped_data (review D5)."""
+        if self.scrollback_cursor < self.scrollback.base_offset:
+            self._canvas_dropped = True
+            self.scrollback_cursor = self.scrollback.base_offset
+
+    def read_canvas(
+        self,
+        limit: int = 200,
+        tail: Optional[int] = None,
+        offset: Optional[int] = None,
+        wait_timeout: Optional[float] = None,
+        max_chars: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """The tab's single unread stream: a line-based window over the canvas (m01215).
+
+        run and read share one cursor (self.scrollback_cursor, an absolute stream
+        offset), so a command's output reaches the caller exactly once and everything
+        is measured in LINES: has_more is the number of unread lines still left.
+        - neither offset nor tail: the next limit unread lines; the cursor advances.
+        - tail=N: the last N lines of the canvas; the cursor jumps to the end, so
+          has_more becomes 0; dropped_data reports unread lines skipped on the way.
+        - offset: peek / inspection of history - the cursor does NOT move and has_more
+          counts what is still unread from the working cursor.
+          offset>=0 reads from that line forward (offset=0 = very beginning).
+          offset<0 reads limit lines starting |offset| lines above the cursor.
+        - limit=0: no line cap (internal callers that want a whole run).
+        """
+        limit = clamp_int(limit if limit is not None else DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_LINES, 0, MAX_READ_MAX_LINES)
+        max_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 1, MAX_READ_MAX_CHARS)
+
+        if wait_timeout is None:
+            wait_timeout = DEFAULT_WAIT_TIMEOUT
+
+        self._mirror_runs()
+        with self.lock:
+            active_r = self.runs.get(self.active_run_id) if self.active_run_id is not None else None
+            canvas_end = self.scrollback.base_offset + len(self.scrollback)
+            # Unread text already sitting in the canvas returns at once: waiting the
+            # whole window while the caller has output to read burned wait_timeout
+            # on every poll of a long-running command (R6).
+            unread_waiting = self.scrollback_cursor < canvas_end
+        if active_r is not None and not unread_waiting:
+            _wait_for_run(active_r, wait_timeout or 0.0, active_r.output_end())
+        # Take in whatever the wait produced, plus any run output that never had a
+        # live canvas feed (restored runs, mocked readers).
+        self._mirror_runs()
+
+        with self.lock:
+            # Snapshot under the lock; all line math below runs on the immutable
+            # string, so a 2 MB canvas read no longer stalls the PTY reader (R7).
+            full_text = self.scrollback.text()
             base_offset = self.scrollback.base_offset
-            use_cursor = offset is None
-
-            if offset is None:
-                offset = self.scrollback_cursor
-            elif offset < 0:
-                chars_from_end = abs(offset)
-                offset = max(base_offset, base_offset + total_len - chars_from_end)
-
-            dropped_data = False
-            if offset < base_offset:
-                offset = base_offset
+            total_chars = len(full_text)
+            dropped_data = self._canvas_dropped
+            self._canvas_dropped = False
+            if self.scrollback_cursor < base_offset:
+                # Unread text was trimmed away before the cursor reached it (D5).
                 dropped_data = True
+            cursor_abs = max(base_offset, min(self.scrollback_cursor, base_offset + total_chars))
 
-            relative = max(0, offset - base_offset)
-            available = max(0, total_len - relative)
-            char_cap = max(1, max_chars)
-            limited = available > char_cap
-            data = self.scrollback.window(relative, char_cap)
+        cursor_rel = cursor_abs - base_offset
+        total_lines = count_virtual_lines(full_text)
+        advance = False
+        limited = False
 
-            if max_lines > 0:
-                lines = data.splitlines(keepends=True)
-                if len(lines) > max_lines:
-                    data = "".join(lines[:max_lines])
-                    limited = True
+        if tail is not None and tail > 0:
+            win_start = find_line_offset(full_text, max(0, total_lines - tail))
+            if cursor_rel < win_start:
+                # The jump skips unread output between the cursor and the window.
+                dropped_data = True
+            window = full_text[win_start:]
+            advance = True
+        elif offset is not None:
+            # Peek: inspect session history without moving the unread cursor.
+            # offset < 0: |offset| lines above the cursor
+            # offset >= 0: line offset from the beginning (0 = very start of history)
+            if offset < 0:
+                cursor_line = count_virtual_lines(full_text, 0, cursor_rel)
+                win_start = find_line_offset(full_text, max(0, cursor_line + offset))
+            else:
+                win_start = find_line_offset(full_text, max(0, offset))
+            if limit > 0:
+                window, _ = slice_virtual_lines(full_text, win_start, limit)
+            else:
+                window = full_text[win_start:]
+            advance = False
+        else:
+            win_start = cursor_rel
+            if limit > 0:
+                window, _ = slice_virtual_lines(full_text, win_start, limit)
+            else:
+                window = full_text[win_start:]
+            advance = True
 
-            next_offset = offset + len(data)
-            if use_cursor:
-                self.scrollback_cursor = next_offset
+        if len(window) > max_chars:
+            window = window[:max_chars]
+            limited = True
+        win_end = win_start + len(window)
+        if win_end < total_chars:
+            # More text stays in the canvas: either beyond the line cap or cut off
+            # by max_chars, so the window is partial either way.
+            limited = True
 
+        next_offset = base_offset + win_end
+        if advance:
+            with self.lock:
+                base_now = self.scrollback.base_offset
+                if next_offset < base_now:
+                    # The canvas was trimmed while we were working on the snapshot.
+                    dropped_data = True
+                self.scrollback_cursor = max(next_offset, base_now)
+            # Unread lines left after the cursor moved to the window end (m01215).
+            has_more = count_virtual_lines(full_text, win_end)
+        else:
+            # A peek reports what is still UNREAD, not what follows the window.
+            has_more = count_virtual_lines(full_text, cursor_rel)
+
+        with self.lock:
             active_r = self.runs.get(self.active_run_id) if self.active_run_id is not None else None
             last_r = self.runs.get(self.last_run_id) if self.last_run_id is not None else None
 
-            if active_r and not active_r.done_event.is_set():
-                status = "running"
-                still_running = True
-                exit_status = None
-            elif last_r:
-                still_running = not last_r.done_event.is_set()
-                exit_status = last_r.exit_status
-                if last_r.done_event.is_set():
-                    if last_r.completion_method == "prompt_detected":
-                        status = "completed"
-                    elif last_r.completion_method == "interrupted":
-                        status = "interrupted"
-                    elif last_r.completion_method in {"exit_marker", "exit_status"}:
-                        status = "completed" if last_r.exit_status == 0 else "completed_nonzero"
-                    else:
-                        status = last_r.status
-                else:
-                    status = "running"
-            else:
-                status = "completed"
-                still_running = False
-                exit_status = None
+        # Same resolver as run/read paths: a quiet-idle unfinished run is
+        # "stalled" (honest uncertainty), not "running".
+        newest_r = active_r if active_r is not None else last_r
+        if active_r is not None and not active_r.done_event.is_set():
+            status = _run_display_status(active_r)
+            still_running = True
+            exit_status = None
+        elif newest_r is not None:
+            # A finished active run is still the newest state: report its exit status.
+            still_running = not newest_r.done_event.is_set()
+            exit_status = newest_r.exit_status
+            status = _run_display_status(newest_r)
+        else:
+            status = "completed"
+            still_running = False
+            exit_status = None
 
-        cleaned_output = clean_output(data)
         res = {
             "success": True,
             "session_id": f"{self.server_alias}/{self.id}",
             "numeric_session_id": self.id,
             "server": self.server_alias,
             "status": status,
-            "output": cleaned_output,
-            "next_offset": next_offset,
-            "base_offset": base_offset,
-            "limited": limited,
+            "output": window,
+            "has_more": has_more,
             "still_running": still_running,
+            "in_shell": self.in_shell,
+            "mode": self.get_mode(),
         }
         if exit_status is not None:
             res["exit_status"] = exit_status
         if dropped_data:
             res["dropped_data"] = True
-        if status == "interrupted":
+        run_for_hints = active_r if (active_r and not active_r.done_event.is_set()) else (last_r or active_r)
+        if run_for_hints is not None:
+            if run_for_hints.recv_paused:
+                # The receiver paused on this tab; the read reports why it is quiet.
+                res["recv_paused"] = True
+                res["pause_reason"] = run_for_hints.pause_reason
+            _apply_run_hints(
+                res,
+                status,
+                self.server_alias,
+                self.id,
+                {"limited": limited, "output": window},
+                run_for_hints,
+            )
+        if status == "interrupted" and last_r is not None:
             res.update(_interrupt_fields_for(last_r))
+        if limited and "hint" not in res:
+            res["hint"] = "output truncated - raise max_chars/max_lines or read again for the rest."
         return res
 
     def _invoke_shell_with_timeout(self, width: int = 220, height: int = 50, timeout: float = 15.0) -> paramiko.Channel:
@@ -480,6 +725,7 @@ class SSHSession:
                     self.is_dead = False
                     self.death_reason = ""
                     self.death_time = None
+                    self._pty_invalidated = False
                 self._log_session("SYS", {"event": "connected", "host": self.server_config.host, "port": self.server_config.port})
                 return True
             except Exception as exc:
@@ -583,14 +829,20 @@ class SSHSession:
             self.is_dead = True
             self.death_reason = reason
             self.death_time = datetime.now()
+        self._finalize_scrollback()
         self._log_session("SYS", {"event": "session_dead", "reason": reason})
         try:
             cleanup_dead_session_logs(self.cache_dirs, server_alias=self.server_alias)
         except Exception:
             pass
 
+    def get_mode(self) -> str:
+        if getattr(self, "_pty_invalidated", False):
+            return "unknown"
+        return "linux_shell" if self.in_shell else "ndm_cli"
+
     def is_alive(self) -> bool:
-        if self.is_dead:
+        if self.is_dead or getattr(self, "_pty_invalidated", False):
             return False
         if not self.client:
             return False
@@ -650,6 +902,7 @@ class SSHSession:
                 self.is_dead = False
                 self.death_reason = ""
                 self.in_shell = False
+                self._pty_invalidated = False
                 self.state_lost = True
                 if self.active_run_id is not None:
                     r = self.runs.get(self.active_run_id)
@@ -663,6 +916,11 @@ class SSHSession:
             return (
                 f"Session {self.server_alias}/{self.id} is closed. "
                 "Open a new session instead of reconnecting this one."
+            )
+        if getattr(self, "_pty_invalidated", False):
+            return (
+                f"Session {self.server_alias}/{self.id} has no channel (PTY invalidated). "
+                "Close it with session_close and start fresh with new_session=true."
             )
         if self.is_dead or not self.check_health():
             log_error(f"Session {self.id} is dead. Attempting to reconnect...")
@@ -720,8 +978,12 @@ class SSHSession:
                 return False
 
     def _send_ctrl_c_raw(self) -> None:
-        if self.channel and not self.channel.closed:
-            self.channel.send("\x03")
+        ch = self.channel
+        if ch and getattr(ch, "closed", False) is not True:
+            try:
+                ch.send("\x03")
+            except Exception:
+                pass
 
     def _invalidate_pty(self, reason: str) -> None:
         """The command boundary on the PTY is unknown (partial send, interrupt without
@@ -734,12 +996,17 @@ class SSHSession:
                 self.state_lost = True
             self.in_shell = False
             self._is_subshell = False
+            self._pty_invalidated = True
             channel, self.channel = self.channel, None
+        with self._stdin_lock:
+            self._pending_stdin = ""
+            self._pending_stdin_run_id = None
         try:
             if channel is not None:
                 channel.close()
         except Exception as e:
             log_error(f"Error closing invalidated PTY on session {self.id}: {e}")
+        self._finalize_scrollback()
         self._log_session("SYS", {"event": "pty_invalidated", "reason": reason})
 
     def _start_reader_thread(self, run: RunState):
@@ -754,7 +1021,17 @@ class SSHSession:
             self.reader_threads[run.run_id] = thread
         thread.start()
 
-    def _exit_shell(self) -> bool:
+    def _exit_shell(self, timeout: float = 5.5) -> bool:
+        # Keenetic NDM quirk: 'exit' from an entered shell is SLOW (~2-4.6s on
+        # live probes) and sometimes never redraws the NDM prompt. A short wait
+        # (0.8s - 2.5s) systematically misfires while the router already left the shell
+        # - and trusting in_shell=True afterwards sends POSIX into NDM CLI
+        # (live repro: echo/printf marker -> "no such command: echo", 5s burn).
+        # So: wait a generous prompt budget (>=5.5s) and on failure treat the
+        # interpreter as UNKNOWN - invalidate the PTY (fail LOUD). We deliberately
+        # do NOT re-send 'exit\n' while the channel is idle: if the router already
+        # left the shell the retry lands in NDM CLI and logs the session out.
+        # NDM work continues via new_session=true + shell=false (a fresh CLI session).
         with self._connect_lock:
             if not self.in_shell:
                 return True
@@ -766,27 +1043,41 @@ class SSHSession:
             try:
                 self._drain_ready(self.channel)
 
-                for _ in range(3):
-                    self.channel.send("exit\n")
-                    time.sleep(0.3)
-                    output = ""
-                    start = time.time()
-                    while time.time() - start < 2.0:
-                        if self.channel.recv_ready():
-                            output += self._drain_ready(self.channel)
-                            if re.search(r"(\(.*\))?>\s*$", output.rstrip()) or re.search(r"^[>#]\s*$", output.strip()):
-                                self.in_shell = False
-                                self._is_subshell = False
-                                self._log_session("SYS", {"event": "exit_shell_ok"})
-                                return True
-                        time.sleep(0.05)
+                self.channel.send("exit\n")
+                time.sleep(0.3)
+                output = ""
+                start = time.monotonic()
+                while time.monotonic() - start < timeout:
+                    if self.channel.recv_ready():
+                        output += self._drain_ready(self.channel)
+                        prompt = find_prompt(output)
+                        if (prompt and not re.search(r"[#$][ \t]*$", prompt)) or re.search(r"(?:[a-zA-Z0-9._-]+\s*)?(?:\([^)]+\))?>\s*$", output.rstrip()) or re.search(r"^[>#]\s*$", output.strip()):
+                            self.in_shell = False
+                            self._is_subshell = False
+                            self._log_session("SYS", {"event": "exit_shell_ok"})
+                            return True
+                        # NDM prompt arrived WITHOUT the strict regex matching
+                        # (banner redraw, partial line): any NDM-looking tail after
+                        # an exit means we are out of the Linux shell.
+                        if "(config)" in output or re.search(r"config\s*>", output):
+                            self.in_shell = False
+                            self._is_subshell = False
+                            self._log_session("SYS", {"event": "exit_shell_ok_loose_ndm"})
+                            return True
+                    time.sleep(0.05)
 
-                self.in_shell = False
-                self._log_session("SYS", {"event": "exit_shell_timeout_assumed_ok"})
-                return True
+                # Unknown interpreter: do NOT keep a trusted in_shell=True. The
+                # next shell=true would skip _enter_shell and send POSIX into NDM.
+                # Invalidate the PTY so the session visibly needs a fresh start.
+                self._log_session("SYS", {"event": "exit_shell_unknown_interpreter", "output_tail": output[-200:]})
+                self._invalidate_pty("exit did not return to NDM CLI - interpreter unknown")
+                return False
             except Exception as exc:
                 self._log_session("SYS", {"event": "exit_shell_error", "error": str(exc)})
-                self.in_shell = False
+                try:
+                    self._invalidate_pty(f"exit_shell error: {exc}")
+                except Exception:
+                    pass
                 return False
 
     def _reader_loop(self, run: RunState) -> None:
@@ -805,7 +1096,8 @@ class SSHSession:
                     run.interrupt_at = time.time()
                     self._send_ctrl_c_raw()
 
-                if self.channel and self.channel.recv_ready():
+                ch = self.channel
+                if ch and getattr(ch, "closed", False) is not True and ch.recv_ready():
                     if _buffer_checker and not _buffer_checker(BUFFER_SIZE):
                         # Do not recv to discard. An acknowledged SSH window lets the remote command
                         # keep producing data we would throw away. Leaving the window full blocks the
@@ -836,7 +1128,7 @@ class SSHSession:
                         run.set_recv_paused(False)
 
                     try:
-                        chunk_bytes = self.channel.recv(BUFFER_SIZE)
+                        chunk_bytes = ch.recv(BUFFER_SIZE)
                     except socket.timeout:
                         continue
                     if not chunk_bytes:
@@ -846,8 +1138,8 @@ class SSHSession:
                         break
 
                     chunk = decoder.decode(chunk_bytes)
-                    run.append_output(chunk)
-                    self.append_scrollback(chunk)
+                    mirrored_to = run.append_output(chunk)
+                    self.append_scrollback(chunk, run=run, mirrored_to=mirrored_to)
                     self._log_run(run, "OUT", {"chunk": chunk})
 
                     # Read tail under lock to prevent race condition
@@ -862,7 +1154,7 @@ class SSHSession:
                             found_pager = True
                             break
                     if found_pager:
-                        self.channel.send(" ")
+                        ch.send(" ")
                         self._log_run(run, "SYS", {"event": "pagination_detected_sending_space"})
 
                     token = getattr(run, "exit_marker_token", None)
@@ -877,8 +1169,9 @@ class SSHSession:
                         prompt = find_prompt(curr_buffer)
                         if prompt:
                             run.prompt_detected = True
-                            run.prompt_line = prompt
-                            if re.search(r"[#$][ \t]*$", prompt):
+                            # Do NOT set self.in_shell = True on loose '#' during NDM commands.
+                            # Only set in_shell if a clear POSIX shell login prompt is detected.
+                            if not self.in_shell and (re.search(r"@[a-zA-Z0-9._-]+:.*[#$]", prompt) or re.search(r"^[/~].*[#$]", prompt)):
                                 self.in_shell = True
                             if run.interrupt_sent:
                                 run.mark_done(
@@ -919,7 +1212,7 @@ class SSHSession:
                         if run.last_stdin_at is not None:
                             stdin_recent = (time.time() - run.last_stdin_at) < quiet_timeout
 
-                        if run.total_received_chars > 0 and (time.time() - run.last_data_at) >= quiet_timeout and not stdin_recent:
+                        if (time.time() - run.last_data_at) >= quiet_timeout and not stdin_recent:
                             if hint in ("quiet", "either"):
                                 # Interactive hang check
                                 with run.lock:
@@ -930,9 +1223,12 @@ class SSHSession:
                                     if pattern.search(clean_tail):
                                         is_interactive = True
                                         break
-                                if is_interactive:
+                                # Zero-output silence can never be an interactive prompt
+                                # (nothing to match): only scan when text exists.
+                                if is_interactive and run.total_received_chars > 0:
                                     run.interrupt_sent = True
                                     self._send_ctrl_c_raw()
+                                    self._invalidate_pty("interactive prompt detected")
                                     run.mark_done(
                                         "failed",
                                         reason="interactive_prompt_detected",
@@ -950,10 +1246,15 @@ class SSHSession:
         except Exception as exc:
             run.mark_done("failed", reason="reader exception", error=str(exc), completion_method="failed")
         finally:
+            with self._stdin_lock:
+                if self._pending_stdin_run_id == run.run_id:
+                    self._pending_stdin = ""
+                    self._pending_stdin_run_id = None
             with self.lock:
                 if self.active_run_id == run.run_id:
                     self.active_run_id = None
-                self.last_run_id = run.run_id
+                if self.last_run_id is None or self.last_run_id == run.run_id:
+                    self.last_run_id = run.run_id
 
     def _exec_reader_loop(self, run: RunState) -> None:
         self._log_run(run, "SYS", {"event": "exec_reader_started"})
@@ -1008,8 +1309,8 @@ class SSHSession:
                         time.sleep(0.02)
                     elif chunk_bytes:
                         chunk = decoder_out.decode(chunk_bytes)
-                        run.append_output(chunk)
-                        self.append_scrollback(chunk)
+                        mirrored_to = run.append_output(chunk)
+                        self.append_scrollback(chunk, run=run, mirrored_to=mirrored_to)
                         self._log_run(run, "OUT", {"chunk": chunk})
                         has_data = True
 
@@ -1034,8 +1335,8 @@ class SSHSession:
                         time.sleep(0.02)
                     elif chunk_bytes:
                         chunk = decoder_err.decode(chunk_bytes)
-                        run.append_output(chunk)
-                        self.append_scrollback(chunk)
+                        mirrored_to = run.append_output(chunk)
+                        self.append_scrollback(chunk, run=run, mirrored_to=mirrored_to)
                         self._log_run(run, "ERR", {"chunk": chunk})
                         has_data = True
 
@@ -1098,10 +1399,15 @@ class SSHSession:
                     run.exec_stderr.close()
             except Exception as e:
                 log_error(f"Error closing exec channel in reader finally: {e}")
+            with self._stdin_lock:
+                if self._pending_stdin_run_id == run.run_id:
+                    self._pending_stdin = ""
+                    self._pending_stdin_run_id = None
             with self.lock:
                 if self.active_run_id == run.run_id:
                     self.active_run_id = None
-                self.last_run_id = run.run_id
+                if self.last_run_id is None or self.last_run_id == run.run_id:
+                    self.last_run_id = run.run_id
 
     def _cleanup_old_runs(self) -> None:
         to_clean_runs = []
@@ -1116,6 +1422,10 @@ class SSHSession:
                         self.reader_threads.pop(rid, None)
 
         for r in to_clean_runs:
+            with self.lock:
+                # Mirror before discarding: an evicted run's buffer disappears, but any
+                # output the canvas has not seen yet must reach the unread stream first.
+                self._mirror_run(r)
             with r.lock:
                 r.discard_all_output()
 
@@ -1170,75 +1480,89 @@ class SSHSession:
                 return sec_err
 
         # Atomic busy check + reservation
-        with self.lock:
-            if self._file_op_active and not internal:
-                return {
-                    "success": False,
-                    "error": (
-                        f"Session {self.server_alias}/{self.id} is busy with a file operation. "
-                        "An SSH session is a single terminal process (PTY) and cannot run commands in parallel. "
-                        "Use 'new_session=true' to run concurrently in a new session, or wait for the operation to complete."
-                    ),
-                    "session_id": f"{self.server_alias}/{self.id}",
-                    "numeric_session_id": self.id,
-                    "server": self.server_alias,
-                }
-            if self.active_run_id is not None:
-                r = self.runs.get(self.active_run_id)
-                if r and not r.done_event.is_set():
-                    active_cmd = r.command or self.last_command or ""
-                    cmd_info = f" running '{active_cmd}'" if active_cmd else ""
+        with self._handoff_lock:
+            with self.lock:
+                if self._file_op_active and not internal:
                     return {
                         "success": False,
                         "error": (
-                            f"Session {self.server_alias}/{self.id} is busy{cmd_info}. "
-                            "An SSH session is a single shell terminal and cannot run commands in parallel. "
-                            "Use 'new_session=true' to execute concurrently in a new session, or wait for the active command to finish (or send signal 'ctrl_c')."
-                        ),
-                        "session_id": f"{self.server_alias}/{self.id}",
-                        "numeric_session_id": self.id,
-                        "server": self.server_alias
-                    }
-
-            if self.state_lost and not internal:
-                self.state_lost = False  # One-shot: the next command may run
-                # For router CLI (shell is False), commands are stateless (e.g. show version),
-                # so do not reject the command. Only reject for Linux bash/sh sessions where cd/env were lost.
-                if shell is not False:
-                    return {
-                        "success": False,
-                        "error": (
-                            f"Warning: Connection for session {self.server_alias}/{self.id} was lost and auto-recovered! "
-                            "Your interactive shell state (working directory, env variables, etc.) has been reset. "
-                            f"To prevent errors or damage, your command '{command}' was NOT executed. "
-                            "Please run your environment setup commands again (e.g. 'cd <dir>') and then repeat your command."
+                            f"Session {self.server_alias}/{self.id} is busy with a file operation. "
+                            "An SSH session is a single terminal process (PTY) and cannot run commands in parallel. "
+                            "Use 'new_session=true' to run concurrently in a new session, or wait for the operation to complete."
                         ),
                         "session_id": f"{self.server_alias}/{self.id}",
                         "numeric_session_id": self.id,
                         "server": self.server_alias,
-                        "status": "failed"
+                    }
+                if self.active_run_id is not None:
+                    r = self.runs.get(self.active_run_id)
+                    if r and not r.done_event.is_set():
+                        active_cmd = r.command or self.last_command or ""
+                        cmd_info = f" running '{active_cmd}'" if active_cmd else ""
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Session {self.server_alias}/{self.id} is busy{cmd_info}. "
+                                "An SSH session is a single shell terminal and cannot run commands in parallel. "
+                                "Use 'new_session=true' to execute concurrently in a new session, or wait for the active command to finish (or send signal 'ctrl_c')."
+                            ),
+                            "session_id": f"{self.server_alias}/{self.id}",
+                            "numeric_session_id": self.id,
+                            "server": self.server_alias
+                        }
+
+                if getattr(self, "_pty_invalidated", False) and not internal:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Session {self.server_alias}/{self.id} terminal was invalidated (e.g. failed to exit shell). "
+                            "Close it with session_close and start fresh with new_session=true or reconnect."
+                        ),
+                        "session_id": f"{self.server_alias}/{self.id}",
+                        "numeric_session_id": self.id,
+                        "server": self.server_alias,
+                        "status": "failed",
                     }
 
-            run_id = self.run_counter
-            self.run_counter += 1
-            run = RunState(
-                run_id=run_id, session_id=self.id, command=command, mode=mode,
-                started_at=time.time(), wait_timeout=wait_timeout, startup_wait=startup_wait,
-                hard_timeout=hard_timeout, max_buffer_chars=MAX_BUFFER_CHARS,
-                run_log_path=self._build_run_log_path(run_id)
-            )
-            run.completion_hint = completion_hint
-            run.quiet_complete_timeout = quiet_complete_timeout
+                if self.state_lost and not internal:
+                    self.state_lost = False  # One-shot: the next command may run
+                    # For router CLI (shell is False), commands are stateless (e.g. show version),
+                    # so do not reject the command. Only reject for Linux bash/sh sessions where cd/env were lost.
+                    if shell is not False:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"Warning: Connection for session {self.server_alias}/{self.id} was lost and auto-recovered! "
+                                "Your interactive shell state (working directory, env variables, etc.) has been reset. "
+                                f"To prevent errors or damage, your command '{command}' was NOT executed. "
+                                "Please run your environment setup commands again (e.g. 'cd <dir>') and then repeat your command."
+                            ),
+                            "session_id": f"{self.server_alias}/{self.id}",
+                            "numeric_session_id": self.id,
+                            "server": self.server_alias,
+                            "status": "failed"
+                        }
 
-            self.runs[run_id] = run
-            self.active_run_id = run_id
-            self.last_run_id = run_id
-            if req_id is not None:
-                run.req_id = req_id
-                self.inflight_by_req[req_id] = run_id
-                # bounded FIFO: stale entries are harmless (cancel checks active_run_id)
-                while len(self.inflight_by_req) > 256:
-                    self.inflight_by_req.pop(next(iter(self.inflight_by_req)))
+                run_id = self.run_counter
+                self.run_counter += 1
+                run = RunState(
+                    run_id=run_id, session_id=self.id, command=command, mode=mode,
+                    started_at=time.time(), wait_timeout=wait_timeout, startup_wait=startup_wait,
+                    hard_timeout=hard_timeout, max_buffer_chars=MAX_BUFFER_CHARS,
+                    run_log_path=self._build_run_log_path(run_id)
+                )
+                run.completion_hint = completion_hint
+                run.quiet_complete_timeout = quiet_complete_timeout
+
+                self.runs[run_id] = run
+                self.active_run_id = run_id
+                self.last_run_id = run_id
+                if req_id is not None:
+                    run.req_id = req_id
+                    self.inflight_by_req[req_id] = run_id
+                    # bounded FIFO: stale entries are harmless (cancel checks active_run_id)
+                    while len(self.inflight_by_req) > 256:
+                        self.inflight_by_req.pop(next(iter(self.inflight_by_req)))
 
         self._cleanup_old_runs()
 
@@ -1270,12 +1594,24 @@ class SSHSession:
                     run.mark_done("failed", error=f"Failed to enter system shell on server '{self.server_alias}'")
                     return {"success": False, "error": f"Failed to enter system shell on server '{self.server_alias}'", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
             elif shell is False and self.in_shell:
+                # Keenetic NDM quirk: 'exit' is slow (2-4.6s live) and sometimes never
+                # redraws the prompt. _exit_shell waits a real budget; on failure the
+                # interpreter is UNKNOWN and the PTY is invalidated (never a trusted
+                # in_shell=True - that lie sent POSIX into NDM CLI). Fail loud with
+                # a fresh-session recipe instead of burning wait_timeout.
                 if not self._exit_shell():
                     with self.lock:
                         if self.active_run_id == run_id:
                             self.active_run_id = None
-                    run.mark_done("failed", error=f"Failed to exit system shell on server '{self.server_alias}'")
-                    return {"success": False, "error": f"Failed to exit system shell on server '{self.server_alias}'", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
+                    run.mark_done("failed", error="exit_shell_failed", completion_method="failed")
+                    return {"success": False, "error": (
+                        f"Session {self.server_alias}/{self.id}: 'exit' did not return to NDM CLI, "
+                        "interpreter unknown - PTY invalidated, this session needs a fresh start. "
+                        "Close it with session_close and run NDM commands with new_session=true + shell=false (a fresh CLI session)."
+                    ),
+                        "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id,
+                        "server": self.server_alias, "in_shell": None,
+                        "mode": "unknown"}
 
             if self.channel:
                 old_t = self.channel.gettimeout()
@@ -1303,7 +1639,10 @@ class SSHSession:
                         if self.active_run_id == run_id:
                             self.active_run_id = None
                     run.mark_done("failed", error="No channel")
-                    return {"success": False, "error": "No channel", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
+                    return {"success": False, "error": (
+                        f"Session {self.server_alias}/{self.id} has no channel (PTY invalidated or never opened). "
+                        "Start fresh with new_session=true."
+                    ), "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
                 # Reader must be running before send so a large payload cannot fill the window.
                 self._start_reader_thread(run)
                 send_deadline = time.time() + 30.0
@@ -1377,22 +1716,46 @@ class SSHSession:
             run.done_event.wait(wait_for)
 
         char_ceiling = MAX_BUFFER_CHARS if internal else MAX_READ_MAX_CHARS
-        read_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 100, char_ceiling) if max_chars is not None else DEFAULT_READ_MAX_CHARS
-        slice_lines = DEFAULT_READ_MAX_LINES if max_lines is None else max(0, int(max_lines))
-        snapshot = run.read_slice(offset=None, max_lines=slice_lines, max_chars=read_chars)
+        read_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 1, char_ceiling) if max_chars is not None else DEFAULT_READ_MAX_CHARS
+        slice_lines = DEFAULT_READ_MAX_LINES if max_lines is None else clamp_int(max_lines, DEFAULT_READ_MAX_LINES, 0, MAX_READ_MAX_LINES)
 
-        status = snapshot["status"]
-        if snapshot["output_complete"]:
-            if run.completion_method == "prompt_detected":
-                status = "completed"
-            elif run.completion_method == "interrupted":
-                status = "interrupted"
-            elif run.completion_method in {"exit_status", "exit_marker"}:
-                status = "completed" if run.exit_status == 0 else "completed_nonzero"
-        elif _silence_may_finish(run) and run.quiet_event.is_set():
-            status = "stalled"
-        elif not snapshot["output_complete"]:
-            status = "running"
+        if internal:
+            # Internal callers (fs.py and friends) parse the output of the helper
+            # command they just ran. They read that run's own buffer and never touch
+            # the tab cursor: a helper must not consume output the agent has not
+            # read yet, and its window is bounded by max_lines/max_chars only.
+            with run.lock:
+                buffered = run.output_buffer
+                recv_paused = run.recv_paused
+                pause_reason = run.pause_reason
+                still_running = not run.done_event.is_set()
+            window = buffered
+            if slice_lines > 0:
+                lines = window.splitlines(keepends=True)
+                if len(lines) > slice_lines:
+                    window = "".join(lines[:slice_lines])
+            if len(window) > read_chars:
+                window = window[:read_chars]
+            snapshot = {
+                "output": window,
+                "limited": len(window) < len(buffered),
+                "dropped_data": False,
+                "recv_paused": recv_paused,
+                "pause_reason": pause_reason,
+                "still_running": still_running,
+                "has_more": count_virtual_lines(buffered, len(window)) if len(buffered) > len(window) else 0,
+            }
+            status = _run_display_status(run)
+        else:
+            # One stream for the agent (m01215): the tab canvas, with the same line
+            # window, the same cursor and the same has_more as read(session_id).
+            snapshot = self.read_canvas(
+                limit=slice_lines,
+                max_chars=read_chars,
+                wait_timeout=0.0,
+            )
+            status = _run_display_status(run)
+            still_running = not run.done_event.is_set()
 
         resp = {
             "success": True,
@@ -1402,230 +1765,41 @@ class SSHSession:
             "run_id": run_id,
             "status": status,
             "output": snapshot["output"],
-            "next_offset": snapshot["next_offset"],
-            "limited": snapshot["limited"],
-            "still_running": snapshot["still_running"],
-            "total_chars": snapshot["total_received_chars"],
+            "has_more": int(snapshot.get("has_more", 0)),
+            "still_running": still_running,
+            "in_shell": self.in_shell,
+            "mode": self.get_mode(),
         }
+        if run.completion_method:
+            resp["completion_method"] = run.completion_method
+        _apply_run_hints(resp, status, self.server_alias, self.id, snapshot, run)
         if snapshot.get("recv_paused"):
             resp["recv_paused"] = True
             resp["pause_reason"] = snapshot.get("pause_reason") or ""
+        if snapshot.get("dropped_data"):
+            resp["dropped_data"] = True
         if background:
             resp["message"] = f"Command started in background on session {self.server_alias}/{self.id}"
-        if status == "dead" and snapshot.get("error"):
-            resp["error"] = snapshot["error"]
+        if status == "dead" and run.error:
+            resp["error"] = run.error
         if run.exit_status is not None:
             resp["exit_status"] = run.exit_status
         if status == "interrupted":
             resp.update(_interrupt_fields_for(run))
         return resp
 
-    def _restore_run_from_disk(self, run_id: int) -> Optional[RunState]:
-        pattern = os.path.join(self.cache_dirs["runs_dir"], f"{self.project_tag}__{safe_name(self.server_alias)}__s{self.id}__r{run_id}__*.log")
-        files = glob.glob(pattern)
-        if not files:
-            pattern_old = os.path.join(self.cache_dirs["runs_dir"], f"{self.project_tag}__s{self.id}__r{run_id}__*.log")
-            files = glob.glob(pattern_old)
-        if not files:
-            return None
-
-        files.sort(key=os.path.getmtime)
-        filepath = files[-1]
-
-        try:
-            started_at = os.path.getctime(filepath)
-        except OSError:
-            started_at = time.time()
-
-        run = RunState(
-            run_id=run_id,
-            session_id=self.id,
-            command="",
-            mode="sync",
-            started_at=started_at,
-            wait_timeout=20.0,
-            startup_wait=2.0,
-            hard_timeout=0.0,
-            max_buffer_chars=MAX_BUFFER_CHARS,
-            run_log_path=filepath
-        )
-
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = json.loads(line)
-                        direction = evt.get("dir")
-                        if direction in ("OUT", "ERR"):
-                            chunk = evt.get("chunk", "")
-                            if chunk:
-                                run.append_output(chunk)
-                        elif direction == "SYS":
-                            event = evt.get("event")
-                            if event == "run_created":
-                                run.command = evt.get("command", "")
-                                run.mode = evt.get("mode", "sync")
-                                run.started_at = evt.get("started_at", run.started_at)
-                                run.wait_timeout = evt.get("wait_timeout", run.wait_timeout)
-                                run.startup_wait = evt.get("startup_wait", run.startup_wait)
-                                run.hard_timeout = evt.get("hard_timeout", run.hard_timeout)
-                            elif event == "run_done":
-                                run.status = evt.get("status", "completed")
-                                run.finish_reason = evt.get("reason", "")
-                                run.error = evt.get("error", "")
-                                run.exit_status = evt.get("exit_status")
-                                run.completion_method = evt.get("completion_method", "")
-                                run.finished_at = evt.get("finished_at")
-                                run.done_event.set()
-                    except Exception as e:
-                        log_error(f"Error parsing line in run log {filepath}: {e}")
-        except Exception as exc:
-            log_error(f"Failed to read log file for run {run_id}: {exc}")
-            return None
-
-        if not run.done_event.is_set():
-            run.status = "interrupted"
-            run.finish_reason = "restored_incomplete_log"
-            run.done_event.set()
-
-        with self.lock:
-            self.runs[run_id] = run
-        self._cleanup_old_runs()
-
-        return run
-
-    def read_run(self, run_id: Optional[int], offset: Optional[int], max_lines: int, max_chars: int, wait_timeout: float = 5.0) -> Dict[str, Any]:
-        max_lines = clamp_int(max_lines, DEFAULT_READ_MAX_LINES, 1, MAX_READ_MAX_LINES)
-        max_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 100, MAX_READ_MAX_CHARS)
-
-        # 1. Explicit run_id provided (internal callers / backward-compat unit tests)
-        if run_id is not None:
-            selected = None
-            with self.lock:
-                selected = self.runs.get(run_id)
-
-            if not selected:
-                selected = self._restore_run_from_disk(run_id)
-
-            if not selected:
-                return {"success": False, "error": "No run found", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
-
-            if not selected.done_event.is_set() and wait_timeout and wait_timeout > 0:
-                selected.done_event.wait(timeout=wait_timeout)
-
-            snapshot = selected.read_slice(offset=offset, max_lines=max_lines, max_chars=max_chars)
-            # T2.4/F7: a fully-consumed buffer goes back to the pool (discard_through
-            # used to be dead code). A later rewind then honestly reports dropped_data;
-            # tab-level history (scrollback) still supports offset=0.
-            if snapshot["next_offset"] >= selected.buffer_base_offset + selected.buffer_len:
-                selected.discard_through(snapshot["next_offset"])
-            status = selected.status
-            if selected.done_event.is_set():
-                if selected.completion_method == "prompt_detected":
-                    status = "completed"
-                elif selected.completion_method == "interrupted":
-                    status = "interrupted"
-                elif selected.completion_method in {"exit_marker", "exit_status"}:
-                    status = "completed" if selected.exit_status == 0 else "completed_nonzero"
-            elif selected.quiet_event.is_set():
-                status = "stalled"
-            elif not selected.done_event.is_set():
-                status = "running"
-
-            result = {
-                "success": True,
-                "session_id": f"{self.server_alias}/{self.id}",
-                "numeric_session_id": self.id,
-                "server": self.server_alias,
-                "run_id": selected.run_id,
-                "status": status,
-                "output": snapshot["output"],
-                "next_offset": snapshot["next_offset"],
-                "limited": snapshot["limited"],
-                "still_running": not selected.done_event.is_set(),
-                "total_chars": snapshot["total_received_chars"],
-            }
-            if selected.exit_status is not None:
-                result["exit_status"] = selected.exit_status
-            if snapshot.get("recv_paused"):
-                result["recv_paused"] = True
-                result["pause_reason"] = snapshot.get("pause_reason") or ""
-            if snapshot.get("dropped_data"):
-                result["dropped_data"] = True
-            if status == "interrupted":
-                result.update(_interrupt_fields_for(selected))
-            return result
-
-        # 2. run_id is None -> Tab-level read
-        active_r = None
-        with self.lock:
-            if self.active_run_id is not None:
-                active_r = self.runs.get(self.active_run_id)
-
-        if active_r is not None and not active_r.done_event.is_set() and wait_timeout and wait_timeout > 0:
-            active_r.done_event.wait(timeout=wait_timeout)
-
-        if offset is None:
-            target_r = active_r
-            if target_r is None:
-                with self.lock:
-                    if self.last_run_id is not None:
-                        target_r = self.runs.get(self.last_run_id)
-
-            if target_r is not None and target_r.shared_cursor < target_r.buffer_len:
-                snapshot = target_r.read_slice(offset=None, max_lines=max_lines, max_chars=max_chars)
-                status = target_r.status
-                if target_r.done_event.is_set():
-                    if target_r.completion_method == "prompt_detected":
-                        status = "completed"
-                    elif target_r.completion_method == "interrupted":
-                        status = "interrupted"
-                    elif target_r.completion_method in {"exit_marker", "exit_status"}:
-                        status = "completed" if target_r.exit_status == 0 else "completed_nonzero"
-                elif target_r.quiet_event.is_set():
-                    status = "stalled"
-                elif not target_r.done_event.is_set():
-                    status = "running"
-
-                result = {
-                    "success": True,
-                    "session_id": f"{self.server_alias}/{self.id}",
-                    "numeric_session_id": self.id,
-                    "server": self.server_alias,
-                    "status": status,
-                    "output": snapshot["output"],
-                    "next_offset": snapshot["next_offset"],
-                    "limited": snapshot["limited"],
-                    "still_running": not target_r.done_event.is_set(),
-                    "total_chars": snapshot["total_received_chars"],
-                }
-                if target_r.exit_status is not None:
-                    result["exit_status"] = target_r.exit_status
-                if snapshot.get("recv_paused"):
-                    result["recv_paused"] = True
-                    result["pause_reason"] = snapshot.get("pause_reason") or ""
-                if snapshot.get("dropped_data"):
-                    result["dropped_data"] = True
-                if status == "interrupted":
-                    result.update(_interrupt_fields_for(target_r))
-                return result
-
-        return self.read_scrollback(offset=offset, max_lines=max_lines, max_chars=max_chars)
-
     def cancel_run_for_request(self, req_id: Any) -> Dict[str, Any]:
         """MCP notifications/cancelled: interrupt the run started by that request.
         Only acts while the request's run is still active AND unfinished, so a late
         cancellation can never kill an unrelated newer command (T1.4)."""
-        with self.lock:
-            run_id = self.inflight_by_req.get(req_id)
-            run = self.runs.get(run_id) if run_id is not None else None
-            active = self.active_run_id
-        if run_id is None or active != run_id or run is None or run.done_event.is_set():
-            return {"success": True, "message": "nothing to cancel: request already finished"}
-        return self.send_signal("ctrl_c")
+        with self._handoff_lock:
+            with self.lock:
+                run_id = self.inflight_by_req.get(req_id)
+                run = self.runs.get(run_id) if run_id is not None else None
+                active = self.active_run_id
+            if run_id is None or active != run_id or run is None or run.done_event.is_set():
+                return {"success": True, "message": "nothing to cancel: request already finished"}
+            return self.send_signal("ctrl_c", expected_run_id=run_id)
 
     def begin_file_op(self) -> bool:
         with self.lock:
@@ -1655,14 +1829,26 @@ class SSHSession:
     def is_busy(self) -> bool:
         return bool(self.busy_info().get("busy"))
 
-    def send_signal(self, action: str, text: str = "", press_enter: bool = True) -> Dict[str, Any]:
+    def send_signal(self, action: str, text: str = "", press_enter: bool = True, expected_run_id: Optional[int] = None) -> Dict[str, Any]:
+        if expected_run_id is not None:
+            with self.lock:
+                if self.active_run_id != expected_run_id:
+                    return {"success": True, "message": "nothing to cancel: run already finished"}
+                r = self.runs.get(expected_run_id)
+                if r is None or r.done_event.is_set():
+                    return {"success": True, "message": "nothing to cancel: run already finished"}
+
         error = self.ensure_alive()
         if error:
             return {"success": False, "error": error, "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
 
         target_channel = self.channel
         with self.lock:
+            if expected_run_id is not None and self.active_run_id != expected_run_id:
+                return {"success": True, "message": "nothing to cancel: run already finished"}
             r = self.runs.get(self.active_run_id) if self.active_run_id else None
+            if expected_run_id is not None and (r is None or r.run_id != expected_run_id or r.done_event.is_set()):
+                return {"success": True, "message": "nothing to cancel: run already finished"}
             if r and r.exec_channel:
                 target_channel = r.exec_channel
 
@@ -1717,13 +1903,30 @@ class SSHSession:
                     "server": self.server_alias,
                 }
             with self._stdin_lock:
+                if self._pending_stdin_run_id is not None and self._pending_stdin_run_id != r.run_id:
+                    self._pending_stdin = ""
+                    self._pending_stdin_run_id = None
                 pending = self._pending_stdin + text
+                if len(pending) > MAX_PENDING_STDIN:
+                    # Refuse instead of buffering forever: a client that keeps
+                    # sending without press_enter used to grow unbounded (F5).
+                    self._pending_stdin = ""
+                    self._pending_stdin_run_id = None
+                    return {
+                        "success": False,
+                        "error": f"Buffered stdin exceeds {MAX_PENDING_STDIN} characters; send it with press_enter=true",
+                        "session_id": f"{self.server_alias}/{self.id}",
+                        "numeric_session_id": self.id,
+                        "server": self.server_alias,
+                    }
                 sec_err = self._check_security(pending)
                 if sec_err:
                     self._pending_stdin = ""
+                    self._pending_stdin_run_id = None
                     return sec_err
                 if not press_enter:
                     self._pending_stdin = pending
+                    self._pending_stdin_run_id = r.run_id
                     return {
                         "success": True,
                         "session_id": f"{self.server_alias}/{self.id}",
@@ -1732,6 +1935,7 @@ class SSHSession:
                         "message": "stdin buffered",
                     }
                 self._pending_stdin = ""
+                self._pending_stdin_run_id = None
                 if not target_channel or target_channel.closed:
                     return {"success": False, "error": "Channel closed", "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
                 payload = (pending + "\n").encode("utf-8", errors="replace")
@@ -1771,8 +1975,8 @@ class SSHSession:
         if active_r and not active_r.done_event.is_set():
             active_r.mark_done("dead", reason="session closed", error="session closed", completion_method="dead")
 
-        # NOTE: buffered output stays readable after death on purpose (read_run on a
-        # dead session is a feature). Freeing happens in free_buffers() when the
+        # NOTE: buffered output stays readable after death on purpose (reading the
+        # canvas of a dead session is a feature). Freeing happens in free_buffers() when the
         # session leaves its node and can no longer be read at all.
 
         for r in all_runs:

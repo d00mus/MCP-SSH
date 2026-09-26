@@ -16,7 +16,7 @@ from src.config import (
     CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, MAX_TOTAL_BUFFER_CHARS, MAX_LOG_TOTAL_BYTES,
     ServerTargetConfig, ServersRegistry, config
 )
-from src.utils import log_error, iso_now, safe_name, cleanup_old_logs, cleanup_dead_session_logs, mask_secrets
+from src.utils import log_error, iso_now, cleanup_old_logs, cleanup_dead_session_logs, mask_secrets
 from src.session import SSHSession
 from src.ssh_state import CHARS_ACCOUNT
 
@@ -281,12 +281,16 @@ class ServerNode:
             items = list(self.sessions.items())
         for sid, s in items:
             info = s.info()
-            status = "broken" if (info["dead"] or not info["alive"]) else ("busy" if s.is_busy() else "idle")
+            status = "broken" if (info["dead"] or not info["alive"] or getattr(s, "_pty_invalidated", False)) else ("busy" if s.is_busy() else "idle")
+            in_shell = bool(info.get("in_shell", False))
+            mode = "unknown" if getattr(s, "_pty_invalidated", False) else ("linux_shell" if in_shell else "ndm_cli")
             row = {
                 "session_id": f"{self.alias}/{sid}",
                 "numeric_session_id": sid,
                 "server": self.alias,
                 "status": status,
+                "in_shell": in_shell,
+                "mode": mode,
             }
             if include_name:
                 row["name"] = info.get("name")
@@ -364,6 +368,7 @@ class MultiServerManager:
                 log_error(f"Failed to read initial config from '{self.config_path}': {e}")
         self.nodes: Dict[str, ServerNode] = {}
         self.lock = threading.RLock()
+        self._closed = False
         self.last_tool_result_global: Optional[Dict[str, Any]] = None
         self._cached_total_buffer: int = 0
         self._cached_total_buffer_time: float = 0.0
@@ -516,6 +521,8 @@ class MultiServerManager:
     def get_or_create_node(self, server_cfg: ServerTargetConfig) -> Optional[ServerNode]:
         key = server_cfg.alias.lower()
         with self.lock:
+            if self._closed:
+                return None
             current = self.registry.get(key)
             if current is None:
                 return None
@@ -691,19 +698,28 @@ class MultiServerManager:
             except Exception as e:
                 log_error(f"Health check loop error: {e}")
 
-    def list_all_servers(self, reload: bool = False) -> Dict[str, Any]:
+    def list_all_servers(self, reload: bool = False, server_filter: Optional[str] = None) -> Dict[str, Any]:
         reload_result = self.check_reload(force=True) if reload else {}
         servers_info = []
-        for cfg in self.registry.list_all():
+        cfgs = self.registry.find_by_prefix(server_filter) if server_filter else self.registry.list_all()
+        for cfg in cfgs:
             with self.lock:
                 node = self.nodes.get(cfg.alias.lower())
             active_sessions = 0
             status = "configured"
+            active_list = []
             if node:
                 with node.lock:
                     active_sessions = len(node.sessions)
                 status = node.get_status()
-            servers_info.append({
+                for s_info in node.list_sessions():
+                    if s_info.get("status") in ("idle", "busy"):
+                        active_list.append({
+                            "session_id": s_info["session_id"],
+                            "status": s_info["status"],
+                            "mode": s_info["mode"],
+                        })
+            entry = {
                 "alias": cfg.alias,
                 "host": f"{cfg.host}:{cfg.port}",
                 "user": cfg.user,
@@ -711,10 +727,18 @@ class MultiServerManager:
                 "sessions": active_sessions,
                 "description": cfg.description,
                 "read_only": cfg.read_only,
-            })
+            }
+            if active_list:
+                entry["active_sessions"] = active_list[:10]
+                if len(active_list) > 10:
+                    entry["more_sessions"] = len(active_list) - 10
+            servers_info.append(entry)
         resp = {"success": True, "servers": servers_info}
-        if reload_result.get("reloaded"):
-            resp["reload"] = reload_result
+        if reload_result:
+            if reload_result.get("reloaded"):
+                resp["reload"] = reload_result
+            elif reload_result.get("error"):
+                resp["reload_error"] = reload_result["error"]
         return resp
 
     def list_all_sessions(
@@ -846,6 +870,7 @@ class MultiServerManager:
             if self.health_thread.is_alive():
                 log_error("Warning: health thread did not terminate within 5.0s during shutdown")
         with self.lock:
+            self._closed = True
             nodes = list(self.nodes.values())
             self.nodes.clear()
         for node in nodes:

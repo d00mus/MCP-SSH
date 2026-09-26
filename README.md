@@ -16,9 +16,9 @@ This project is a **high-performance, resilient terminal gateway** that acts lik
 | The Pain Point | Typical SSH MCP Server (The "Scooter") | This Gateway (The "Supercar") |
 | :--- | :--- | :--- |
 | **Context Bloat & Token Waste** | Separate MCP server for each host. 5 servers = 50+ tool definitions dumped into every prompt, burning API tokens and causing model confusion. | **Unified Multi-Server Gateway:** 1 single MCP instance exposing compact tools for your entire fleet. Route by `server: "alias"` or composite session IDs (`keenetic/1`, `vps/2`). |
-| **Configuration Restarts** | Adding or editing a server requires restarting the MCP server, dropping all open SSH sessions and background jobs. | **Zero-Downtime Hot-Reload:** Automatically detects changes in `servers.json` within seconds. Adds new servers, updates policies, and reloads without interrupting active sessions. |
+| **Configuration Restarts** | Adding or editing a server requires restarting the MCP server, dropping all open SSH sessions and background jobs. | **Zero-Downtime Hot-Reload:** Automatically detects changes in `servers.json` on the health-loop pass (every 30s). Adds new servers, updates policies, and reloads without interrupting active sessions. |
 | **Interactive Prompt Hangs** | Freezes forever when a command prompts for `[y/n]`, `[Enter]`, or passwords. Wastes your API budget while waiting for a timeout. | **Intelligent Anti-Hang Engine:** Instantly detects interactive prompts (like `Password:`, `[Y/n]`), pauses, and returns a helpful warning so the LLM knows it requires non-interactive flags. |
-| **Silent Command Failures** | Command errors (non-zero exit codes) are returned as plain text. LLMs often miss them, assume success, and keep hallucinating. | **Loud Exit Status Warning:** Automatically wraps failures in highly visible error headers and includes full stderr, forcing the LLM to recognize the error and auto-correct. |
+| **Silent Command Failures** | Command errors (non-zero exit codes) are returned as plain text. LLMs often miss them, assume success, and keep hallucinating. | **Explicit Exit Status:** Non-zero exits return status completed_nonzero + exit_status (not a tool error), so the LLM sees success/failure explicitly and self-corrects. |
 | **Long-Running Daemons** | Launching a dev server or log watcher blocks the connection, causing the IDE agent to freeze, crash, or fail to progress. | **Multiplexed Multi-Sessions:** Act like `tmux` for AI. Default 5.0s timeout returns `still_running: true` without failing. Immediate async start via `wait_timeout: 0`. Run concurrent sessions via `new_session: true`. |
 | **Restricted Shells & Pagers** | Completely breaks on network appliances, enterprise switches, and routers (like **Keenetic** CLI) that force pagination (`--More--`). | **Keenetic & Pager Aware:** Specialized logic to handle pager prompts, auto-paginate, and separate NDM CLI (`shell: false`) from Linux shell (`shell: true`). |
 | **File Editing Overhead** | AI must download the entire file, edit it locally, and re-upload it. Extremely slow, expensive, and error-prone. | **Smart In-place Remote Editing:** Built-in `file.edit` that executes safe search-and-replace with line-numbered diagnostics and similarity matching on typos. |
@@ -36,7 +36,7 @@ Instead of registering 5–10 individual MCP servers in your IDE, configure all 
 
 ### 2. Live Zero-Downtime Hot-Reload
 Change a password, adjust a blacklist, or add a new host directly in `servers.json`:
-- The gateway detects file modifications via `mtime` and content hashing.
+- The gateway detects file modifications via `mtime` and content hashing on each health-loop pass (every 30s).
 - Unaffected hosts and ongoing terminal sessions remain 100% uninterrupted.
 - Policy changes (`read_only`, `command_blacklist`, `description`, `max_sessions`) apply immediately without dropping connections.
 - Agents can trigger on-demand reloads with `server_list(reload=true)`.
@@ -47,8 +47,8 @@ Standard SSH MCPs open a new connection for every tool call or block the termina
 ### 4. Token-Saving and Cost Optimization
 AI agents don't need raw terminal noise. We sanitize the terminal stream on the server side:
 - **ANSI Escape and Control Code Stripping:** Removes all terminal styling codes before returning text.
-- **Predictable Output Windows & Pagination:** Clean pagination via `offset` and `next_offset`, with `limited: true` when output exceeds page limits.
-- **Rewindable 2MB Buffer:** Retains output in memory without premature eviction. The agent can rewind and re-read from `offset: 0`.
+- **Predictable Output Windows & Pagination:** One unread stream per tab (the tab canvas) read through a single line-based cursor: `limit` (default 200 lines, max 5000, `0` = no line cap), `tail` (last N lines), `offset` = **line** position (negative peeks back from the cursor, `0` inspects from the very first line, positive inspects from line N; any `offset` is a non-consuming peek - the unread cursor does **not** move). `has_more` is the **number of unread lines still left** (`0` = all caught up).
+- **Inspectable 2M-Character Buffer:** Retains up to 2,000,000 characters per tab without premature eviction. Output is mirrored into the tab canvas as it arrives and completed run buffers are evicted under a process-wide budget, so `offset: 0` inspects whatever the canvas holds without resetting unread progress. `dropped_data` reports unread text that was dropped before it could be delivered - including a `tail` jump that skips unread lines.
 - **Native Shell Pipelines:** Agents use standard `| grep`, `| awk`, `| head` inside commands rather than inefficient client-side filtering.
 - **On-Demand Verbose Debugging:** The server returns compact JSON responses by default. Deep telemetry is retrieved only when calling `last_command_details`.
 
@@ -80,11 +80,11 @@ Our toolset is optimized to minimize context bloat while giving your AI agent fu
 | `server_add` | Append target | Safely registers a new SSH target dynamically without restarting the server (append-only). |
 | `session_list` | Session audit | Lists all active persistent sessions and their statuses (`idle`, `busy`, `broken`). Filterable by server prefix. |
 | `session_update` | Rename session | Renames sessions for easier identification. |
-| `session_close` | Terminate channel | Cleanly terminates remote background processes and tears down the SSH channel. |
-| `run` | Execute commands | Runs commands with 5s anti-hang timeout and returns output directly. Without `session_id`, an **idle session is reused with unknown state** (`new_session: true` forces a clean shell); pass the returned `session_id` for sequential commands to preserve state (cwd, env). If an explicit `session_id` is busy, it fails immediately — no background sessions are created. Only commands taking >5s return `still_running: true` (read remaining output via `read`). `wait_timeout: 0` = async, `hard_timeout` = safety interrupt, `use_pty: false` for multiline scripts. |
-| `read` | Read / Scroll Tab | Reads remaining output for commands that returned `still_running: true`, or scrolls through the terminal tab history. Supports full rewind (`offset: 0`) for agent context recovery, tail viewing (negative offset), and pagination (`next_offset`). Retains up to 2MB circular buffer. |
+| `session_close` | Terminate channel | Closes the session and tears down the SSH channel. It does **not** kill remote processes: a command already running on the server may keep going, and anything it writes to the channel after the close is lost. |
+| `run` | Execute commands | Runs commands with 5s anti-hang timeout and returns output directly. Without `session_id`, an **idle session is reused with unknown state** (`new_session: true` forces a clean shell); pass the returned `session_id` for sequential commands to preserve state (cwd, env). If an explicit `session_id` is busy, it fails immediately — no background sessions are created. Only commands taking >5s return `still_running: true`. The first 200 lines (`max_lines`) come back directly; anything beyond that stays in the tab stream, and `has_more` reports how many unread LINES are still waiting - continue with `read(session_id)`. `wait_timeout: 0` or `background: true` = immediate async start, `hard_timeout` = interrupt after N seconds (`status: interrupted`, partial output kept), `use_pty: false` for single commands without PTY (stdin is closed, no interactive heredoc). |
+| `read` | Read / Scroll Tab | Reads the tab's single unread stream (the tab canvas) through one **line-based** cursor: `limit` (default 200 lines, max 5000, `0` = no line cap, no synthetic newlines), `tail` (last N lines; moves the unread position to the end and reports skipped unread lines as `dropped_data`), `offset` = **line** position (negative=peek back from the cursor, `0`=inspect from the very first line, positive=inspect from line N; any `offset` is a non-consuming peek - the cursor does NOT move and unread progress is preserved). No bookkeeping counters are returned: `has_more` is the **number of unread LINES still left** (`0` = all caught up; a window cut by `max_chars`/`max_lines` also adds a `hint`), so call `read(session_id)` again to continue - there is no continuation token. `status` may be `running`, `completed`, `completed_nonzero`, `interrupted` or `stalled` (quiet idle with no end-of-command marker; adds `unconfirmed_completion: true`); `wait_timeout` waits for completion **or** new output and blocks only while the stream is silent. |
 | `signal` | Control processes | Sends `action: "ctrl_c"` to immediately interrupt a stuck command and free the session, or `stdin` to answer prompts. |
-| `file` | Manage files | Workspace-contained file tool supporting directory listings, read windows, uploads, downloads, and in-place search-and-replace edits. |
+| `file` | Manage files | Workspace-contained remote file tool (SFTP, shell fallback) supporting directory listings (`list`), chunked reading with line pagination (`read` with `offset_line`, `limit_lines`), safe atomic creation/overwriting with chmod before rename (`write`), and atomic in-place search-and-replace edits (`edit`), with an optional private `0600` `<path>.mcp.bak` backup (`create_backup: true`); new files are always written with mode `0600` (existing files keep their mode). |
 | `last_command_details`| Command inspect | Returns exact command string, arguments, execution status, and raw output of the last executed tool call for troubleshooting. |
 
 ---
@@ -148,6 +148,58 @@ pip install -r requirements.txt
 ---
 
 ## IDE & Client Configuration
+
+### Tool Profiles: Lean vs Full
+- **`--tool-profile lean` (6 tools):** Ships only `server_list`, `run`, `read`, `signal`, `file`, `session_close`. `server_list` always provides inline `active_sessions: [{"session_id": "...", "status": "...", "mode": "..."}]` in both profiles, so models don't need a separate `session_list` call. Recommended for token efficiency and lightweight local LLMs.
+- **`--tool-profile full` (10 tools, default):** Includes the 6 core tools plus administrative/diagnostic tools: `server_add`, `session_list`, `session_update`, `last_command_details`.
+
+---
+
+### Concrete Agent Examples
+
+#### 1. NDM Router Command (Keenetic CLI)
+Run Cisco-style NDM commands directly with `shell: false`. Do not mix NDM CLI and Linux shell in the same session tab:
+```json
+// tools/call: run
+{
+  "server": "keenetic",
+  "command": "show interface",
+  "shell": false
+}
+```
+
+#### 2. Linux One-Shot Command (Non-Interactive, use_pty: false)
+Execute a standalone script or command via a clean single exec channel with closed `stdin` (no terminal wrappers or PTY echoes):
+```json
+// tools/call: run
+{
+  "server": "vps",
+  "command": "cat /etc/os-release | grep PRETTY_NAME",
+  "use_pty": false
+}
+```
+
+#### 3. Long-Running Command & Clean Output Windowing
+When a command runs longer than `wait_timeout` (`still_running: true`) or unread output remains (`has_more` > 0, including output cut by the inline limits), read the remaining output in clean line-based chunks:
+```json
+// Step 1: tools/call: run
+{
+  "server": "keenetic",
+  "command": "show running-config",
+  "shell": false
+}
+// Response: {"still_running": true, "has_more": 138, "output": "...", "session_id": "keenetic/1"}   // has_more = unread LINES
+
+// Step 2: tools/call: read
+{
+  "server": "keenetic",
+  "session_id": "keenetic/1",
+  "limit": 200
+}
+// Response: has_more counts the unread LINES still left (0 = caught up), plus still_running - repeat the same read to continue; offset counts lines.
+```
+
+---
 
 ### MCP Client Config (`mcp.json`)
 
@@ -215,7 +267,7 @@ pip install -r requirements.txt
 | Parameter / Env | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--servers-config` / `SSH_SERVERS_CONFIG` | String | `servers.json` | Path to JSON file with server targets or inline JSON string. |
-| `--project-root` / `PROJECT_ROOT` | String | `cwd` | Local project root for path containment and cache placement. |
+| `--project-root` | String | `cwd` | Local project root for path containment and cache placement (CLI flag only - there is no `PROJECT_ROOT` environment variable). |
 | `--cache-dir` / `SSH_MCP_CACHE_DIR` | String | `.ssh-cache` | Storage root for session logs, run buffers, and recovery state. |
 | `--read-only` / `SSH_READ_ONLY` | Boolean | `False` | Global read-only guardrail override. |
 | `--command-blacklist` / `SSH_COMMAND_BLACKLIST` | String | None | Global prohibited commands (comma-separated). |

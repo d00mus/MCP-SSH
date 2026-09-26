@@ -32,6 +32,9 @@ MAX_FILE_INSPECT_MAX_BYTES = 2_000_000
 DEFAULT_FILE_EDIT_MAX_BYTES = 1_000_000
 MAX_FILE_EDIT_MAX_BYTES = 5_000_000
 MAX_INLINE_WRITE_BYTES = 200000
+# Buffered stdin (send_signal press_enter=false) is held in memory until it is
+# flushed; without a cap a runaway client grows the session without bound (F5).
+MAX_PENDING_STDIN = 65536
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILE_BYTES = 20 * 1024 * 1024
 # Retention is bounded by BYTES, not by file count (T2.5/F7): 500 files x 20 MB
@@ -76,7 +79,18 @@ INTERACTIVE_PROMPT_PATTERNS = [
 COMPILED_INTERACTIVE_PATTERNS = [re.compile(p) for p in INTERACTIVE_PROMPT_PATTERNS]
 
 # ========= Output cleanup =========
-ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+# CSI, OSC (BEL or ST terminated), DCS/SOS/PM/APC (ST terminated) and the generic
+# ECMA-35 escape ESC [intermediates 0x20-0x2F]* final(0x30-0x7E) - the latter also
+# covers two-byte sequences such as ESC 7 / ESC 8 / ESC = / ESC > / ESC ( B,
+# which the old class [@-Z\\-_] missed (review D3).
+ANSI_ESCAPE = re.compile(
+    r"\x1B(?:"
+    r"\[[0-?]*[ -/]*[@-~]"                     # CSI ... final byte
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"         # OSC ... BEL | ST
+    r"|[PX^_][^\x1b]*(?:\x1b\\)?"              # DCS/SOS/PM/APC ... ST
+    r"|[\x20-\x2f]*[\x30-\x7e]"                # generic escape / designator
+    r")"
+)
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 PROMPT_ONLY_LINE = re.compile(r"^\s*(\([^)]*\)\s*[>#]|[>#])\s*$")
 
@@ -187,25 +201,6 @@ class ServerTargetConfig:
             description=str(data.get("description", "")).strip(),
             max_sessions=max_sessions,
         )
-
-    def to_dict(self, hide_secrets: bool = True) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
-            "alias": self.alias,
-            "host": self.host,
-            "port": self.port,
-            "user": self.user,
-            "description": self.description,
-            "verify_host": self.verify_host,
-            "read_only": self.read_only,
-            "extra_path": self.extra_path,
-            "command_blacklist": self.command_blacklist,
-            "max_sessions": self.max_sessions,
-        }
-        if not hide_secrets:
-            d["password"] = self.password
-            d["key_path"] = self.key_path
-            d["key_passphrase"] = self.key_passphrase
-        return d
 
 
 class ServersRegistry:

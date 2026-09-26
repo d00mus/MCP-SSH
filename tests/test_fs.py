@@ -562,7 +562,14 @@ class TestFS(unittest.TestCase):
         self.assertEqual(len(renames), 1)
         self.assertTrue(renames[0][1].startswith("/etc/rc.local.mcp_tmp."), renames)
         self.assertEqual(renames[0][2], "/etc/rc.local")
-        self.assertIn(("chmod", "/etc/rc.local", 0o755), sftp.calls)
+        # P0: chmod MUST happen on the temp file BEFORE posix_rename
+        chmod_calls = [c for c in sftp.calls if c[0] == "chmod"]
+        self.assertTrue(chmod_calls)
+        self.assertTrue(chmod_calls[0][1].startswith("/etc/rc.local.mcp_tmp."))
+        self.assertEqual(chmod_calls[0][2], 0o755)
+        posix_rename_idx = sftp.calls.index(renames[0])
+        chmod_idx = sftp.calls.index(chmod_calls[0])
+        self.assertLess(chmod_idx, posix_rename_idx, "chmod must occur before posix_rename!")
         # the destination itself must never be opened for writing (truncate risk)
         self.assertFalse([c for c in sftp.calls if c[0] == "file" and c[1] == "/etc/rc.local"])
 
@@ -1233,6 +1240,183 @@ class TestFS(unittest.TestCase):
             res = _write_remote_file_bytes(session, "/opt/test.txt", b"binary \x00 data")
             self.assertFalse(res["success"], res)
             self.assertIn("cannot be written safely", res["error"])
+
+    def test_chmod_denied_leaves_original_unchanged_and_returns_error(self):
+        """P0: If chmod fails on temp file, rename must NOT occur and error must be returned."""
+        class ChmodFailingSFTP:
+            def __init__(self):
+                self.calls = []
+                self.removed = []
+
+            class _H:
+                def __enter__(self): return self
+                def __exit__(self, *args): return False
+                def write(self, data): pass
+
+            def stat(self, path):
+                m = MagicMock()
+                m.st_mode = 0o100600
+                return m
+
+            def file(self, path, mode):
+                self.calls.append(("file", path))
+                return ChmodFailingSFTP._H()
+
+            def chmod(self, path, mode):
+                self.calls.append(("chmod", path, mode))
+                raise PermissionError("chmod denied")
+
+            def posix_rename(self, src, dst):
+                self.calls.append(("posix_rename", src, dst))
+
+            def remove(self, path):
+                self.removed.append(path)
+
+            def close(self): pass
+
+        sftp = ChmodFailingSFTP()
+        session = MagicMock()
+        session.open_sftp.return_value = sftp
+        # Mock client.exec_command to avoid fallback succeeding
+        session.client.exec_command.side_effect = Exception("No exec")
+
+        res = _write_remote_file_bytes(session, "/root/secret.key", b"secret_data")
+        self.assertFalse(res["success"])
+        # Ensure posix_rename was never called!
+        self.assertFalse([c for c in sftp.calls if c[0] == "posix_rename"])
+        self.assertTrue(sftp.removed)
+
+    def test_file_read_501_lines_reports_incomplete_and_exposes_next_line(self):
+        """P1: file(action=read) on 501 lines reports truncated=True and next_offset_line=201."""
+        lines = [f"line {i}" for i in range(1, 502)]
+        full_content = "\n".join(lines).encode("utf-8")
+
+        session = MagicMock()
+        session.server_alias = "srv1"
+        session.id = 1
+        session.name = "sess"
+        session.is_busy.return_value = False
+        session.ensure_alive.return_value = None
+        session.is_dead = False
+        node = MagicMock()
+        node.alias = "srv1"
+        node.get_session.return_value = session
+        node.server_config.read_only = False
+        manager = MagicMock()
+        manager.resolve_target_for_args.return_value = (node, 1, False, None)
+
+        with patch("src.fs._read_remote_file_bytes", return_value={"success": True, "data": full_content, "method": "sftp", "truncated": False}):
+            res = file_dispatch({"action": "read", "path": "/var/log/big.log"}, manager)
+            self.assertTrue(res["success"])
+            self.assertTrue(res["truncated"], "501 lines with default 200 limit MUST be truncated=True!")
+            self.assertEqual(res["line_start"], 1)
+            self.assertEqual(res["line_end"], 200)
+            self.assertEqual(res["total_lines"], 501)
+            self.assertEqual(res.get("next_offset_line"), 201)
+
+    def test_sftp_new_file_mode_defaults_to_0600(self):
+        """§4 / §10: New file written via SFTP must default to 0600 mode."""
+        chmod_calls = []
+        class MockNewSFTP:
+            def stat(self, path):
+                raise FileNotFoundError("no such file")
+            def file(self, path, mode):
+                return MagicMock()
+            def chmod(self, path, mode):
+                chmod_calls.append((path, oct(mode)))
+            def posix_rename(self, src, dst):
+                pass
+            def close(self):
+                pass
+
+        session = MagicMock()
+        session.open_sftp.return_value = MockNewSFTP()
+        res = _write_remote_file_bytes(session, "/root/new_secret.txt", b"payload")
+        self.assertTrue(res["success"])
+        self.assertTrue(chmod_calls)
+        self.assertEqual(chmod_calls[0][1], "0o600", "New file must default to 0600 mode!")
+
+    def test_edit_backup_has_private_mode_even_when_new(self):
+        """§4 / §10: Backup file .mcp.bak must be written with private_mode=True."""
+        manager, session = self._create_mock_manager()
+        written_files = []
+
+        def mock_write(sess, path, data, private_mode=False):
+            written_files.append((path, private_mode))
+            return {"success": True, "method": "sftp"}
+
+        with patch("src.fs._read_remote_file_bytes", return_value={"success": True, "data": b"old content\n", "method": "sftp"}), \
+             patch("src.fs._write_remote_file_bytes", side_effect=mock_write):
+            res = file_dispatch({
+                "action": "edit", "path": "/etc/secret.conf", "create_backup": True,
+                "edits": [{"old_text": "old", "new_text": "new"}],
+            }, manager)
+
+        self.assertTrue(res["success"])
+        bak_entries = [w for w in written_files if w[0].endswith(".mcp.bak")]
+        self.assertTrue(bak_entries, "Backup file must be written")
+        self.assertTrue(bak_entries[0][1], "Backup file must have private_mode=True!")
+
+    def test_shell_write_chmods_tmp_file_before_mv(self):
+        """§4 / §10: Shell fallback must chmod temporary file BEFORE mv."""
+        import re
+        session = MagicMock()
+        session.open_sftp.return_value = None
+        session.client = MagicMock()
+        session.client.exec_command.side_effect = RuntimeError("exec disabled")
+        captured = []
+
+        def mock_sync(s, cmd, **kwargs):
+            captured.append(cmd)
+            if "stat -c %a" in cmd:
+                return {"success": True, "output": "755"}
+            m = re.search(r"echo '(MCP_[A-Z0-9_]+)'", cmd)
+            if m:
+                return {"success": True, "output": m.group(1)}
+            return {"success": True, "output": ""}
+
+        with patch("src.fs._sync_shell", side_effect=mock_sync):
+            res = _write_remote_file_bytes(session, "/etc/init.d/rc.local", b"#!/bin/sh\n")
+        self.assertTrue(res["success"], res)
+        # Check that decode_cmd contains chmod on tmp_remote before mv
+        decode_cmds = [c for c in captured if "base64 -d" in c]
+        self.assertTrue(decode_cmds, "Must have decode command")
+        self.assertIn("chmod", decode_cmds[0], "chmod must be inside decode command before mv!")
+        chmod_pos = decode_cmds[0].find("chmod")
+        mv_pos = decode_cmds[0].find("mv -f")
+        self.assertLess(chmod_pos, mv_pos, "chmod must execute before mv!")
+
+    def test_exec_cat_new_file_chmods_0600_after_mv(self):
+        """R5: exec-cat write of a new file must chmod 600 the target AFTER the tmp+mv rename."""
+        import re
+        sent = []
+        session = MagicMock()
+        session.id = 1
+        session.open_sftp.return_value = None  # force the exec_command write branch
+        session.client = MagicMock()
+
+        def fake_exec(cmd):
+            sent.append(cmd)
+            m_in, m_out, m_err = MagicMock(), MagicMock(), MagicMock()
+            m_out.channel.recv_exit_status.return_value = 0
+            m_out.read.return_value = b""  # stat returns nothing -> new file (original_mode=None)
+            m_err.read.return_value = b""
+            marker = re.search(r"echo '(MCP_CAT_OK_[^']+)'", cmd)
+            if marker:
+                m_out.read.return_value = marker.group(1).encode()
+            return m_in, m_out, m_err
+
+        session.client.exec_command.side_effect = fake_exec
+
+        res = _write_remote_file_bytes(session, "/root/new_secret.key", b"payload")
+        self.assertTrue(res["success"], res)
+        self.assertEqual(res.get("method"), "exec_cat")
+
+        target = "/root/new_secret.key"
+        chmods = [i for i, c in enumerate(sent) if c == f"chmod 600 '{target}'"]
+        self.assertEqual(len(chmods), 1, f"exactly one chmod 600 on the target expected: {sent}")
+        mv_index = next(i for i, c in enumerate(sent) if "mv -f" in c and target in c)
+        self.assertLess(mv_index, chmods[0], f"chmod 600 must run after tmp+mv: {sent}")
 
 if __name__ == "__main__":
     unittest.main()
