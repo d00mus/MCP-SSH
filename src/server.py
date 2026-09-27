@@ -10,7 +10,7 @@ from src.config import (
     DEFAULT_QUIET_COMPLETE_TIMEOUT, DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_CHARS,
     MAX_SERVERS, config
 )
-from src.utils import log_error, to_bool
+from src.utils import log_error, to_bool, strip_internal_framing
 from src.fs import file_dispatch
 
 def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -63,7 +63,7 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
             f"Command hit hard timeout ({result.get('hard_timeout', 'see hard_timeout param')}s) and was interrupted; "
             "partial output kept - re-run with a bigger hard_timeout or in background."
         )
-        projected["output"] = result.get("output", "")
+        projected["output"] = strip_internal_framing(result.get("output", ""))
         if result.get("hint"):
             projected["hint"] = result["hint"]
         if result.get("error_code"):
@@ -76,13 +76,13 @@ def project_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any
             projected["error"] = result.get("error") or f"Command failed ({status})"
         else:
             projected["error"] = result.get("error") or f"Command failed with exit status {exit_status}"
-        projected["output"] = result.get("output", "")
+        projected["output"] = strip_internal_framing(result.get("output", ""))
         if result.get("hint"):
             projected["hint"] = result["hint"]
         if result.get("error_code"):
             projected["error_code"] = result["error_code"]
     elif tool_name in {"run", "read"}:
-        projected["output"] = result.get("output", "")
+        projected["output"] = strip_internal_framing(result.get("output", ""))
         if result.get("message"):
             projected["message"] = result.get("message")
         if result.get("session_reused"):

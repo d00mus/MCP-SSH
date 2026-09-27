@@ -10,7 +10,7 @@ import functools
 from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 from src.config import (
-    ANSI_ESCAPE, CONTROL_CHARS, PROMPT_ONLY_LINE, MAX_READ_MAX_LINES, MAX_LOG_FILE_BYTES, config,
+    ANSI_ESCAPE, CONTROL_CHARS, MAX_READ_MAX_LINES, MAX_LOG_FILE_BYTES, config,
     MAX_DEAD_SESSION_LOGS_PER_SERVER, MIN_LOG_RETENTION_SECONDS
 )
 
@@ -78,7 +78,10 @@ def _is_filesystem_root(path: str) -> bool:
     return parent == real
 
 
-_EXIT_MARKER_LINE = re.compile(r"^__MCP_EC_[0-9a-f]+_\d+$")
+# Any residual marker token, whole or split by a canvas window boundary.
+_EXIT_MARKER_TOKEN = re.compile(r"__MCP_EC_[0-9a-f_]*")
+# The PTY echo of the wrapper command built by wrap_posix_exit_marker().
+_EXIT_MARKER_WRAPPER = re.compile(r"printf\s+'%s\\n'\s+\"__MCP_EC_[0-9a-f_]*_\$\?\"")
 
 
 def parse_exit_marker(text: str, token: str) -> Optional[int]:
@@ -99,6 +102,35 @@ def parse_exit_marker(text: str, token: str) -> Optional[int]:
     if match:
         return int(match.group(1))
     return None
+
+
+def strip_internal_framing(text: str) -> str:
+    """Strip the internal exit-marker framing from agent-facing output.
+
+    wrap_posix_exit_marker() appends a printf that prints __MCP_EC_<token>_<rc>.
+    The PTY echoes the wrapped command and the shell prints the marker line; both
+    are bookkeeping (the token is unguessable, which is exactly what lets
+    parse_exit_marker trust it) and must never reach the agent. This is the single
+    sanitiser at the output boundary. Only internal framing is removed: every
+    other byte is preserved verbatim, and no cursor/has_more arithmetic is
+    derived from the returned text.
+    """
+    if not text or "__MCP_EC_" not in text:
+        return text
+    kept = []
+    for line in text.split("\n"):
+        if "__MCP_EC_" not in line:
+            kept.append(line)
+            continue
+        if _EXIT_MARKER_WRAPPER.search(line):
+            # The PTY echo of the wrapper command: drop the whole line.
+            continue
+        residual = _EXIT_MARKER_TOKEN.sub("", line)
+        if line.strip() and not residual.strip():
+            # The line was nothing but the marker (or a window-split fragment).
+            continue
+        kept.append(residual)
+    return "\n".join(kept)
 
 
 def _is_within(norm_real: str, norm_root: str) -> bool:
@@ -351,23 +383,6 @@ class StreamCleaner:
         self._pending_escape = ""
         return out
 
-def clean_output(text: str, remove_echo: bool = False, strip: bool = True) -> str:
-    if not text:
-        return ""
-    text = ANSI_ESCAPE.sub("", text)
-    text = CONTROL_CHARS.sub("", text)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if remove_echo and "\n" in text:
-        text = text.split("\n", 1)[1]
-    cleaned_lines = []
-    for line in text.split("\n"):
-        stripped = line.strip() or ""
-        if PROMPT_ONLY_LINE.match(stripped) or _EXIT_MARKER_LINE.match(stripped):
-            continue
-        cleaned_lines.append(line)
-    text = "\n".join(cleaned_lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip() if strip else text
 
 def json_line(path: str, payload: Dict[str, Any]) -> None:
     if getattr(config, "LOG_OUTPUT", "meta") == "off":

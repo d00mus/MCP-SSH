@@ -92,7 +92,6 @@ ANSI_ESCAPE = re.compile(
     r")"
 )
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-PROMPT_ONLY_LINE = re.compile(r"^\s*(\([^)]*\)\s*[>#]|[>#])\s*$")
 
 # ========= Server Target Configuration =========
 @dataclass(eq=True)

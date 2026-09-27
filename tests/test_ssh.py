@@ -520,15 +520,6 @@ class TestSSH(unittest.TestCase):
             self.assertEqual(run.status, "failed")
             self.assertIn("Interactive prompt detected", run.error)
 
-    def test_clean_output_preserves_parentheses_lines(self):
-        """Verify PROMPT_ONLY_LINE does not strip valid text lines enclosed in parentheses."""
-        from src.utils import clean_output
-        text = "header\n(1)\n(DEBUG: initializing)\n(config)>\n#"
-        cleaned = clean_output(text)
-        self.assertIn("(1)", cleaned)
-        self.assertIn("(DEBUG: initializing)", cleaned)
-        self.assertNotIn("(config)>", cleaned)
-
     def test_find_prompt_no_false_positive_on_dollar_hash_greater(self):
         """Verify find_prompt does not falsely match text ending with $, #, > unless it's a prompt."""
         from src.utils import find_prompt
@@ -1764,12 +1755,48 @@ class TestSSH(unittest.TestCase):
         # Echo line must NOT match (it contains _$?)
         self.assertIsNone(parse_exit_marker(f"echo hi; printf '%s\\n' \"__MCP_EC_{token}_$?\"\n", token))
 
-    def test_clean_output_removes_exit_marker(self):
-        from src.utils import clean_output
-        text = "Hello world\n__MCP_EC_0123456789abcdef_0\n"
-        cleaned = clean_output(text)
-        self.assertEqual(cleaned, "Hello world")
+    def test_strip_internal_framing_removes_echo_and_marker(self):
+        from src.utils import strip_internal_framing
+        token = "c5b472bf1f93d509"
+        raw = (
+            f"ls -la /opt/naiveproxy; printf '%s\\n' \"__MCP_EC_{token}_$?\"\n"
+            "/opt/naiveproxy:\n"
+            "total 60\n"
+            f"__MCP_EC_{token}_0\n"
+            "$ "
+        )
+        cleaned = strip_internal_framing(raw)
         self.assertNotIn("__MCP_EC_", cleaned)
+        self.assertNotIn("printf", cleaned)
+        self.assertIn("/opt/naiveproxy:", cleaned)
+        self.assertIn("total 60", cleaned)
+
+    def test_strip_internal_framing_removes_split_marker_fragment(self):
+        from src.utils import strip_internal_framing
+        # A canvas window can end mid-marker: the fragment must not leak either.
+        cleaned = strip_internal_framing("real output\n__MCP_EC_c5b472bf\nmore")
+        self.assertEqual(cleaned, "real output\nmore")
+
+    def test_strip_internal_framing_preserves_plain_output(self):
+        from src.utils import strip_internal_framing
+        # No framing -> byte-for-byte identity (blank lines and whitespace included),
+        # so canvas cursor / has_more arithmetic can never be shifted by the sanitiser.
+        raw = "first\n\n  spaced  \nlast\n"
+        self.assertEqual(strip_internal_framing(raw), raw)
+
+    def test_read_canvas_never_exposes_exit_marker(self):
+        session, _, _ = self._create_mock_session()
+        token = "fb70ca1f3860fafa"
+        session.append_scrollback(
+            f"sed -n '30,31p' /etc/hosts; printf '%s\\n' \"__MCP_EC_{token}_$?\"\n"
+            "127.0.0.1 localhost\n"
+            f"__MCP_EC_{token}_0\n"
+            "$ "
+        )
+        res = session.read_canvas(limit=100, max_chars=100000, wait_timeout=0.0)
+        self.assertNotIn("__MCP_EC_", res["output"])
+        self.assertNotIn("printf", res["output"])
+        self.assertIn("127.0.0.1 localhost", res["output"])
 
     def test_async_start_wait_timeout_zero(self):
         session, _, _ = self._create_mock_session()
@@ -3229,13 +3256,6 @@ class TestScrollbackEvictionSemantics(unittest.TestCase):
         self.assertTrue(res["success"])
         self.assertTrue(res["dropped_data"], "Evicted scrollback must be reported as dropped_data!")
         self.assertEqual(res["output"], "GHIJ")
-
-    def test_clean_output_keeps_whitespace_when_strip_is_false(self):
-        """clean_output(strip=False) strips escapes but keeps the surrounding whitespace."""
-        from src.utils import clean_output
-        raw = "  \x1b[31mspaced\x1b[0m  \r\nnext\r\n"
-        self.assertEqual(clean_output(raw), "spaced  \nnext")
-        self.assertEqual(clean_output(raw, strip=False), "  spaced  \nnext\n")
 
 
 class TestReadStateContract(unittest.TestCase):

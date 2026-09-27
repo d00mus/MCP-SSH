@@ -1149,6 +1149,28 @@ class TestMultiServer(unittest.TestCase):
         self.assertLess(len(last_details["result"]["output"]), 20000)
         self.assertIn("[truncated", last_details["result"]["output"])
 
+    def test_last_command_details_never_exposes_exit_marker(self):
+        """last_command_details bypasses project_tool_result, so its stored snapshot
+        must strip internal __MCP_EC_ framing on its own."""
+        res_payload = {
+            "success": True,
+            "status": "completed",
+            "session_id": "keenetic/1",
+            "output": (
+                "uptime; printf '%s\\n' \"__MCP_EC_deadbeefdeadbeef_$?\"\n"
+                " 10:00:00 up 3 days\n"
+                "__MCP_EC_deadbeefdeadbeef_0\n"
+                "$ "
+            ),
+        }
+
+        self.manager.record_tool_result("keenetic", "run", {"server": "keenetic"}, res_payload)
+        last_details = self.manager.get_last_tool_result("keenetic", 1)
+
+        self.assertNotIn("__MCP_EC_", last_details["result"]["output"])
+        self.assertNotIn("printf", last_details["result"]["output"])
+        self.assertIn("up 3 days", last_details["result"]["output"])
+
     def test_dispute_epoch_still_drops_inflight_session(self):
         node = self.manager.get_or_create_node(self.cfg1)
 

@@ -16,7 +16,7 @@ from src.config import (
     CONNECT_TIMEOUT, HEALTH_CHECK_INTERVAL, MAX_TOTAL_BUFFER_CHARS, MAX_LOG_TOTAL_BYTES,
     ServerTargetConfig, ServersRegistry, config
 )
-from src.utils import log_error, iso_now, cleanup_old_logs, cleanup_dead_session_logs, mask_secrets
+from src.utils import log_error, iso_now, cleanup_old_logs, cleanup_dead_session_logs, mask_secrets, strip_internal_framing
 from src.session import SSHSession
 from src.ssh_state import CHARS_ACCOUNT
 
@@ -37,6 +37,10 @@ def _sanitize_tool_data(data: Any, depth: int = 0) -> Any:
     elif isinstance(data, list):
         return [_sanitize_tool_data(x, depth + 1) for x in data[:100]]
     elif isinstance(data, str):
+        # Internal command framing (__MCP_EC_ exit marker + echoed wrapper) must never
+        # reach diagnostics either: last_command_details returns this snapshot verbatim
+        # and deliberately bypasses project_tool_result.
+        data = strip_internal_framing(data)
         # Secret-looking fragments (password=..., --token ...) stay out of diagnostics
         if len(data) > 10000:
             return mask_secrets(data[:10000]) + "... [truncated in last_command_details]"

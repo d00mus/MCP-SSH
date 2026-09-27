@@ -32,7 +32,7 @@ from src.config import (
 from src.utils import (
     log_error, clamp_float, clamp_int, iso_now, json_line, safe_name,
     find_prompt, parse_exit_marker, cleanup_dead_session_logs,
-    StreamCleaner
+    strip_internal_framing, StreamCleaner
 )
 from src.security import check_command_security, escape_shell_path
 from src.ssh_state import RunState, ChunkBuffer, CHARS_ACCOUNT, count_virtual_lines, find_line_offset, slice_virtual_lines
@@ -563,7 +563,7 @@ class SSHSession:
             "numeric_session_id": self.id,
             "server": self.server_alias,
             "status": status,
-            "output": window,
+            "output": strip_internal_framing(window),
             "has_more": has_more,
             "still_running": still_running,
             "in_shell": self.in_shell,

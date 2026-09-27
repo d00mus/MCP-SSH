@@ -17,7 +17,7 @@ from src.server import (
 )
 from src.session import SSHSession
 from src.ssh_state import RunState
-from src.utils import apply_text_filters, make_cache_dirs, resolve_local_path
+from src.utils import apply_text_filters, make_cache_dirs, resolve_local_path, StreamCleaner
 
 class TestServer(unittest.TestCase):
     def test_project_tool_result_mcp_level_errors(self):
@@ -704,7 +704,7 @@ class TestServer(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("too many regex workers are still running", result["error"])
 
-    def test_dispute_run_filter_strips_ansi_under_lock(self):
+    def test_run_projection_strips_internal_framing_under_lock(self):
         root = tempfile.mkdtemp()
         cache_dirs = make_cache_dirs(root)
         registry_cfg = ServerTargetConfig(alias="filt", host="10.9.8.7", user="u")
@@ -715,13 +715,17 @@ class TestServer(unittest.TestCase):
             session = SSHSession(1, "s", cache_dirs, "filt", server_config=registry_cfg)
             session.ensure_alive = MagicMock(return_value=None)
             session.client = MagicMock()
-            ansi = "\x1b[31mhello\x1b[0m"
+            raw_output = (
+                "echo; printf '%s\\n' \"__MCP_EC_0123456789abcdef_$?\"\n"
+                "\x1b[31mhello\x1b[0m\n"
+                "__MCP_EC_0123456789abcdef_0"
+            )
             run = RunState(
                 run_id=7, session_id=1, command="echo", mode="sync",
                 started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
                 max_buffer_chars=1000, run_log_path=os.path.join(cache_dirs["runs_dir"], "filt.log"),
             )
-            run.output_buffer = ansi
+            run.output_buffer = raw_output
 
             class _LockProbe:
                 def __init__(self, inner):
@@ -740,7 +744,7 @@ class TestServer(unittest.TestCase):
             session.runs[7] = run
             session.run_command = MagicMock(return_value={
                 "success": True,
-                "output": ansi,
+                "output": raw_output,
                 "run_id": 7,
                 "status": "completed",
                 "session_id": "filt/1",
@@ -749,9 +753,14 @@ class TestServer(unittest.TestCase):
             node.sessions[1] = session
             result = run_dispatch({"server": "filt", "session_id": "filt/1", "command": "echo"}, manager)
             self.assertTrue(result["success"])
-            from src.utils import clean_output
-            cleaned = clean_output(result["output"])
-            self.assertEqual(cleaned, "hello")
+            # The SERVER projection (not the test) must strip internal framing:
+            # cleaning here instead hid the regression for a whole release.
+            projected = project_tool_result("run", result)
+            self.assertNotIn("__MCP_EC_", projected["output"])
+            self.assertNotIn("printf", projected["output"])
+            # The payload survives; ANSI removal is the stream cleaner's job, which
+            # runs upstream when the PTY bytes enter the canvas.
+            self.assertEqual(StreamCleaner().feed(projected["output"]), "hello")
             self.assertEqual(probe.entries, 0)
         finally:
             manager.close_all()
