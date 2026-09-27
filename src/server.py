@@ -350,13 +350,12 @@ def tools_list() -> Dict[str, Any]:
             "name": "run",
             "description": (
                 "Run a command in a session tab (one command at a time). "
-                "The first max_lines (default 200) lines come back when it finishes within "
+                "The first line_limit (default 200) lines come back when it finishes within "
                 "wait_timeout (default 5s); the rest stays in the tab stream, counted by has_more - "
                 "continue with read(session_id). "
-                "Call 'read' only when still_running=true or status=stalled (quiet idle, "
-                "unconfirmed_completion=true). Without session_id an idle session is reused with "
-                "UNKNOWN state (pwd/env); pass session_id to preserve state, or new_session=true "
-                "for a clean shell."
+                "Call 'read' only when still_running=true or status=stalled. "
+                "Without session_id an idle session is reused with UNKNOWN state; "
+                "pass session_id to preserve state, or new_session=true for a clean shell."
             ),
             "inputSchema": {
                 "type": "object",
@@ -370,8 +369,7 @@ def tools_list() -> Dict[str, Any]:
                     "new_session": {"type": "boolean", "description": "Force opening a clean session with default state."},
                     "session_name": {"type": "string"},
                     "use_pty": {"type": "boolean", "description": "true (default, supports heredoc/stdin via signal); false=exec channel for single commands only (stdin is closed, no heredoc)."},
-                    "max_chars": {"type": "number", "description": "Max output chars returned inline (default 8192, max 200000). Raise for long outputs like show running-config."},
-                    "max_lines": {"type": "number", "description": "Max output lines returned inline (default 200, max 5000; 0=all lines). Anything beyond it stays in the tab stream and is counted by has_more - continue with read(session_id)."},
+                    "line_limit": {"type": "integer", "description": "Max lines to return inline (default 200, max 5000; 0=all lines). Anything beyond it stays in the tab stream and is counted by has_more - continue with read(session_id)."},
                 },
                 "required": ["command"],
             },
@@ -381,10 +379,10 @@ def tools_list() -> Dict[str, Any]:
             "description": (
                 "Read the session tab's unread output. run and read page over ONE stream (the tab "
                 "scrollback canvas) with one line-based cursor, so output is never delivered twice. "
-                "A plain read(session_id) returns the next unread lines up to limit (default 200) and advances "
+                "A plain read(session_id) returns the next unread lines up to line_limit (default 200) and advances "
                 "the cursor; tail=N returns the last N lines and moves the cursor to the end of the stream; "
                 "offset peeks session history without moving the unread cursor: offset>=0 reads from that line forward (offset=0 = the very beginning of "
-                "the buffered history); offset<0 peeks limit lines starting that many lines ABOVE the cursor. "
+                "the buffered history); offset<0 peeks line_limit lines starting that many lines ABOVE the cursor. "
                 "wait_timeout blocks only while the stream is silent - output already buffered comes back at once. "
                 "Returns output plus has_more - the NUMBER of unread LINES still left (0 = all caught up; read "
                 "again to continue) - and still_running (true while a command is in flight); plus status, mode "
@@ -395,12 +393,10 @@ def tools_list() -> Dict[str, Any]:
                 "properties": {
                     "server": server_param,
                     "session_id": session_id_param,
-                    "limit": {"type": "integer", "description": "Max lines to return (default 200, max 5000; 0=all lines up to max_chars). Not combined with tail."},
+                    "line_limit": {"type": "integer", "description": "Max lines to return (default 200, max 5000; 0=all lines). Not combined with tail."},
                     "tail": {"type": "integer", "description": "Return the last N lines and move the cursor to the end of the stream; unread lines skipped on the way are reported as dropped_data."},
-                    "offset": {"type": "number", "description": "LINE number in the tab stream (the only unit offsets use). Any offset is a non-consuming peek: inspects history without moving the unread cursor. offset>=0 reads from that line forward (0=the very first line of history). offset<0 peeks: limit lines starting that many lines ABOVE the cursor. Omit for normal paging through unread output."},
+                    "offset": {"type": "number", "description": "LINE number in the tab stream (the only unit offsets use). Any offset is a non-consuming peek: inspects history without moving the unread cursor. offset>=0 reads from that line forward (0=the very first line of history). offset<0 peeks: line_limit lines starting that many lines ABOVE the cursor. Omit for normal paging through unread output."},
                     "wait_timeout": {"type": "number", "description": "Max seconds to wait for a running command to finish or produce output (default 5.0). Blocks only while the stream is silent; set 0 for an instant non-blocking read."},
-                    "max_lines": {"type": "number", "description": "Line cap for this window; used when limit is absent."},
-                    "max_chars": {"type": "number", "description": "Max output chars returned inline (default 8192, up to 200000). A truncated window is reported through has_more and a hint."},
                 },
             },
         },
@@ -515,15 +511,13 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
     hard_timeout = args.get("hard_timeout", DEFAULT_HARD_TIMEOUT)
     background = to_bool(args.get("background", False))
     use_pty = to_bool(args.get("use_pty", True))
-    run_max_chars = args.get("max_chars", DEFAULT_READ_MAX_CHARS)
-    run_max_lines = args.get("max_lines", DEFAULT_READ_MAX_LINES)
-    try: run_max_chars = int(run_max_chars)
-    except (ValueError, TypeError): run_max_chars = DEFAULT_READ_MAX_CHARS
-    try: run_max_lines = int(run_max_lines)
-    except (ValueError, TypeError): run_max_lines = DEFAULT_READ_MAX_LINES
+    raw_line_limit = args.get("line_limit")
+    run_line_limit = coerce_int_arg(raw_line_limit) if raw_line_limit is not None else DEFAULT_READ_MAX_LINES
+    if raw_line_limit is not None and run_line_limit is None:
+        return {"success": False, "error": "line_limit must be number"}
+
     # Internal knobs are deliberately not agent-facing (T3.1): fixed sane defaults
     # here; the file tool reaches the full run_command surface internally.
-    # max_chars/max_lines ARE agent-facing: they only size the inline slice.
     mode = "sync"
     startup_wait = DEFAULT_STARTUP_WAIT
     completion_hint = "either"
@@ -599,7 +593,7 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
         command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
         startup_wait=startup_wait, hard_timeout=hard_timeout,
         completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
-        max_chars=run_max_chars, max_lines=run_max_lines,
+        line_limit=run_line_limit,
         background=background, use_pty=use_pty, req_id=req_id
     )
 
@@ -614,7 +608,7 @@ def run_dispatch(args: Dict[str, Any], manager, req_id: Any = None) -> Dict[str,
                     command=command, mode=mode, shell=shell, wait_timeout=wait_timeout,
                     startup_wait=startup_wait, hard_timeout=hard_timeout,
                     completion_hint=completion_hint, quiet_complete_timeout=quiet_complete_timeout,
-                    max_chars=run_max_chars, max_lines=run_max_lines,
+                    line_limit=run_line_limit,
                     background=background, use_pty=use_pty, req_id=req_id
                 )
                 result = retry_result
@@ -670,10 +664,11 @@ def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     # Everything is session-level (m01215): run and read page over the tab canvas
     # through one line-based cursor, so there is no run selector on this surface.
     offset = args.get("offset")
-    limit = args.get("limit")
+    raw_line_limit = args.get("line_limit")
+    line_limit = coerce_int_arg(raw_line_limit) if raw_line_limit is not None else None
+    if raw_line_limit is not None and line_limit is None:
+        return {"success": False, "error": "line_limit must be number"}
     tail = args.get("tail")
-    max_lines = args.get("max_lines", DEFAULT_READ_MAX_LINES)
-    max_chars = args.get("max_chars", DEFAULT_READ_MAX_CHARS)
     wait_timeout = args.get("wait_timeout", DEFAULT_WAIT_TIMEOUT)
     if wait_timeout is not None:
         try: wait_timeout = float(wait_timeout)
@@ -682,18 +677,9 @@ def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
     if offset is not None:
         offset = coerce_int_arg(offset)
         if offset is None: return {"success": False, "error": "offset must be number"}
-    if limit is not None:
-        limit = coerce_int_arg(limit)
-        if limit is None: return {"success": False, "error": "limit must be number"}
     if tail is not None:
         tail = coerce_int_arg(tail)
         if tail is None: return {"success": False, "error": "tail must be number"}
-    if max_lines is not None:
-        max_lines = coerce_int_arg(max_lines)
-        if max_lines is None: return {"success": False, "error": "max_lines must be number"}
-    if max_chars is not None:
-        max_chars = coerce_int_arg(max_chars)
-        if max_chars is None: return {"success": False, "error": "max_chars must be number"}
     if args.get("run_id") is not None:
         return {
             "success": False,
@@ -722,15 +708,12 @@ def read_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:
         else:
             return {"success": False, "error": f"Multiple sessions exist on server '{target_manager.alias}'. Please specify 'session_id'.", "server": target_manager.alias}
 
-    effective_limit = limit if limit is not None else max_lines
-    if effective_limit is None:
-        effective_limit = DEFAULT_READ_MAX_LINES
+    effective_limit = line_limit if line_limit is not None else DEFAULT_READ_MAX_LINES
     return session.read_canvas(
-        limit=effective_limit,
+        line_limit=effective_limit,
         tail=tail,
         offset=offset,
         wait_timeout=wait_timeout,
-        max_chars=max_chars,
     )
 
 def signal_dispatch(args: Dict[str, Any], manager) -> Dict[str, Any]:

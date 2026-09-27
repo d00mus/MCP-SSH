@@ -1,32 +1,34 @@
-# Robust Multi-Server SSH MCP Gateway with Persistent Sessions & Anti-Hang Protection
+# Multi-Server SSH MCP Gateway with Persistent Sessions
 
 [![Model Context Protocol](https://img.shields.io/badge/MCP-Supported-blue)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-**A professional, production-ready Multi-Server SSH Model Context Protocol (MCP) gateway engineered specifically for AI agents (Claude Desktop, Continue.dev, LLM IDEs).**
+An SSH gateway (Model Context Protocol) for AI agents — Claude Desktop, Continue.dev, LLM IDEs — that need to work with more than one host: routers, NAS, cloud VPS, staging boxes.
 
-Most SSH MCP implementations are simple 1:1 single-host wrappers. When you manage multiple servers (routers, NAS, cloud VPS, staging environments), registering separate MCP servers explodes your tool catalog to 60–80+ tools, wastes precious context tokens, triggers hallucinations, and constantly freezes on interactive prompts.
+Most SSH MCP setups are single-host wrappers: one host means one more MCP server in the config. With a few hosts that turns into dozens of duplicated tools in every prompt — extra tokens, a confused model, and sessions that hang on the first interactive prompt.
 
-This project is a **high-performance, resilient terminal gateway** that acts like a distributed `tmux` for your AI agent—featuring a **unified multi-host routing engine**, **zero-downtime hot-reload**, persistent multi-session control (up to 10 concurrent sessions per server by default), token-saving lean payloads, and automated anti-hang engines.
+This gateway covers the whole fleet from a single MCP instance: routing by server alias, persistent sessions with scrollback, compact output with explicit exit statuses, and handling for interactive prompts and pagers. It fits AI-assisted ops (AI-devops) workflows well: the agent runs commands, reads output, edits files, and moves on without constant supervision.
 
 ---
 
-## The Difference: Why Existing SSH MCPs Fail (and How We Fix It)
+## Where single-host setups usually hurt
 
-| The Pain Point | Typical SSH MCP Server (The "Scooter") | This Gateway (The "Supercar") |
+The same problems come up in almost every SSH MCP implementation:
+
+| Problem | Typical single-host setup | This gateway |
 | :--- | :--- | :--- |
-| **Context Bloat & Token Waste** | Separate MCP server for each host. 5 servers = 50+ tool definitions dumped into every prompt, burning API tokens and causing model confusion. | **Unified Multi-Server Gateway:** 1 single MCP instance exposing compact tools for your entire fleet. Route by `server: "alias"` or composite session IDs (`keenetic/1`, `vps/2`). |
-| **Configuration Restarts** | Adding or editing a server requires restarting the MCP server, dropping all open SSH sessions and background jobs. | **Zero-Downtime Hot-Reload:** Automatically detects changes in `servers.json` on the health-loop pass (every 30s). Adds new servers, updates policies, and reloads without interrupting active sessions. |
-| **Interactive Prompt Hangs** | Freezes forever when a command prompts for `[y/n]`, `[Enter]`, or passwords. Wastes your API budget while waiting for a timeout. | **Intelligent Anti-Hang Engine:** Instantly detects interactive prompts (like `Password:`, `[Y/n]`), pauses, and returns a helpful warning so the LLM knows it requires non-interactive flags. |
-| **Silent Command Failures** | Command errors (non-zero exit codes) are returned as plain text. LLMs often miss them, assume success, and keep hallucinating. | **Explicit Exit Status:** Non-zero exits return status completed_nonzero + exit_status (not a tool error), so the LLM sees success/failure explicitly and self-corrects. |
-| **Long-Running Daemons** | Launching a dev server or log watcher blocks the connection, causing the IDE agent to freeze, crash, or fail to progress. | **Multiplexed Multi-Sessions:** Act like `tmux` for AI. Default 5.0s timeout returns `still_running: true` without failing. Immediate async start via `wait_timeout: 0`. Run concurrent sessions via `new_session: true`. |
-| **Restricted Shells & Pagers** | Completely breaks on network appliances, enterprise switches, and routers (like **Keenetic** CLI) that force pagination (`--More--`). | **Keenetic & Pager Aware:** Specialized logic to handle pager prompts, auto-paginate, and separate NDM CLI (`shell: false`) from Linux shell (`shell: true`). |
-| **File Editing Overhead** | AI must download the entire file, edit it locally, and re-upload it. Extremely slow, expensive, and error-prone. | **Smart In-place Remote Editing:** Built-in `file.edit` that executes safe search-and-replace with line-numbered diagnostics and similarity matching on typos. |
-| **Unsafe / Destructive Commands** | LLM can hallucinate and execute destructive commands (`rm -rf /`, `reboot`) across sensitive production servers. | **Per-Host Guardrails:** Read-only denylist and merged per-host command blacklists (regex over the command text) catch the obvious cases, plus local directory containment for file transfers. A guardrail for the LLM, **not a security boundary**. |
+| **Context bloat** | A separate MCP server per host. 5 servers means 50+ tool definitions in every prompt — extra tokens and a confused model. | **One gateway for the fleet.** A single MCP instance with compact tools for all hosts. Route by `server: "alias"` or composite session IDs (`keenetic/1`, `vps/2`). |
+| **Config restarts** | Adding or editing a server means restarting the MCP server, losing open sessions and background jobs. | **Hot-reload without drops.** Changes in `servers.json` are picked up on the health-loop pass (every 30s): new servers are added, policies updated, active sessions keep running. |
+| **Interactive prompts** | A command asking for `[y/n]`, `[Enter]`, or a password hangs until timeout, burning API budget. | **Prompt detection.** Common interactive prompts (like `Password:`, `[Y/n]`) are detected, the call returns early with a hint to use non-interactive flags. |
+| **Silent failures** | Non-zero exits come back as plain text. The model can miss the failure, assume success, and carry on. | **Explicit exit status.** Non-zero exits return `completed_nonzero` plus `exit_status` (not a tool error), so success and failure are visible. |
+| **Long-running commands** | A dev server or log tail blocks the connection and the agent stalls with it. | **Multiple sessions.** Up to 10 sessions per server by default. The 5s timeout returns `still_running: true` instead of failing, `wait_timeout: 0` starts async immediately, `new_session: true` runs things in parallel. |
+| **Pagers and appliance CLIs** | Network appliances and routers (like **Keenetic** CLI) force pagination (`--More--`), which plain wrappers do not handle. | **Pager-aware.** Handles pager prompts with auto-pagination, and keeps NDM CLI (`shell: false`) separate from Linux shell (`shell: true`). |
+| **File editing overhead** | Download the whole file, edit locally, upload back — slow and fragile for large files. | **In-place remote editing.** Built-in `file.edit` does search-and-replace on the remote side, with line-numbered diagnostics and similarity hints on mismatches. |
+| **Unsafe commands** | A hallucinated `rm -rf /` or `reboot` can go straight to a production server. | **Per-host guardrails.** Read-only mode plus merged per-host command blacklists (regex over the command text) catch the obvious cases, with local directory containment for file transfers. A guardrail against mistakes, **not a security boundary**. |
 
 ---
 
-## Key Design Philosophies & Superpowers
+## Design notes
 
 ### 1. Unified Multi-Server Architecture
 Instead of registering 5–10 individual MCP servers in your IDE, configure all your hosts in a single `servers.json`. The AI agent uses a clean, predictable routing convention:
@@ -34,20 +36,20 @@ Instead of registering 5–10 individual MCP servers in your IDE, configure all 
 - Target any host via `server: "vps"` or composite session ID `session_id: "vps/1"`.
 - Agent can register new servers on the fly via `server_add` (append-only for security).
 
-### 2. Live Zero-Downtime Hot-Reload
+### 2. Hot-reload without restarts
 Change a password, adjust a blacklist, or add a new host directly in `servers.json`:
 - The gateway detects file modifications via `mtime` and content hashing on each health-loop pass (every 30s).
 - Unaffected hosts and ongoing terminal sessions remain 100% uninterrupted.
 - Policy changes (`read_only`, `command_blacklist`, `description`, `max_sessions`) apply immediately without dropping connections.
 - Agents can trigger on-demand reloads with `server_list(reload=true)`.
 
-### 3. Multiplexed Multi-Sessions (`tmux` for AI)
+### 3. Persistent sessions
 Standard SSH MCPs open a new connection for every tool call or block the terminal line on long-running processes. This server keeps multiple SSH channels open concurrently across different targets (up to 10 concurrent sessions per server by default). Background processes run reliably while the agent works in another session.
 
-### 4. Token-Saving and Cost Optimization
+### 4. Compact output by default
 AI agents don't need raw terminal noise. We sanitize the terminal stream on the server side:
 - **ANSI Escape and Control Code Stripping:** Removes all terminal styling codes before returning text.
-- **Predictable Output Windows & Pagination:** One unread stream per tab (the tab canvas) read through a single line-based cursor: `limit` (default 200 lines, max 5000, `0` = no line cap), `tail` (last N lines), `offset` = **line** position (negative peeks back from the cursor, `0` inspects from the very first line, positive inspects from line N; any `offset` is a non-consuming peek - the unread cursor does **not** move). `has_more` is the **number of unread lines still left** (`0` = all caught up).
+- **Predictable Output Windows & Pagination:** One unread stream per tab (the tab canvas) read through a single line-based cursor: `line_limit` (default 200 lines, max 5000, `0` = no line cap), `tail` (last N lines), `offset` = **line** position (negative peeks back from the cursor, `0` inspects from the very first line, positive inspects from line N; any `offset` is a non-consuming peek - the unread cursor does **not** move). `has_more` is the **number of unread lines still left** (`0` = all caught up).
 - **Inspectable 2M-Character Buffer:** Retains up to 2,000,000 characters per tab without premature eviction. Output is mirrored into the tab canvas as it arrives and completed run buffers are evicted under a process-wide budget, so `offset: 0` inspects whatever the canvas holds without resetting unread progress. `dropped_data` reports unread text that was dropped before it could be delivered - including a `tail` jump that skips unread lines.
 - **Native Shell Pipelines:** Agents use standard `| grep`, `| awk`, `| head` inside commands rather than inefficient client-side filtering.
 - **On-Demand Verbose Debugging:** The server returns compact JSON responses by default. Deep telemetry is retrieved only when calling `last_command_details`.
@@ -65,9 +67,9 @@ AI agents don't need raw terminal noise. We sanitize the terminal stream on the 
 
 ---
 
-## Available MCP Tools
+## MCP tools
 
-Our toolset is optimized to minimize context bloat while giving your AI agent full terminal mastery:
+Small catalog on purpose — fewer tools in the prompt, less room for confusion:
 
 > **`--tool-profile lean`** ships only the six everyday tools (`server_list`, `run`, `read`, `signal`,
 > `file`, `session_close`) - roughly half the catalog tokens, which matters for small local models.
@@ -81,8 +83,8 @@ Our toolset is optimized to minimize context bloat while giving your AI agent fu
 | `session_list` | Session audit | Lists all active persistent sessions and their statuses (`idle`, `busy`, `broken`). Filterable by server prefix. |
 | `session_update` | Rename session | Renames sessions for easier identification. |
 | `session_close` | Terminate channel | Closes the session and tears down the SSH channel. It does **not** kill remote processes: a command already running on the server may keep going, and anything it writes to the channel after the close is lost. |
-| `run` | Execute commands | Runs commands with 5s anti-hang timeout and returns output directly. Without `session_id`, an **idle session is reused with unknown state** (`new_session: true` forces a clean shell); pass the returned `session_id` for sequential commands to preserve state (cwd, env). If an explicit `session_id` is busy, it fails immediately — no background sessions are created. Only commands taking >5s return `still_running: true`. The first 200 lines (`max_lines`) come back directly; anything beyond that stays in the tab stream, and `has_more` reports how many unread LINES are still waiting - continue with `read(session_id)`. `wait_timeout: 0` or `background: true` = immediate async start, `hard_timeout` = interrupt after N seconds (`status: interrupted`, partial output kept), `use_pty: false` for single commands without PTY (stdin is closed, no interactive heredoc). |
-| `read` | Read / Scroll Tab | Reads the tab's single unread stream (the tab canvas) through one **line-based** cursor: `limit` (default 200 lines, max 5000, `0` = no line cap, no synthetic newlines), `tail` (last N lines; moves the unread position to the end and reports skipped unread lines as `dropped_data`), `offset` = **line** position (negative=peek back from the cursor, `0`=inspect from the very first line, positive=inspect from line N; any `offset` is a non-consuming peek - the cursor does NOT move and unread progress is preserved). No bookkeeping counters are returned: `has_more` is the **number of unread LINES still left** (`0` = all caught up; a window cut by `max_chars`/`max_lines` also adds a `hint`), so call `read(session_id)` again to continue - there is no continuation token. `status` may be `running`, `completed`, `completed_nonzero`, `interrupted` or `stalled` (quiet idle with no end-of-command marker; adds `unconfirmed_completion: true`); `wait_timeout` waits for completion **or** new output and blocks only while the stream is silent. |
+| `run` | Execute commands | Runs commands with 5s anti-hang timeout and returns output directly. Without `session_id`, an **idle session is reused with unknown state** (`new_session: true` forces a clean shell); pass the returned `session_id` for sequential commands to preserve state (cwd, env). If an explicit `session_id` is busy, it fails immediately — no background sessions are created. Only commands taking >5s return `still_running: true`. The first 200 lines (`line_limit`) come back directly; anything beyond that stays in the tab stream, and `has_more` reports how many unread LINES are still waiting - continue with `read(session_id)`. `wait_timeout: 0` or `background: true` = immediate async start, `hard_timeout` = interrupt after N seconds (`status: interrupted`, partial output kept), `use_pty: false` for single commands without PTY (stdin is closed, no interactive heredoc). |
+| `read` | Read / Scroll Tab | Reads the tab's single unread stream (the tab canvas) through one **line-based** cursor: `line_limit` (default 200 lines, max 5000, `0` = no line cap, no synthetic newlines), `tail` (last N lines; moves the unread position to the end and reports skipped unread lines as `dropped_data`), `offset` = **line** position (negative=peek back from the cursor, `0`=inspect from the very first line, positive=inspect from line N; any `offset` is a non-consuming peek - the cursor does NOT move and unread progress is preserved). No bookkeeping counters are returned: `has_more` is the **number of unread LINES still left** (`0` = all caught up; a window cut by `line_limit` also adds a `hint`), so call `read(session_id)` again to continue - there is no continuation token. `status` may be `running`, `completed`, `completed_nonzero`, `interrupted` or `stalled` (quiet idle with no end-of-command marker; adds `unconfirmed_completion: true`); `wait_timeout` waits for completion **or** new output and blocks only while the stream is silent. |
 | `signal` | Control processes | Sends `action: "ctrl_c"` to immediately interrupt a stuck command and free the session, or `stdin` to answer prompts. |
 | `file` | Manage files | Workspace-contained remote file tool (SFTP, shell fallback) supporting directory listings (`list`), chunked reading with line pagination (`read` with `offset_line`, `limit_lines`), safe atomic creation/overwriting with chmod before rename (`write`), and atomic in-place search-and-replace edits (`edit`), with an optional private `0600` `<path>.mcp.bak` backup (`create_backup: true`); new files are always written with mode `0600` (existing files keep their mode). |
 | `last_command_details`| Command inspect | Returns exact command string, arguments, execution status, and raw output of the last executed tool call for troubleshooting. |
@@ -279,11 +281,9 @@ When a command runs longer than `wait_timeout` (`still_running: true`) or unread
 
 ---
 
-## Community & Stars
+## Feedback
 
-This project is built out of frustration with fragile, single-host SSH MCP implementations. It is designed to be a dependable workhorse for daily AI agent engineering.
-
-If this server saved your IDE session from freezing, cut down your API token spending, or made managing remote servers easier, **please consider dropping a Star ⭐ on the repository!**
+Built for everyday use: checking routers, poking at staging, tailing logs through an agent. If the gateway saves you a frozen session or some tokens, a star ⭐ helps others find it.
 
 ---
 ## License

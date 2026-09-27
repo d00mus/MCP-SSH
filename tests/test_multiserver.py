@@ -1018,10 +1018,13 @@ class TestMultiServer(unittest.TestCase):
             "sha256": "abcdef123456"
         }
         projected = project_tool_result("file", raw_res)
-        self.assertEqual(projected["mode"], "binary_hidden")
-        self.assertEqual(projected["size"], 1024)
-        self.assertEqual(projected["message"], "File is binary. Content hidden.")
-        self.assertEqual(projected["sha256"], "abcdef123456")
+        expected = {
+            "mode": "binary_hidden",
+            "message": "File is binary. Content hidden.",
+            "size": 1024,
+            "sha256": "abcdef123456",
+        }
+        self.assertEqual(projected, expected)
 
     def test_run_dispatch_target_sid_busy_fails_clearly(self):
         """Verify run_dispatch fails clearly when session is busy without silent fallback."""

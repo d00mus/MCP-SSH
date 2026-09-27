@@ -226,7 +226,7 @@ def _apply_run_hints(resp: Dict[str, Any], status: str, server_alias: str, sessi
             f"once it produces output."
         )
     elif snapshot.get("limited"):
-        resp["hint"] = "output truncated - raise max_chars/max_lines or read again for the rest."
+        resp["hint"] = "output truncated - raise line_limit or read again for the rest."
 
     out = snapshot.get("output", "")
     if "0xcffd0062" in out or "Cli::Main" in out:
@@ -424,28 +424,30 @@ class SSHSession:
 
     def read_canvas(
         self,
-        limit: int = 200,
+        line_limit: Optional[int] = None,
         tail: Optional[int] = None,
-        offset: Optional[int] = None,
+        offset: Optional[float] = None,
         wait_timeout: Optional[float] = None,
         max_chars: Optional[int] = None,
+        limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """The tab's single unread stream: a line-based window over the canvas (m01215).
 
         run and read share one cursor (self.scrollback_cursor, an absolute stream
         offset), so a command's output reaches the caller exactly once and everything
         is measured in LINES: has_more is the number of unread lines still left.
-        - neither offset nor tail: the next limit unread lines; the cursor advances.
+        - neither offset nor tail: the next line_limit unread lines; the cursor advances.
         - tail=N: the last N lines of the canvas; the cursor jumps to the end, so
           has_more becomes 0; dropped_data reports unread lines skipped on the way.
         - offset: peek / inspection of history - the cursor does NOT move and has_more
           counts what is still unread from the working cursor.
           offset>=0 reads from that line forward (offset=0 = very beginning).
-          offset<0 reads limit lines starting |offset| lines above the cursor.
-        - limit=0: no line cap (internal callers that want a whole run).
+          offset<0 reads line_limit lines starting |offset| lines above the cursor.
+        - line_limit=0: no line cap (internal callers that want a whole run).
         """
-        limit = clamp_int(limit if limit is not None else DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_LINES, 0, MAX_READ_MAX_LINES)
-        max_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 1, MAX_READ_MAX_CHARS)
+        chosen_limit = line_limit if line_limit is not None else limit
+        limit = clamp_int(chosen_limit if chosen_limit is not None else DEFAULT_READ_MAX_LINES, DEFAULT_READ_MAX_LINES, 0, MAX_READ_MAX_LINES)
+        max_chars = clamp_int(max_chars, MAX_READ_MAX_CHARS, 1, MAX_READ_MAX_CHARS) if max_chars is not None else MAX_READ_MAX_CHARS
 
         if wait_timeout is None:
             wait_timeout = DEFAULT_WAIT_TIMEOUT
@@ -588,7 +590,7 @@ class SSHSession:
         if status == "interrupted" and last_r is not None:
             res.update(_interrupt_fields_for(last_r))
         if limited and "hint" not in res:
-            res["hint"] = "output truncated - raise max_chars/max_lines or read again for the rest."
+            res["hint"] = "output truncated - raise line_limit or read again with read(session_id) for the rest."
         return res
 
     def _invoke_shell_with_timeout(self, width: int = 220, height: int = 50, timeout: float = 15.0) -> paramiko.Channel:
@@ -1452,6 +1454,7 @@ class SSHSession:
         quiet_complete_timeout: float,
         max_chars: Optional[int] = None,
         max_lines: Optional[int] = None,
+        line_limit: Optional[int] = None,
         background: bool = False,
         use_pty: bool = True,
         internal: bool = False,
@@ -1521,6 +1524,8 @@ class SSHSession:
                         "session_id": f"{self.server_alias}/{self.id}",
                         "numeric_session_id": self.id,
                         "server": self.server_alias,
+                        "in_shell": self.in_shell,
+                        "mode": self.get_mode(),
                         "status": "failed",
                     }
 
@@ -1716,14 +1721,15 @@ class SSHSession:
             run.done_event.wait(wait_for)
 
         char_ceiling = MAX_BUFFER_CHARS if internal else MAX_READ_MAX_CHARS
-        read_chars = clamp_int(max_chars, DEFAULT_READ_MAX_CHARS, 1, char_ceiling) if max_chars is not None else DEFAULT_READ_MAX_CHARS
-        slice_lines = DEFAULT_READ_MAX_LINES if max_lines is None else clamp_int(max_lines, DEFAULT_READ_MAX_LINES, 0, MAX_READ_MAX_LINES)
+        read_chars = clamp_int(max_chars, char_ceiling, 1, char_ceiling) if max_chars is not None else char_ceiling
+        chosen_lines = line_limit if line_limit is not None else max_lines
+        slice_lines = DEFAULT_READ_MAX_LINES if chosen_lines is None else clamp_int(chosen_lines, DEFAULT_READ_MAX_LINES, 0, MAX_READ_MAX_LINES)
 
         if internal:
             # Internal callers (fs.py and friends) parse the output of the helper
             # command they just ran. They read that run's own buffer and never touch
             # the tab cursor: a helper must not consume output the agent has not
-            # read yet, and its window is bounded by max_lines/max_chars only.
+            # read yet, and its window is bounded by line_limit/max_chars only.
             with run.lock:
                 buffered = run.output_buffer
                 recv_paused = run.recv_paused
@@ -1750,7 +1756,7 @@ class SSHSession:
             # One stream for the agent (m01215): the tab canvas, with the same line
             # window, the same cursor and the same has_more as read(session_id).
             snapshot = self.read_canvas(
-                limit=slice_lines,
+                line_limit=slice_lines,
                 max_chars=read_chars,
                 wait_timeout=0.0,
             )

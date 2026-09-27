@@ -254,12 +254,12 @@ class TestSSH(unittest.TestCase):
         run.mark_done("completed", completion_method="prompt_detected")
         session.runs[99] = run
 
-        res = session.read_canvas(limit=10, max_chars=1000, wait_timeout=0.0)
+        res = session.read_canvas(line_limit=10, wait_timeout=0.0)
         self.assertTrue(res["success"])
         self.assertEqual(res["output"], "super_secret_key_123\n")
         self.assertEqual(res["has_more"], 0)
         # Mirrored exactly once: a second read has nothing left.
-        again = session.read_canvas(limit=10, max_chars=1000, wait_timeout=0.0)
+        again = session.read_canvas(line_limit=10, wait_timeout=0.0)
         self.assertEqual(again["output"], "")
 
     def test_state_lost_warning(self):
@@ -2138,8 +2138,8 @@ class TestSSH(unittest.TestCase):
         self.assertIn("No completion marker seen", hint)
         self.assertIn("new_session=true", hint)
 
-    def test_run_max_lines_zero_means_all(self):
-        """max_lines=0 means all lines (P4): 300 lines survive (default 200 would cut)."""
+    def test_run_line_limit_zero_means_all(self):
+        """line_limit=0 means all lines (P4): 300 lines survive (default 200 would cut)."""
         session, _, channel = self._create_mock_session()
         channel.closed = False
         channel.recv_ready.return_value = False
@@ -2153,7 +2153,7 @@ class TestSSH(unittest.TestCase):
             command="seq 1 300", mode="sync", shell=True,
             wait_timeout=2.0, startup_wait=0.05, hard_timeout=0.0,
             completion_hint="either", quiet_complete_timeout=0.5,
-            max_chars=200000, max_lines=0,
+            line_limit=0,
         )
         self.assertTrue(res["success"])
         self.assertEqual(res["status"], "completed")
@@ -2208,8 +2208,9 @@ class TestSSH(unittest.TestCase):
         )
         self.assertFalse(res["success"])
         self.assertIn("new_session=true", res["error"])
+        expected_failure_keys = {"success", "error", "status", "server", "session_id", "numeric_session_id", "in_shell", "mode"}
+        self.assertEqual(set(res.keys()), expected_failure_keys)
         self.assertEqual(res.get("status"), "failed")
-        self.assertNotIn("run_id", res)
 
         # The real (unmocked) ensure_alive gives the same recipe on the second attempt.
         del session.ensure_alive
@@ -2276,8 +2277,12 @@ class TestSSH(unittest.TestCase):
 
         # 1. Peek beginning (offset=0) to solve agent context loss / amnesia: inspects whole history without moving cursor
         res_rewind = session.read_canvas(limit=1000, offset=0, max_chars=50000)
+        expected_rewind_keys = {
+            "success", "session_id", "numeric_session_id", "server",
+            "status", "output", "has_more", "still_running", "in_shell", "mode"
+        }
+        self.assertEqual(set(res_rewind.keys()), expected_rewind_keys)
         self.assertTrue(res_rewind["success"])
-        self.assertNotIn("run_id", res_rewind)
         self.assertIn("first line output", res_rewind["output"])
         self.assertIn("second line output", res_rewind["output"])
         self.assertIn("third line output", res_rewind["output"])
@@ -2485,23 +2490,22 @@ class TestSSH(unittest.TestCase):
     def test_paging_across_cleaned_ansi_and_crlf_matches_single_output(self):
         """P0: ANSI/CRLF are cleaned once on the way into the canvas, so paging cannot split them."""
         session, _, _ = self._create_mock_session()
-        session.append_scrollback("0123456789" + "\x1b[31mRed\x1b[0m\r\nNextLine")
+        session.append_scrollback("0123456789" + "\x1b[31mRed\x1b[0m\r\nNextLine\n")
 
-        whole = session.read_canvas(limit=0, offset=0, max_chars=10000, wait_timeout=0.0)
-        self.assertEqual(whole["output"], "0123456789Red\nNextLine")
+        whole = session.read_canvas(offset=0, wait_timeout=0.0)
+        self.assertEqual(whole["output"], "0123456789Red\nNextLine\n")
         self.assertNotIn("[31m", whole["output"], "ANSI must never reach the caller as raw text")
 
-        # Cut at 11 chars, then continue: the boundary falls inside the old escape, but
-        # the escape was already removed when the chunk entered the canvas.
-        page1 = session.read_canvas(limit=0, max_chars=11, wait_timeout=0.0)
-        page2 = session.read_canvas(limit=0, max_chars=10000, wait_timeout=0.0)
+        # Page 1 line, then continue
+        page1 = session.read_canvas(line_limit=1, wait_timeout=0.0)
+        page2 = session.read_canvas(line_limit=10, wait_timeout=0.0)
         self.assertEqual(page1["output"] + page2["output"], whole["output"],
                          "concatenated pages must equal the single cleaned output")
 
     def test_paging_keeps_reading_the_canvas_not_the_last_run(self):
         """Paging over the tab canvas must never switch to the last run's private buffer."""
         session, _, _ = self._create_mock_session()
-        session.append_scrollback("HIST_PAGE1_HIST_PAGE2")
+        session.append_scrollback("HIST_PAGE1_HIST_PAGE2\n")
         # Run 1 exists and is finished; its output is a plain canvas append.
         r1 = session.runs[1] = RunState(
             run_id=1, session_id=session.id, command="cmd1", mode="sync",
@@ -2514,16 +2518,15 @@ class TestSSH(unittest.TestCase):
         session.last_run_id = 1
 
         # Read canvas page 1, then continue with the single unread cursor.
-        page1 = session.read_canvas(limit=0, max_chars=10, wait_timeout=0.0)
-        self.assertEqual(page1["output"], "HIST_PAGE1", "the first page starts at the beginning of the stream")
+        page1 = session.read_canvas(line_limit=1, wait_timeout=0.0)
+        self.assertEqual(page1["output"], "HIST_PAGE1_HIST_PAGE2\n", "the first page starts at the beginning of the stream")
         self.assertTrue(page1["has_more"] > 0)
 
-        page2 = session.read_canvas(limit=0, max_chars=100, wait_timeout=0.0)
-        self.assertIn("HIST_PAGE2", page2["output"], "paging continues in the canvas history")
+        page2 = session.read_canvas(line_limit=10, wait_timeout=0.0)
         self.assertIn("RUN1_OUTPUT", page2["output"],
                       "the run output joins the same stream, in order - it is not a second view")
         self.assertEqual(
-            page1["output"] + page2["output"], "HIST_PAGE1_HIST_PAGE2RUN1_OUTPUT\n",
+            page1["output"] + page2["output"], "HIST_PAGE1_HIST_PAGE2\nRUN1_OUTPUT\n",
             "paging must resume exactly where the previous page stopped",
         )
 
@@ -2541,7 +2544,7 @@ class TestSSH(unittest.TestCase):
         session.active_run_id = 2
 
         # The run produced nothing, so the unread history is all there is to hand back.
-        res = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
+        res = session.read_canvas(line_limit=10, wait_timeout=0.0)
         self.assertEqual(res["status"], "stalled", "a quiet unfinished run is honestly uncertain")
         self.assertEqual(res["output"], "OLD_HISTORY_LINE_1\nOLD_HISTORY_LINE_2\n")
         self.assertEqual(res["has_more"], 0)
@@ -2565,15 +2568,15 @@ class TestSSH(unittest.TestCase):
         self.assertEqual(r.output_buffer, "67890EXTRA")
         self.assertEqual(r.output_end(), 15)
 
-        res = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
+        res = session.read_canvas(line_limit=10, wait_timeout=0.0)
         self.assertEqual(res["output"], "67890EXTRA")
         self.assertTrue(res["dropped_data"], "the first read MUST report that unread text was dropped!")
         self.assertEqual(r.buffer_base_offset, 5)
         self.assertEqual(r.total_received_chars, 15)
 
         # Reported exactly once: the canvas already gave up those chars (D6).
-        second = session.read_canvas(limit=10, max_chars=100, wait_timeout=0.0)
-        self.assertNotIn("dropped_data", second)
+        second = session.read_canvas(line_limit=10, wait_timeout=0.0)
+        self.assertFalse(second.get("dropped_data", False))
 
     def test_invalidated_pty_is_broken_not_idle_ndm(self):
         """P0: Invalidated PTY session must report broken/unknown and not be treated as idle NDM."""
@@ -3245,8 +3248,6 @@ class TestReadStateContract(unittest.TestCase):
     never reach the agent surface: it is plumbing the caller did not ask for.
     """
 
-    PLUMBING = ("next_offset", "base_offset", "total_chars", "total_lines", "next_line", "limited", "next_cursor")
-
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.cache_dirs = make_cache_dirs(self.test_dir)
@@ -3285,8 +3286,11 @@ class TestReadStateContract(unittest.TestCase):
         return run
 
     def _assert_state_only(self, res):
-        for key in self.PLUMBING:
-            self.assertNotIn(key, res, "'%s' is bookkeeping and must not be in the answer" % key)
+        expected_keys = {
+            "success", "session_id", "numeric_session_id", "server",
+            "status", "output", "has_more", "still_running", "in_shell", "mode"
+        }
+        self.assertEqual(set(res.keys()) - {"dropped_data", "exit_status", "hint", "recv_paused", "pause_reason", "run_id"}, expected_keys)
         unread = res["has_more"]
         self.assertIsInstance(unread, int, "has_more must be an int of unread LINES")
         self.assertNotIsInstance(unread, bool, "has_more is a LINE COUNT, not a flag (m01215)")

@@ -677,10 +677,19 @@ class TestFS(unittest.TestCase):
         self.assertTrue(res.get("changed"))
         write_mock.assert_not_called()
         projected = project_tool_result("file", res)
-        self.assertIn("dry run", projected["message"].lower())
-        self.assertTrue(projected["dry_run"])
-        self.assertTrue(projected["changed"])
-        self.assertEqual(projected["replacements"], 0 + res["replacements"])
+        expected_projected = {
+            "message": "File edit dry run - NOTHING was written",
+            "changed": True,
+            "dry_run": True,
+            "replacements": res["replacements"],
+            "size": res["size"],
+            "old_sha256": res["old_sha256"],
+            "new_sha256": res["new_sha256"],
+            "server": res["server"],
+            "session_id": res["session_id"],
+            "status": "completed",
+        }
+        self.assertEqual(projected, expected_projected)
 
     def test_write_remote_file_bytes_atomic_mv_and_cleanup(self):
         """Verify _write_remote_file_bytes writes to a temporary file and atomically moves it via mv -f."""
