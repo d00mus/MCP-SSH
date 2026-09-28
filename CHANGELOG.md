@@ -7,15 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [6.0.0] — 2026-09-27
+## [6.0.0] — 2026-09-28
 
 ### Changed
 - Unified scrollback: every tab keeps one 2M-character canvas addressed through a
   single line-based cursor. `run` returns the first `line_limit` lines inline,
   `has_more` reports the number of unread **lines**, and `read` delivers the next
   window. No continuation token, no bookkeeping counters.
-- Honest MCP framing: internal exit markers and prompt echoes are stripped before
-  anything reaches the agent.
+- Honest MCP framing: internal exit markers, prompt echoes and gateway machinery
+  never surface in the agent's window.
 - Configuration is hot-reloaded on the health-loop pass (mtime + content hash), so
   adding a host or tightening a policy no longer drops open sessions.
 - Control requests (Ctrl+C, reads, session control) are served from a separate
@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--import-ssh-config`: register key-auth hosts from `~/.ssh/config`.
 - Degraded mode: without paramiko the server still answers JSON-RPC with real
   errors (-32700 / -32603) instead of hanging or returning an empty tool catalog.
+- MCP client contract: negotiates protocol 2025-06-18 with fallback to older
+  revisions, sends `instructions` on initialize, and annotates every tool with
+  `readOnlyHint` / `destructiveHint` / `idempotentHint`.
 
 ### Security
 - Per-host read-only guardrail and merged command blacklists, with local directory
