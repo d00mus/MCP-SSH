@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.2] — 2026-09-28
+
+### Changed
+- Document and verify installation from the published PyPI package in an isolated directory.
+- Replace dummy password values in the MCP client example with explicit placeholders.
+
 ## [6.0.1] — 2026-09-28
 
 ### Added

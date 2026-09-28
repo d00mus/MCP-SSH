@@ -3,7 +3,7 @@
   "name": "io.github.d00mus/mcp-ssh-gateway",
   "title": "MCP SSH Gateway",
   "description": "One MCP server for a whole SSH fleet: persistent sessions, honest exit status, pager-aware output.",
-  "version": "6.0.1",
+  "version": "6.0.2",
   "repository": {
     "url": "https://github.com/d00mus/MCP-SSH",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "mcp-ssh-gateway",
-      "version": "6.0.1",
+      "version": "6.0.2",
       "transport": {
         "type": "stdio"
       },

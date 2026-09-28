@@ -8,7 +8,7 @@
 # NOTE: the importable package is the top-level `src` module (all 12 files import
 # `from src.config import ...`), so it is shipped as-is. Do not rename it without
 # refactoring those imports.
-version = "6.0.1"
+version = "6.0.2"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-ssh-gateway"
-version = "6.0.1"
+version = "6.0.2"
 description = "MCP server for a whole fleet of SSH hosts: persistent sessions with scrollback, explicit exit statuses, pager- and router-CLI-aware (Keenetic NDM), hot-reloaded config, honest output paging."
 readme = "README.md"
 license = { text = "MIT" }

@@ -49,11 +49,19 @@ Create `servers.json` at the absolute path you will pass with `--servers-config`
 
 ### Path A: Python (Fastest)
 
+From a new working directory, create an isolated Python environment, install the package from PyPI, and confirm the console command resolves before configuring an MCP client:
+
 ```bash
-pip install mcp-ssh-gateway
+mkdir ssh-gateway && cd ssh-gateway
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux:       source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install mcp-ssh-gateway
+mcp-ssh-gateway --help
 ```
 
-Then run `mcp-ssh-gateway --servers-config servers.json`. To work on the project itself, clone it and use `pip install -r requirements.txt` instead.
+Then configure your MCP client to run `mcp-ssh-gateway --servers-config /absolute/path/to/servers.json`. The virtual environment's command is in `.venv/Scripts` on Windows or `.venv/bin` on macOS/Linux; use its full path if your MCP client does not inherit the activated environment's PATH. To work on the project source itself, clone it and install its development dependencies instead.
 
 ### Path B: Docker
 

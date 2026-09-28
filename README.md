@@ -12,17 +12,23 @@ For people who already use SSH and want an assistant to help with routine diagno
 
 You need Python 3.11+, an SSH account on a host you control and an MCP client that can launch a local stdio server.
 
-1. Install it:
+1. Create a working directory for the gateway configuration and install the published package into an isolated environment. The virtual environment keeps this install separate from other Python tools:
 
    ```bash
+   mkdir ssh-gateway && cd ssh-gateway
+   python -m venv .venv
+   # Windows PowerShell: .venv\Scripts\Activate.ps1
+   # macOS/Linux:       source .venv/bin/activate
+   python -m pip install --upgrade pip
    python -m pip install mcp-ssh-gateway
+   mcp-ssh-gateway --help
    ```
 
-   Or run it without installing anything: `uvx --from mcp-ssh-gateway mcp-ssh-gateway --servers-config servers.json`
+   This installs the current release from PyPI and checks that the command is available. Create servers.json in this directory before starting the gateway; without configuration, startup exits with an error. For a disposable launch without a persistent install, use `uvx --from mcp-ssh-gateway mcp-ssh-gateway --help`; to use a config file, replace `--help` with `--servers-config /absolute/path/to/servers.json`.
 
-   To work on the project itself, clone it instead: `git clone https://github.com/d00mus/MCP-SSH.git && cd MCP-SSH && python -m pip install -r requirements.txt`
+   To work on the project source instead, clone it and install development dependencies: `git clone https://github.com/d00mus/MCP-SSH.git && cd MCP-SSH && python -m pip install -r requirements.txt`
 
-2. Create a `servers.json` somewhere you will remember (replace the address, user and key path with your own):
+2. Create a `servers.json` in this working directory (replace the address, user and key path with your own):
 
    ```json
    {
@@ -57,7 +63,7 @@ You need Python 3.11+, an SSH account on a host you control and an MCP client th
 
 4. In the client, ask: **“List my SSH hosts, then run `uname -a` on lab.”** If the host is missing, check the config path and the client's MCP server logs. If SSH fails, check credentials and host-key verification.
 
-Add more hosts under `servers` in the same file. [servers.json.example](servers.json.example) shows a multi-host configuration; check its host-key and credential choices before copying it.
+Add more hosts under `servers` in the same file. [servers.json.example](servers.json.example) shows a multi-host configuration; check its host-key and credential choices before copying it. For a clean-directory installation check that does not depend on the repository clone, follow the [PyPI smoke-test steps](PYPI_SMOKE_TEST.md).
 
 ## What using it looks like
 

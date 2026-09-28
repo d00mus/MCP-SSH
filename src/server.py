@@ -219,7 +219,7 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[-1]
 
 SERVER_NAME = "mcp-ssh"
-SERVER_VERSION = "6.0.1"
+SERVER_VERSION = "6.0.2"
 
 # Sent once per session in the initialize result. This is the only channel that
 # reaches the model's context on every run without costing prompt tokens, so it

@@ -8,7 +8,7 @@
         "--cache-dir", "C:\\tools\\ssh-gateway\\.ssh-cache"
       ],
       "env": {
-        "KEENETIC_PASSWORD": "SecretPassword123"
+        "KEENETIC_PASSWORD": "<replace-with-a-secret; do-not-commit>"
       }
     },
 
@@ -24,7 +24,7 @@
         "--cache-dir", "/app/.ssh-cache"
       ],
       "env": {
-        "KEENETIC_PASSWORD": "SecretPassword123"
+        "KEENETIC_PASSWORD": "<replace-with-a-secret; do-not-commit>"
       }
     }
   }
