@@ -19,3 +19,8 @@ agent-tools/
 agent-transcripts/
 .tmp/
 .idea/
+
+# python build artifacts (PyPI packaging)
+build/
+dist/
+*.egg-info/
