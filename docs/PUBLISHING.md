@@ -11,6 +11,13 @@ Change all three in one commit.
 
 ## 1. Preconditions
 
+Run the schema check first — it is free, offline-ish, and catches the failure modes
+that `publish` only reports after the login round-trip:
+
+```bash
+mcp-publisher validate
+```
+
 - `SERVER_VERSION` == `pyproject.toml` version.
 - `README.md` starts with the line `<!-- mcp-name: io.github.d00mus/mcp-ssh-gateway -->`.
   The token must be followed by a boundary (newline, whitespace, or `-->`); do not
@@ -69,6 +76,18 @@ mcp-publisher status
 The registry name must be `io.github.d00mus/mcp-ssh-gateway` and must match the
 `mcp-name:` line in the PyPI README exactly. The registry is in preview, so
 breaking changes or data resets are possible before GA.
+
+Two constraints bite in practice and are worth knowing before you run `publish`:
+
+- **The PyPI package must already exist.** The registry resolves
+  `registryType: pypi` + `identifier` against live PyPI. Publishing before the
+  upload fails with
+  `PyPI package 'mcp-ssh-gateway' not found (status: 404)`.
+- **The description is copied into `_meta` and capped at 100 characters.** A
+  longer `description` is rejected with
+  `expected length <= 100` on `body._meta.io.modelcontextprotocol.description`.
+  This is why the top-level `description` is short even though the PyPI
+  description is long: only the PyPI page may carry the full pitch.
 
 ## 6. Finish the storefront
 
