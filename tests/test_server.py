@@ -13,7 +13,9 @@ from src.manager import MultiServerManager
 from src.security import check_command_security
 from src.server import (
     project_tool_result, handle_request, tools_list, run_dispatch,
-    read_dispatch, signal_dispatch
+    read_dispatch, signal_dispatch,
+    SUPPORTED_PROTOCOL_VERSIONS, DEFAULT_PROTOCOL_VERSION,
+    SERVER_NAME, SERVER_VERSION, LEAN_TOOLS, TOOL_ANNOTATIONS
 )
 from src.session import SSHSession
 from src.ssh_state import RunState
@@ -333,7 +335,8 @@ class TestServer(unittest.TestCase):
         # Initialize with unsupported arbitrary client version negotiates supported default
         init_unsupported = handle_request({"jsonrpc": "2.0", "id": 7, "method": "initialize",
                                            "params": {"protocolVersion": "9999-99-99"}}, MagicMock())
-        self.assertEqual(init_unsupported["result"]["protocolVersion"], "2024-11-05")
+        self.assertEqual(init_unsupported["result"]["protocolVersion"],
+                         DEFAULT_PROTOCOL_VERSION) 
 
     def test_invalid_json_rpc_array_gets_invalid_request_id_null(self):
         """P2: Non-dict request shape gets JSON-RPC -32600 with id: null."""
@@ -1552,6 +1555,89 @@ class TestServer(unittest.TestCase):
         self.assertIsNone(coerce_int_arg("abc"))
         self.assertIsNone(coerce_int_arg(float("nan")))
         self.assertIsNone(coerce_int_arg(float("inf")))
+
+class TestInitializeContract(unittest.TestCase):
+    """initialize is the only handshake a client gets: version, identity, instructions."""
+
+    def _init(self, requested):
+        params = {} if requested is None else {"protocolVersion": requested}
+        res = handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params},
+            MagicMock(),
+        )
+        return res["result"]
+
+    def test_echoes_every_supported_protocol_version(self):
+        for version in SUPPORTED_PROTOCOL_VERSIONS:
+            self.assertEqual(self._init(version)["protocolVersion"], version)
+
+    def test_unknown_version_falls_back_to_oldest_supported(self):
+        # Never answer with a revision the client did not ask for and we cannot
+        # prove it speaks; 2024-11-05 is understood by every MCP client.
+        result = self._init("9999-99-99")
+        self.assertEqual(result["protocolVersion"], DEFAULT_PROTOCOL_VERSION)
+        self.assertEqual(result["protocolVersion"], "2024-11-05")
+
+    def test_missing_version_falls_back_instead_of_erroring(self):
+        self.assertEqual(self._init(None)["protocolVersion"], DEFAULT_PROTOCOL_VERSION)
+
+    def test_server_info_uses_public_name_not_internal_codename(self):
+        info = self._init("2025-06-18")["serverInfo"]
+        self.assertEqual(info["name"], "mcp-ssh")
+        self.assertEqual(info["version"], SERVER_VERSION)
+        self.assertNotIn("vnext", info["name"])
+
+    def test_instructions_are_sent_to_every_client(self):
+        instructions = self._init("2025-06-18")["instructions"]
+        self.assertTrue(instructions.strip())
+        # The rules an agent most often gets wrong, stated once at handshake.
+        self.assertIn("server_list", instructions)
+        self.assertIn("session_id", instructions)
+        self.assertIn("has_more", instructions)
+        self.assertIn("shell=false", instructions)
+
+class TestToolAnnotations(unittest.TestCase):
+    def _tools(self):
+        return {t["name"]: t for t in tools_list()["result"]["tools"]}
+
+    def test_every_tool_declares_annotations(self):
+        for name, tool in self._tools().items():
+            with self.subTest(tool=name):
+                ann = tool.get("annotations")
+                self.assertIsInstance(ann, dict, f"{name} has no annotations")
+                for key in ("title", "readOnlyHint", "destructiveHint", "idempotentHint"):
+                    self.assertIn(key, ann)
+
+    def test_annotations_known_to_map_cover_the_catalog(self):
+        self.assertEqual(set(TOOL_ANNOTATIONS), set(self._tools()))
+
+    def test_read_only_tools_are_the_inert_ones(self):
+        tools = self._tools()
+        read_only = {n for n, t in tools.items() if t["annotations"]["readOnlyHint"]}
+        self.assertEqual(read_only, {"server_list", "session_list", "read", "last_command_details"})
+
+    def test_mutation_tools_are_flagged_destructive(self):
+        # Clients force a confirmation prompt for destructiveHint; these three can
+        # change remote state or lose buffered output.
+        tools = self._tools()
+        for name in ("run", "file", "signal", "session_close"):
+            with self.subTest(tool=name):
+                self.assertTrue(tools[name]["annotations"]["destructiveHint"])
+                self.assertFalse(tools[name]["annotations"]["readOnlyHint"])
+
+    def test_read_is_idempotent_but_not_read_only(self):
+        # read only advances the unread cursor, so it mutates hidden state.
+        ann = self._tools()["read"]["annotations"]
+        self.assertTrue(ann["readOnlyHint"])
+        self.assertFalse(ann["idempotentHint"])
+
+    def test_lean_profile_keeps_annotations(self):
+        with patch.object(config, "TOOL_PROFILE", "lean"):
+            names = {t["name"] for t in tools_list()["result"]["tools"]}
+        self.assertEqual(names, LEAN_TOOLS)
+        with patch.object(config, "TOOL_PROFILE", "lean"):
+            for tool in tools_list()["result"]["tools"]:
+                self.assertIn("readOnlyHint", tool["annotations"])
 
 if __name__ == "__main__":
     unittest.main()

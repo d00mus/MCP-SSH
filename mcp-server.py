@@ -41,7 +41,14 @@ def run_fallback():
                 "result": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "ssh-mcp-vnext-fallback", "version": "1.0.0"},
+                    # Degraded mode: no tools, so point the client at the real cause
+                    # instead of a name it will never see working.
+                    "serverInfo": {"name": "mcp-ssh (degraded: paramiko missing)", "version": "0.0.0"},
+                    "instructions": (
+                        "This server is running in degraded mode and exposes no tools: the paramiko "
+                        "library is not installed. Install it with 'python -m pip install paramiko' "
+                        "and restart the MCP server."
+                    ),
                 }
             }
             print(json.dumps(res), flush=True)

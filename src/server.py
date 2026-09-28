@@ -212,8 +212,67 @@ def format_tool_result(result: Dict[str, Any], is_error: bool = False) -> Dict[s
 def make_response(req_id: Any, result: Dict[str, Any], is_error: bool = False) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": format_tool_result(result, is_error)}
 
+# Protocol revisions this server implements. Clients negotiate down to the highest
+# mutually supported revision; anything unknown falls back to the oldest revision
+# every MCP client understands.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+DEFAULT_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[-1]
+
+SERVER_NAME = "mcp-ssh"
+SERVER_VERSION = "6.0.0"
+
+# Sent once per session in the initialize result. This is the only channel that
+# reaches the model's context on every run without costing prompt tokens, so it
+# carries the routing rules an agent gets wrong most often.
+SERVER_INSTRUCTIONS = """\
+Single MCP gateway for a whole fleet of SSH hosts (routers, NAS, VPS, staging boxes).
+
+Routing:
+- Start with server_list to see configured aliases and their live sessions.
+- Target any host with run(server='alias', ...). Keep the returned session_id to
+  preserve shell state (cwd, env) across sequential steps.
+- Reuse a returned session_id instead of opening new ones: one session is one
+  terminal, so never send concurrent commands to a single session.
+- Use new_session=true only for real parallelism, and close it with session_close
+  when done, to stay under the per-server session limit.
+
+Reading output:
+- run returns the first line_limit lines (default 200) inline. has_more counts the
+  UNREAD LINES still waiting; read(session_id) delivers them. Do not re-read output
+  you already received.
+- status completed_nonzero with exit_status is a real result, not a failure. Only
+  status failed/dead is an error.
+
+Vendor CLIs and pagers:
+- Appliance CLIs (Keenetic NDM and similar) need shell=false; the POSIX shell is
+  shell=true. Never mix both in one session tab. Pager prompts (--More--) are
+  auto-paginated.
+- Interactive prompts ([y/n], Password:, [Enter]) are detected and returned instead
+  of hanging; answer with signal(action='stdin', ...) or rerun with non-interactive flags.
+
+Safety:
+- read_only targets and command_blacklist are regex guardrails against a mistaken
+  agent, NOT a security boundary. Prefer a read-only alias for production hosts."""
+
 # Everyday tool surface (T3.2/F10). Admin/diagnostic tools ship only in 'full'.
 LEAN_TOOLS = {"server_list", "run", "read", "signal", "file", "session_close"}
+
+# MCP tool annotations (2025-03-26+). Clients use these to gate tools before a
+# confirmation prompt: readOnlyHint lets an auto-approve policy skip the prompt,
+# destructiveHint forces one. readHint/idempotentHint describe the blast radius.
+# "read" is idempotent but not read-only: it advances the unread cursor.
+TOOL_ANNOTATIONS = {
+    "server_list": {"title": "List servers", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    "server_add": {"title": "Add SSH server", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+    "session_list": {"title": "List sessions", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "session_close": {"title": "Close session", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+    "session_update": {"title": "Rename session", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "run": {"title": "Run remote command", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+    "read": {"title": "Read session output", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    "signal": {"title": "Send signal to command", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
+    "last_command_details": {"title": "Inspect last command", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "file": {"title": "Manage remote files", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+}
 
 
 def tools_list() -> Dict[str, Any]:
@@ -461,6 +520,8 @@ def tools_list() -> Dict[str, Any]:
     profile = getattr(config, "TOOL_PROFILE", "full")
     if profile == "lean":
         tools = [t for t in tools if t["name"] in LEAN_TOOLS]
+    for tool in tools:
+        tool["annotations"] = TOOL_ANNOTATIONS.get(tool["name"], {})
     return {"jsonrpc": "2.0", "id": 1, "result": {"tools": tools}}
 
 # Cheap, non-blocking tools run on a dedicated small pool: a stuck run must never
@@ -958,15 +1019,21 @@ def handle_request(request: Dict[str, Any], manager) -> Optional[Dict[str, Any]]
 
     if method == "initialize":
         requested_version = params.get("protocolVersion") if isinstance(params, dict) else None
-        # Supported MCP protocol versions
-        supported_versions = {"2024-11-05"}
-        version = requested_version if requested_version in supported_versions else "2024-11-05"
+        # Negotiate: echo the client's revision when we speak it, else the oldest
+        # revision we know (every client understands it). Never answer with a
+        # revision the client did not ask for.
+        version = (
+            requested_version
+            if requested_version in SUPPORTED_PROTOCOL_VERSIONS
+            else DEFAULT_PROTOCOL_VERSION
+        )
         return {
             "jsonrpc": "2.0", "id": req_id,
             "result": {
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "ssh-mcp-vnext", "version": "6.0.0"},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": SERVER_INSTRUCTIONS,
             },
         }
 
