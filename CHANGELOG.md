@@ -9,9 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [6.0.1] — 2026-09-28
 
+### Added
+- Published to PyPI as `mcp-ssh-gateway` and listed in the MCP Registry as `io.github.d00mus/mcp-ssh-gateway`.
+- Trusted Publishing workflow (`.github/workflows/publish-pypi.yml`): a `v*` tag publishes without a stored long-lived token.
+- PyPI and MCP Registry badges in the README.
+
 ### Changed
 - Rewrite the README around practical SSH fleet workflows, with a verified quickstart and clearer setup and security boundaries.
 - Correct quickstart and security guidance; default the example host configuration to SSH host-key verification.
+- Installation now leads with `pip install mcp-ssh-gateway`; the client config, `mcp.json.example` and quickstart invoke the `mcp-ssh-gateway` console script instead of `mcp-server.py`. Cloning remains documented for working on the project itself.
 
 ## [6.0.0] — 2026-09-28
 
