@@ -1731,14 +1731,16 @@ class TestSSH(unittest.TestCase):
             started_at=time.time(), wait_timeout=1.0, startup_wait=0.1, hard_timeout=0.0,
             max_buffer_chars=1000, run_log_path=os.path.join(self.cache_dirs["runs_dir"], "slice.log"),
         )
-        run.output_buffer = ("A" * 50) + ("B" * 150)
+        # Two virtual lines: a window ends on such a boundary and never splits one,
+        # so the soft max_chars cap (FIX-4) returns the first line whole.
+        run.output_buffer = ("A" * 50) + "\n" + ("B" * 150)
         session.runs[3] = run
         result = session.read_canvas(limit=50, max_chars=100, wait_timeout=0.0)
-        self.assertEqual(result["output"], ("A" * 50) + ("B" * 50))
+        self.assertEqual(result["output"], ("A" * 50) + "\n")
         self.assertTrue(result["has_more"], "the rest of the canvas is still unread")
         # Rewind: the history is intact, the same window comes back.
         reread = session.read_canvas(limit=50, offset=0, max_chars=100, wait_timeout=0.0)
-        self.assertEqual(reread["output"], ("A" * 50) + ("B" * 50))
+        self.assertEqual(reread["output"], ("A" * 50) + "\n")
 
     def test_exit_marker_resilience(self):
         token = "a1b2c3d4e5f60718"
@@ -2973,7 +2975,9 @@ class TestSSH(unittest.TestCase):
         session.append_scrollback("".join(("B" * 400) + "\n" for _ in range(20)))
 
         res = session.read_canvas(limit=20, max_chars=100)
-        self.assertEqual(len(res["output"]), 100)
+        # max_chars is soft: the window ends on a virtual-line boundary, so one whole
+        # 400-char line (plus its newline) comes back instead of a 100-char half (FIX-4).
+        self.assertEqual(len(res["output"]), 401)
         self.assertTrue(res["has_more"], "unread text must still be reported as has_more")
         self.assertIn("truncated", res.get("hint", ""), "a cut window must say so")
 
@@ -3004,18 +3008,19 @@ class TestSSH(unittest.TestCase):
         """D2: the unread cursor is an absolute stream offset, never a relative index."""
         session, _, _ = self._create_mock_session()
         session.scrollback.max_chars = 1000
-        session.append_scrollback("A" * 1000)
+        session.append_scrollback("A" * 999 + "\n")
         session.append_scrollback("B" * 500)
         self.assertEqual(session.scrollback.base_offset, 500, "Setup: 500 chars must be evicted")
 
         # The cursor is clamped to the live buffer start, so the window opens at the
         # 500-char mark of the stream (buffer start), not at the buffer's zero index.
+        # max_chars is soft, so the whole 500-char virtual line comes back (FIX-4).
         page = session.read_canvas(limit=1, max_chars=100)
-        self.assertEqual(page["output"], "A" * 100)
-        self.assertEqual(session.scrollback_cursor, 600, "Cursor must be absolute (base_offset + window end)!")
+        self.assertEqual(page["output"], "A" * 499 + "\n")
+        self.assertEqual(session.scrollback_cursor, 1000, "Cursor must be absolute (base_offset + window end)!")
 
         nxt = session.read_canvas(limit=0, max_chars=50)
-        self.assertEqual(nxt["output"], "A" * 50, "The unread read must continue from the canvas cursor, not from the buffer start!")
+        self.assertEqual(nxt["output"], "B" * 500, "The unread read must continue from the canvas cursor, not from the buffer start!")
 
     def test_run_history_is_backfilled_into_scrollback_only_once(self):
         """D7: a cleared canvas must not silently refill from run buffers again."""
@@ -3229,8 +3234,7 @@ class TestScrollbackEvictionSemantics(unittest.TestCase):
     def test_dropped_data_is_reported_once(self):
         """D6: the sticky loss flag must not survive a later valid read."""
         run = self._run_state(max_buffer_chars=1000, log_name="d6.log")
-        run.append_output("A" * 1000)
-        run.append_output("B" * 500)
+        run.append_output("A" * 500 + ("B" * 99 + "\n") * 10)
         self.assertEqual(run.buffer_base_offset, 500)
         self.assertEqual(run.buffer_len, 1000)
 
@@ -3238,10 +3242,11 @@ class TestScrollbackEvictionSemantics(unittest.TestCase):
         session.runs[1] = run
         first = session.read_canvas(limit=0, max_chars=10, wait_timeout=0.0)
         self.assertTrue(first["dropped_data"], "Reading below the retained base must report the eviction!")
-        self.assertEqual(first["output"], "A" * 10)
+        # The soft cap still delivers one whole virtual line per answer (FIX-4).
+        self.assertEqual(first["output"], "B" * 99 + "\n")
         second = session.read_canvas(limit=0, max_chars=10, wait_timeout=0.0)
         self.assertFalse(second.get("dropped_data"), "A valid read must not repeat a stale drop flag!")
-        self.assertEqual(second["output"], "A" * 10)
+        self.assertEqual(second["output"], "B" * 99 + "\n", "the unread read continues on a virtual-line boundary")
 
     def test_read_canvas_reports_evicted_unread_data(self):
         """A canvas window that starts below the retained base must admit the loss."""
@@ -3417,7 +3422,9 @@ class TestReadStateContract(unittest.TestCase):
             max_chars=6,
         )
         self._assert_state_only(res)
-        self.assertEqual(res["output"], "first ")
+        # Every run answer opens with the console echo of the command; the soft cap
+        # returns that whole virtual line and leaves the output unread (FIX-3/FIX-4).
+        self.assertEqual(res["output"], "$ seq 1 2\n")
         self.assertEqual(res["has_more"], 2, "the window was cut - two lines remain unread")
         self.assertTrue(res["still_running"], "the run was never completed")
 
@@ -3439,6 +3446,194 @@ class TestReadStateContract(unittest.TestCase):
         self._assert_state_only(full)
         self.assertEqual(full["output"], "second\n")
         self.assertEqual(full["has_more"], 0)
+
+
+class TestExecChannelShellGate(unittest.TestCase):
+    """Notebook item 4: shell=True on the non-PTY exec channel must never reach the NDM CLI.
+
+    On Keenetic the exec channel runs the configuration CLI, not a POSIX shell: the
+    gateway fed POSIX text straight into the configurator and the agent read
+    "Command::Base error[7405600]: no such command: uname." back (exit 127). A separate
+    SSH channel has its own interpreter, so the session's own in_shell flag cannot
+    predict it: the verdict is probed once per session and cached in
+    session.exec_channel_posix (None = not known yet).
+    """
+
+    NDM_REFUSAL = b"\x1b[KCommand::Base error[7405600]: no such command: echo.\n\x1b[K"
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.cache_dirs = make_cache_dirs(self.test_dir)
+        config.PROJECT_ROOT = self.test_dir
+        config.PROJECT_TAG = "test_project"
+        config.CACHE_DIRS = self.cache_dirs
+        config.READ_ONLY = False
+        config.COMMAND_BLACKLIST = []
+        set_buffer_limit_checkers(lambda size: True, lambda: 0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _session(self, verdict=None):
+        mock_client = MagicMock()
+        mock_channel = MagicMock()
+        mock_client.invoke_shell.return_value = mock_channel
+        mock_channel.recv_ready.return_value = False
+        session = SSHSession(session_id=1, name="exec_gate", cache_dirs=self.cache_dirs, project_tag="test_project")
+        session.client = mock_client
+        session.channel = mock_channel
+        session.in_shell = True
+        session.ensure_alive = MagicMock(return_value=None)
+        session.check_health = MagicMock(return_value=True)
+        session.exec_channel_posix = verdict
+        return session, mock_client
+
+    def _run_exec(self, session, command, shell=True):
+        return session.run_command(
+            command=command, mode="sync", shell=shell,
+            wait_timeout=0.05, startup_wait=0.05, hard_timeout=0.0,
+            completion_hint="either", quiet_complete_timeout=0.2, use_pty=False,
+        )
+
+    @staticmethod
+    def _mock_exec_streams(mock_client):
+        """A paramiko-shaped (stdin, stdout, stderr) triple whose channel stays silent."""
+        stdin, stdout, stderr = MagicMock(), MagicMock(), MagicMock()
+        channel = stdout.channel
+        channel.recv_ready.return_value = False
+        channel.recv_stderr_ready.return_value = False
+        channel.exit_status_ready.return_value = False
+        stdin.channel = channel
+        mock_client.exec_command.return_value = (stdin, stdout, stderr)
+        return stdin, stdout, stderr
+
+    def test_shell_true_over_a_non_posix_exec_channel_is_refused_before_sending(self):
+        session, mock_client = self._session(verdict=False)
+        res = self._run_exec(session, "uname -a", shell=True)
+        self.assertFalse(res["success"], res)
+        self.assertIn("use_pty=true", res["error"])
+        self.assertIn("shell=false", res["error"])
+        mock_client.exec_command.assert_not_called()
+        self.assertIsNone(session.active_run_id, "the refused run must not stay reserved")
+        canvas = session.read_canvas(limit=10, max_chars=1000, wait_timeout=0.0)
+        self.assertEqual(canvas["output"], "", "a refused command must not be echoed")
+
+    def test_a_posix_exec_channel_still_runs_shell_true(self):
+        session, mock_client = self._session(verdict=True)
+        self._mock_exec_streams(mock_client)
+        session._start_exec_reader_thread = MagicMock()
+        self._run_exec(session, "uname -a", shell=True)
+        mock_client.exec_command.assert_called_once_with("uname -a", get_pty=False)
+
+    def test_ndm_commands_still_run_over_a_non_posix_exec_channel(self):
+        session, mock_client = self._session(verdict=False)
+        self._mock_exec_streams(mock_client)
+        session._start_exec_reader_thread = MagicMock()
+        res = self._run_exec(session, "show version", shell=False)
+        self.assertTrue(res["success"], res)
+        mock_client.exec_command.assert_called_once_with("show version", get_pty=False)
+
+    def test_the_exec_channel_is_probed_once_and_the_verdict_cached(self):
+        session, _ = self._session(verdict=None)
+        # A POSIX host runs the probe and prints its token (the probe text itself never
+        # contains the token, so an echoing host cannot fake a POSIX verdict).
+        client = _FakeExecClient(lambda cmd: b"MCP_EXEC_POSIX_OK\n")
+        session.client = client
+
+        def fill(run):
+            run.append_output("ok\n")
+            run.mark_done("completed")
+
+        session._start_exec_reader_thread = fill
+        self._run_exec(session, "uname -a", shell=True)
+        self._run_exec(session, "uname -r", shell=True)
+        probes = [c for c in client.commands if "MCP_%s_POSIX" in c]
+        self.assertEqual(len(probes), 1, "one probe per session, got %r" % (client.commands,))
+        self.assertTrue(session.exec_channel_posix)
+        self.assertIn("uname -a", client.commands)
+        self.assertIn("uname -r", client.commands)
+
+    def test_an_undecidable_probe_never_blocks_the_command(self):
+        session, mock_client = self._session(verdict=None)
+        session._start_exec_reader_thread = MagicMock()
+        res = self._run_exec(session, "uname -a", shell=True)
+        self.assertNotIn("cannot be honoured", str(res.get("error", "")),
+                         "an undecidable probe must fail open: %r" % (res,))
+        self.assertEqual(mock_client.exec_command.call_count, 2, "one probe plus the real command")
+        self.assertIsNone(session.exec_channel_posix, "an undecidable verdict must not be cached")
+
+    def test_a_ndm_configuration_cli_is_detected_and_cached(self):
+        session, _ = self._session(verdict=None)
+        client = _FakeExecClient(lambda cmd: self.NDM_REFUSAL)
+        session.client = client
+        res = self._run_exec(session, "uname -a", shell=True)
+        self.assertFalse(res["success"], res)
+        self.assertIn("use_pty=true", res["error"])
+        self.assertFalse(session.exec_channel_posix, "the NDM verdict must be cached")
+        self.assertTrue(all("uname" not in c for c in client.commands),
+                        "the refused command must never reach the configurator: %r" % (client.commands,))
+
+
+class _FakeExecChannel:
+    """A paramiko-shaped exec channel that answers with fixed bytes, once."""
+
+    def __init__(self, answer):
+        self._answer = answer
+        self._sent = False
+        self.closed = False
+
+    def settimeout(self, timeout):
+        pass
+
+    def recv_ready(self):
+        return bool(self._answer)
+
+    def recv(self, n=4096):
+        out, self._answer = self._answer, b""
+        self._sent = True
+        return out
+
+    def recv_stderr_ready(self):
+        return False
+
+    def exit_status_ready(self):
+        return True
+
+    def recv_exit_status(self):
+        return 0
+
+    def shutdown_write(self):
+        pass
+
+    def shutdown_read(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeExecStream:
+    def __init__(self, channel):
+        self.channel = channel
+
+    def read(self, n=None):
+        return b""
+
+    def close(self):
+        pass
+
+
+class _FakeExecClient:
+    """A paramiko SSHClient whose exec channel answers with a scripted response."""
+
+    def __init__(self, answer_for):
+        self._answer_for = answer_for
+        self.commands = []
+
+    def exec_command(self, command, get_pty=False, **kwargs):
+        self.commands.append(command)
+        channel = _FakeExecChannel(self._answer_for(command))
+        return _FakeExecStream(channel), _FakeExecStream(channel), _FakeExecStream(channel)
 
 
 if __name__ == "__main__":

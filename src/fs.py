@@ -387,11 +387,30 @@ def _write_remote_file_bytes(
         _sync_shell(session, f"cat << '{b64_delim}' > {tmp_path}\n{b64_content}\n{b64_delim}", timeout=15.0, internal=True)
             
         target_perm = "600" if (private_mode or not shell_mode) else shell_mode
-        decode_cmd = (
-            f"if base64 -d {tmp_path} > '{tmp_remote}' 2>/dev/null && chmod {target_perm} '{tmp_remote}' 2>/dev/null && mv -f '{tmp_remote}' '{safe_path}' && [ -f '{safe_path}' ]; then "
-            f"rm -f {tmp_path}; echo '{marker_ok}'; "
-            f"else rm -f {tmp_path} '{tmp_remote}'; fi"
-        )
+        # Notebook item 3: keep every generated line short. A Keenetic console loses a
+        # command line beyond ~460 chars and leaves the shell at a PS2 continuation
+        # prompt, so the marker never prints and the write hangs (543 chars measured for
+        # /opt/etc/init.d/S00-kmod-zapret). Both long paths live in shell variables, so no
+        # line grows with them, and the marker stays alone on its own line for the
+        # MULTILINE match below. chmod still runs before the mv (mode-safe).
+        dst_var = f"MCP_DST_{stamp}"
+        tmp_var = f"MCP_TMP_{stamp}"
+        decode_cmd = "\n".join([
+            f"{dst_var}='{safe_path}'",
+            f"{tmp_var}='{tmp_remote}'",
+            f'if base64 -d {tmp_path} > "${tmp_var}" 2>/dev/null',
+            "then",
+            f'if chmod {target_perm} "${tmp_var}" 2>/dev/null && mv -f "${tmp_var}" "${dst_var}" && [ -f "${dst_var}" ]',
+            "  then",
+            f'    rm -f {tmp_path}',
+            f"    echo '{marker_ok}'",
+            "  else",
+            f'    rm -f {tmp_path} "${tmp_var}"',
+            "  fi",
+            "else",
+            f'  rm -f {tmp_path} "${tmp_var}"',
+            "fi",
+        ])
         decode_res = _sync_shell(session, decode_cmd, timeout=10.0, internal=True)
         output = decode_res.get("output", "")
         if decode_res.get("success", False) and re.search(rf"^(?:.*?[#$>]\s*)?{re.escape(marker_ok)}\s*$", output, re.MULTILINE):

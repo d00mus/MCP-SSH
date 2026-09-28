@@ -240,6 +240,9 @@ Reading output:
 - run returns the first line_limit lines (default 200) inline. has_more counts the
   UNREAD LINES still waiting; read(session_id) delivers them. Do not re-read output
   you already received.
+- A window ends only on a virtual-line boundary: a logical line longer than 1024
+  characters is split into 1024-character virtual lines, so concatenating
+  consecutive windows rebuilds the original output byte for byte.
 - status completed_nonzero with exit_status is a real result, not a failure. Only
   status failed/dead is an error.
 
@@ -445,7 +448,10 @@ def tools_list() -> Dict[str, Any]:
                 "wait_timeout blocks only while the stream is silent - output already buffered comes back at once. "
                 "Returns output plus has_more - the NUMBER of unread LINES still left (0 = all caught up; read "
                 "again to continue) - and still_running (true while a command is in flight); plus status, mode "
-                "and, when relevant, dropped_data, exit_status and a hint."
+                "and, when relevant, dropped_data, exit_status and a hint. "
+                "A window ends only on a virtual-line boundary: a logical line longer than 1024 characters is "
+                "split into 1024-character virtual lines, so concatenating consecutive windows rebuilds the "
+                "original output byte for byte - a very long line simply arrives across several answers."
             ),
             "inputSchema": {
                 "type": "object",

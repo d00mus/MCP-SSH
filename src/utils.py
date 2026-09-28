@@ -82,6 +82,20 @@ def _is_filesystem_root(path: str) -> bool:
 _EXIT_MARKER_TOKEN = re.compile(r"__MCP_EC_[0-9a-f_]*")
 # The PTY echo of the wrapper command built by wrap_posix_exit_marker().
 _EXIT_MARKER_WRAPPER = re.compile(r"printf\s+'%s\\n'\s+\"__MCP_EC_[0-9a-f_]*_\$\?\"")
+# A line that is nothing but a shell prompt: "$ ", "# ", "/srv/app$", "user@host:~# ",
+# "[root@host ~]# ", the router CLI's "(config)>" or a bare ">" / "#" / "$". Bounded to
+# 65 characters so that ordinary output lines are never mistaken for a prompt.
+_PROMPT_ONLY_LINE = re.compile(
+    r"^[ \t]*(?:"
+    r"\([^)\n]{0,40}\)[ \t]*[>#$]?"                                  # "(venv) $", "(config)>"
+    r"|[>#$]"                                                        # a bare prompt: "$ ", "#", ">"
+    r"|\[[^\]\n]{0,60}\][ \t]*[>#$]"                                 # "[root@host ~]#"
+    r"|[A-Za-z0-9._-]{1,32}@[A-Za-z0-9._-]{1,64}:[^\s]*[ \t]*[>#$]"  # "user@host:~# "
+    r"|[\w.@:/~-]{0,64}[>#$]"                                        # "build# ", "Keenetic-Giga>"
+    r")[ \t]*$"
+)
+# Cheap gate for the fast path: does any line end in a prompt symbol?
+_PROMPT_LINE_TAIL = re.compile(r"[#$>][ \t]*$", re.MULTILINE)
 
 
 def parse_exit_marker(text: str, token: str) -> Optional[int]:
@@ -98,29 +112,54 @@ def parse_exit_marker(text: str, token: str) -> Optional[int]:
     clean = ANSI_ESCAPE.sub("", text).replace("\r", "")
     match = re.search(rf"^__MCP_EC_{re.escape(token)}_(\d+)\s*$", clean, re.MULTILINE)
     if not match:
-        match = re.search(rf"(?:^|\n)__MCP_EC_{re.escape(token)}_(\d+)", clean)
+        # The marker line as it really appears on a PTY: an interactive shell
+        # prints its prompt BEFORE running the marker printf, and a command whose
+        # output has no trailing newline leaves the marker glued to that output.
+        # The 16 random hex chars make the token unguessable, so whatever sits
+        # earlier on the line is framing, not data. The echoed wrapper command
+        # carries '_$?' (not digits), so it can never satisfy the digit group.
+        match = re.search(rf"(?:^|\n)[^\n]*__MCP_EC_{re.escape(token)}_(\d+)", clean)
     if match:
         return int(match.group(1))
     return None
 
 
 def strip_internal_framing(text: str) -> str:
-    """Strip the internal exit-marker framing from agent-facing output.
+    """Strip the internal exit-marker framing and prompt noise from agent output.
 
     wrap_posix_exit_marker() appends a printf that prints __MCP_EC_<token>_<rc>.
-    The PTY echoes the wrapped command and the shell prints the marker line; both
-    are bookkeeping (the token is unguessable, which is exactly what lets
-    parse_exit_marker trust it) and must never reach the agent. This is the single
-    sanitiser at the output boundary. Only internal framing is removed: every
-    other byte is preserved verbatim, and no cursor/has_more arithmetic is
-    derived from the returned text.
+    The PTY echoes the wrapped command, the shell prints its prompt, and the
+    marker line itself appears; all of it is bookkeeping (the token is
+    unguessable, which is exactly what lets parse_exit_marker trust it) and must
+    never reach the agent. This is the single sanitiser at the output boundary.
+    It removes only framing, never command output. The scrollback canvas and its
+    cursor stay raw: has_more is counted on the cleaned remainder, so a promise
+    covers only text the agent can actually receive.
     """
-    if not text or "__MCP_EC_" not in text:
+    if not text:
         return text
+    if "__MCP_EC_" not in text and not _PROMPT_LINE_TAIL.search(text):
+        # Fast path: no framing at all - byte-for-byte identity, no line split.
+        return text
+    if "\x1b" in text:
+        # A PTY brackets what it prints in DECSET escapes (\x1b[?2004h around the
+        # prompt). The canvas normally never sees them - the StreamCleaner strips
+        # them at ingest - but a raw append (a mirrored run buffer, a partial line
+        # released at the end of a run) can carry one in. Strip them here, so an
+        # escaped prompt is still recognised as framing instead of reaching the
+        # agent as noise (live transcript, NL-vps, 2026-09-28).
+        text = ANSI_ESCAPE.sub("", text)
     kept = []
+    prompt_dropped_last = False
     for line in text.split("\n"):
+        if _PROMPT_ONLY_LINE.match(line):
+            # A line that is nothing but a shell prompt: the prompt the shell
+            # printed before the marker's own command, or the one left after it.
+            prompt_dropped_last = True
+            continue
         if "__MCP_EC_" not in line:
             kept.append(line)
+            prompt_dropped_last = False
             continue
         if _EXIT_MARKER_WRAPPER.search(line):
             # The PTY echo of the wrapper command: drop the whole line.
@@ -130,7 +169,167 @@ def strip_internal_framing(text: str) -> str:
             # The line was nothing but the marker (or a window-split fragment).
             continue
         kept.append(residual)
-    return "\n".join(kept)
+        prompt_dropped_last = False
+    cleaned = "\n".join(kept)
+    if prompt_dropped_last and cleaned and not cleaned.endswith("\n"):
+        # The dropped prompt stood on its own line after the last output line,
+        # which the canvas had newline-terminated: keep that newline. A marker
+        # line dropped at the very end must not add one (the marker is written
+        # as the shell's last act and can legitimately glue to unterminated
+        # output, e.g. printf 'hello').
+        cleaned += "\n"
+    return cleaned
+
+
+# What may stand in front of the echoed command on the same line: a shell prompt,
+# and nothing else. Only the echo filter uses it - never output that follows (FIX-3).
+_PROMPT_PREFIX = re.compile(
+    r"^(?:\([^)\n]{0,40}\)|\[[^\]\n]{0,60}\]|[\w.@:/~-]{0,64})[ \t]*[>#$][ \t]*$"
+)
+
+
+class CommandEchoFilter:
+    """Drop the remote shell's own echo of the command the gateway typed (FIX-3).
+
+    A PTY echoes what it is given, so the agent would read the command twice: once
+    in the synthetic "$ <command>" line the runner puts at the head of the answer,
+    and once from the remote shell. The duplicate is removed here, at ingest, before
+    the text reaches the tab canvas; the run buffer stays raw, because the marker
+    parser and the internal callers read that one.
+
+    Only the beginning of a run is examined - a shell echoes before it executes -
+    and the filter disarms for good at the first line it does not recognise, so
+    output that later happens to repeat the command text is left alone. A line
+    counts as the echo when it is the command (or the wrapped command the shell was
+    actually given) verbatim, or when a prompt prefix stands in front of it. Blank
+    and prompt-only lines pass through without disarming: they are framing the
+    canvas sanitiser drops later, and the echo may follow them. The budget bounds
+    the damage of a pathological match: one line per line of the command, plus two.
+
+    A host that echoes a line wider than its terminal splits the echo: the PTY wraps
+    it with CR CR LF in the middle of the command, so the echo arrives as two (or
+    more) physical lines and the first of them is just a prefix. Lines that are still
+    a prefix of a candidate are held until they complete it, and released in place
+    when the next line proves the echo never came (live Keenetic trace, 2026-09-28).
+    """
+
+    def __init__(self, command: str, wire_command: Optional[str] = None) -> None:
+        self._candidates: List[str] = []
+        for text in (command or "", wire_command or ""):
+            for line in text.split("\n"):
+                stripped = line.strip()
+                if stripped and stripped not in self._candidates:
+                    self._candidates.append(stripped)
+        self._budget = len(self._candidates) + 2
+        self._pending = ""
+        self._armed = bool(self._candidates)
+        self._swallow_blank = False
+        # Lines held as a possible echo already started on a wrapped physical line.
+        self._hold: List[str] = []
+        self._hold_text = ""
+
+    def _classify(self, text: str) -> Optional[str]:
+        """Is this text the echo, or could it still grow into it?
+
+        "full" when it is the command (or the wrapped command the shell was given),
+        optionally behind a prompt; "partial" while it is a proper prefix of one of
+        them - the head of an echo the PTY wrapped; None otherwise."""
+        stripped = text.strip()
+        if not stripped:
+            return None
+        for candidate in self._candidates:
+            if stripped == candidate:
+                return "full"
+            if stripped.endswith(candidate) and _PROMPT_PREFIX.match(stripped[: -len(candidate)]):
+                return "full"
+            if candidate.startswith(stripped):
+                return "partial"
+        return None
+
+    def _drop_echo(self) -> None:
+        """The echo is recognised whole: forget it and the blank line it drags along."""
+        self._hold = []
+        self._hold_text = ""
+        self._budget -= 1
+        self._swallow_blank = True
+        if self._budget <= 0:
+            self._armed = False
+
+    def _release_hold(self) -> str:
+        """Lines held as a possible wrapped echo, back as canvas text, in order."""
+        if not self._hold:
+            return ""
+        held, self._hold = self._hold, []
+        self._hold_text = ""
+        return "\n".join(held) + "\n"
+
+    def feed(self, chunk: str) -> str:
+        """Return the part of one raw chunk that belongs in the canvas."""
+        if not chunk:
+            return chunk
+        if not self._armed:
+            # The filter is done examining: anything it held back goes back into the
+            # stream, in order, ahead of this chunk. A partial line held by the very
+            # feed that disarmed the filter must not wait for flush() - that would
+            # move it past the whole rest of the output (live NL-vps regression).
+            held = self._release_hold()
+            pending, self._pending = self._pending, ""
+            return held + pending + chunk
+        text = self._pending + chunk
+        self._pending = ""
+        if text.endswith("\n"):
+            lines = text[:-1].split("\n")
+        else:
+            # An unfinished line is held back: it may still turn out to be the echo.
+            lines = text.split("\n")
+            self._pending = lines.pop()
+        kept: List[str] = []
+        for line in lines:
+            if self._hold:
+                # Mid-echo: only this line can complete (or disprove) it.
+                verdict = self._classify(self._hold_text + line)
+                if verdict == "full":
+                    self._drop_echo()
+                    continue
+                if verdict == "partial":
+                    self._hold.append(line)
+                    self._hold_text += line.strip()
+                    continue
+                # The echo never completed, so those lines were output after all.
+                kept.extend(self._hold)
+                self._hold = []
+                self._hold_text = ""
+            if self._swallow_blank:
+                self._swallow_blank = False
+                if not line.strip():
+                    # Closing bracketed paste makes bash write a lone CR right after
+                    # the command echo; the cleaner reads that CR as a newline, so
+                    # the dropped echo line would leave a blank line in front of the
+                    # output. The blank line belongs to the echo, not to the output.
+                    continue
+            if self._armed and self._budget > 0:
+                verdict = self._classify(line)
+                if verdict == "full":
+                    self._drop_echo()
+                    continue
+                if verdict == "partial":
+                    self._hold = [line]
+                    self._hold_text = line.strip()
+                    continue
+            if line.strip() and not _PROMPT_ONLY_LINE.match(line):
+                self._armed = False
+            kept.append(line)
+        if not kept:
+            return ""
+        return "\n".join(kept) + "\n"
+
+    def flush(self) -> str:
+        """Release what is still held back (the run is over) and stop filtering."""
+        held = self._release_hold()
+        pending, self._pending = self._pending, ""
+        self._armed = False
+        self._swallow_blank = False
+        return held + pending
 
 
 def _is_within(norm_real: str, norm_root: str) -> bool:

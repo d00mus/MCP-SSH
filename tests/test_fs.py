@@ -1427,5 +1427,62 @@ class TestFS(unittest.TestCase):
         mv_index = next(i for i, c in enumerate(sent) if "mv -f" in c and target in c)
         self.assertLess(mv_index, chmods[0], f"chmod 600 must run after tmp+mv: {sent}")
 
+
+class TestShellFallbackLineBudget(unittest.TestCase):
+    """Notebook item 3: one long decode line kills a Keenetic file write.
+
+    The Keenetic console loses a command line of ~460 chars and leaves the shell at a
+    PS2 continuation prompt, so the success marker never prints and the write hangs
+    and the session stays busy (measured: a 466-char command hangs, 460 chars pass).
+    The old decode command was one line growing with the target path - 543 chars for
+    /opt/etc/init.d/S00-kmod-zapret. Every generated line must stay well under the
+    ceiling, and the success marker must keep standing alone on its own line because
+    src/fs.py matches it with ^(?:.*?[#$>]\s*)?MARKER\s*$ (MULTILINE).
+    """
+
+    MAX_LINE = 200  # ~460 chars is fatal on the router console: keep a 2x+ margin
+
+    @staticmethod
+    def _capture(path, payload=b"#!/bin/sh\n"):
+        import re
+        sent = []
+        session = MagicMock()
+        session.id = 1
+        session.open_sftp.return_value = None  # the router has no SFTP subsystem
+        session.client = MagicMock()
+        session.client.exec_command.side_effect = RuntimeError("exec disabled")
+
+        def mock_sync(_session, cmd, **kwargs):
+            sent.append(cmd)
+            if "stat -c %a" in cmd:
+                return {"success": True, "output": "755"}
+            marker = re.search(r"echo '(MCP_[A-Z0-9_]+)'", cmd)
+            if marker:
+                return {"success": True, "output": marker.group(1)}
+            return {"success": True, "output": ""}
+
+        with patch("src.fs._sync_shell", side_effect=mock_sync):
+            res = _write_remote_file_bytes(session, path, payload)
+        return res, sent
+
+    def test_no_generated_line_exceeds_the_console_budget(self):
+        path = "/opt/etc/init.d/S00-kmod-zapret-long-name"
+        res, sent = self._capture(path)
+        self.assertTrue(res["success"], res)
+        overlong = [(len(ln), ln) for cmd in sent for ln in cmd.split("\n") if len(ln) > self.MAX_LINE]
+        self.assertEqual(overlong, [],
+                         "lines over %d chars would hang the router console" % self.MAX_LINE)
+
+    def test_the_success_marker_stands_alone_on_its_own_line(self):
+        import re
+        res, sent = self._capture("/opt/etc/init.d/S00-kmod-zapret-long-name")
+        self.assertTrue(res["success"], res)
+        decode = [c for c in sent if "base64 -d" in c]
+        self.assertEqual(len(decode), 1, "exactly one decode command expected: %r" % (sent,))
+        marker_lines = [ln.strip() for ln in decode[0].split("\n")
+                        if re.fullmatch(r"echo 'MCP_B64_OK_[A-Z0-9_]+'", ln.strip())]
+        self.assertEqual(len(marker_lines), 1,
+                         "the marker echo must stand alone: %r" % (decode[0],))
+
 if __name__ == "__main__":
     unittest.main()

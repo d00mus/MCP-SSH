@@ -32,7 +32,7 @@ from src.config import (
 from src.utils import (
     log_error, clamp_float, clamp_int, iso_now, json_line, safe_name,
     find_prompt, parse_exit_marker, cleanup_dead_session_logs,
-    strip_internal_framing, StreamCleaner
+    strip_internal_framing, StreamCleaner, CommandEchoFilter
 )
 from src.security import check_command_security, escape_shell_path
 from src.ssh_state import RunState, ChunkBuffer, CHARS_ACCOUNT, count_virtual_lines, find_line_offset, slice_virtual_lines
@@ -271,6 +271,9 @@ class SSHSession:
         self.death_reason = ""
         self.death_time: Optional[datetime] = None
         self.in_shell = False
+        # The non-PTY exec channel is a separate SSH channel with its own interpreter,
+        # unrelated to the PTY shell; None = never probed (notebook item 4).
+        self.exec_channel_posix: Optional[bool] = None
         self._is_subshell = False
         self._pty_invalidated = False
         self.state_lost = False
@@ -352,8 +355,24 @@ class SSHSession:
         carries exactly that text, so _mirror_runs will not copy it a second time."""
         if not chunk:
             return
+        if getattr(run, "internal", False):
+            # Gateway maintenance (fs.py helpers): the run keeps its own buffer - the
+            # helper's caller parses that one - and must never enter the single stream
+            # the agent reads. Bookkeeping still advances, so _mirror_runs will not
+            # copy the text in later (live trace, keenetic, 2026-09-28).
+            with self.lock:
+                end = run.output_end() if mirrored_to is None else mirrored_to
+                if end > run.mirrored_upto:
+                    run.mirrored_upto = end
+            return
         with self.lock:
             cleaned = self._scrollback_cleaner.feed(chunk)
+            if run is not None:
+                # The shell's own copy of the command is framing, but it can only be
+                # recognised on cleaned text: what the PTY sends back carries the
+                # echo's CR/LF and the terminal's bracketed-paste escapes (FIX-3).
+                # The run buffer stays raw - the marker parser reads that one.
+                cleaned = run.canvas_chunk(cleaned)
             if cleaned:
                 self.scrollback.append(cleaned)
                 self._clamp_canvas_cursor()
@@ -395,6 +414,18 @@ class SSHSession:
 
         Called for the runs being evicted too: their buffers go away, but their text
         must reach the canvas first, otherwise unread output would vanish silently."""
+        if getattr(run, "internal", False):
+            # Gateway maintenance stays out of the canvas: mark it mirrored and drop
+            # whatever its echo filter still held back, so nothing surfaces later.
+            with run.lock:
+                run.mirrored_upto = run.output_end()
+            return
+        if run.done_event.is_set():
+            # The stream is over, so a partial line its echo filter still held back
+            # can be released: nothing else will ever complete it (FIX-3).
+            pending = run.flush_canvas_echo()
+            if pending:
+                self.scrollback.append(pending)
         with run.lock:
             start = run.mirrored_upto
             end = run.output_end()
@@ -514,7 +545,16 @@ class SSHSession:
             advance = True
 
         if len(window) > max_chars:
-            window = window[:max_chars]
+            # The cap is soft: a window may end only on a virtual-line boundary, so an
+            # over-long line moves on whole to the next read (at most 1023 characters
+            # of progress are deferred) instead of arriving as a half the agent would
+            # have to stitch back together (FIX-4). One whole virtual line is always
+            # delivered, even when max_chars is smaller than it: progress is mandatory.
+            lines_touched = count_virtual_lines(window, 0, max_chars)
+            cut = find_line_offset(window, max(0, lines_touched - 1))
+            if cut <= 0:
+                cut = find_line_offset(window, lines_touched)
+            window = window[:cut]
             limited = True
         win_end = win_start + len(window)
         if win_end < total_chars:
@@ -531,10 +571,13 @@ class SSHSession:
                     dropped_data = True
                 self.scrollback_cursor = max(next_offset, base_now)
             # Unread lines left after the cursor moved to the window end (m01215).
-            has_more = count_virtual_lines(full_text, win_end)
+            # has_more must promise only what the agent can actually receive:
+            # internal framing is not readable output, so the remaining virtual
+            # lines are counted on the cleaned remainder.
+            has_more = count_virtual_lines(strip_internal_framing(full_text[win_end:]), 0)
         else:
             # A peek reports what is still UNREAD, not what follows the window.
-            has_more = count_virtual_lines(full_text, cursor_rel)
+            has_more = count_virtual_lines(strip_internal_framing(full_text[cursor_rel:]), 0)
 
         with self.lock:
             active_r = self.runs.get(self.active_run_id) if self.active_run_id is not None else None
@@ -1023,6 +1066,64 @@ class SSHSession:
             self.reader_threads[run.run_id] = thread
         thread.start()
 
+    def _exec_channel_is_posix(self) -> bool:
+        """Is the non-PTY exec channel a POSIX shell on this host? (notebook item 4)
+
+        The exec channel is a separate SSH channel whose interpreter is unrelated to the
+        PTY: Keenetic answers it with the NDM configuration CLI ('no such command: ...'),
+        a normal host answers with bash. session.in_shell describes the PTY, so it cannot
+        answer this. The verdict is probed once per session (self.exec_channel_posix).
+        A probe that cannot decide fails open - it must never block a command - while a
+        completed probe without the token is a real verdict: the channel is not POSIX.
+        """
+        if self.exec_channel_posix is not None:
+            return self.exec_channel_posix
+        if not self.client:
+            return True
+        # The command deliberately does NOT contain the token literally: a host that
+        # echoes input back would otherwise be mistaken for a POSIX shell.
+        probe_command = "printf 'MCP_%s_POSIX_%s\\n' EXEC OK"
+        probe_token = b"MCP_EXEC_POSIX_OK"
+        probe_timeout = 5.0
+        probe_channel = None
+        try:
+            _stdin, stdout, _stderr = self.client.exec_command(probe_command, get_pty=False)
+            probe_channel = stdout.channel
+            probe_channel.settimeout(probe_timeout)
+            data = b""
+            answered = False
+            while True:
+                try:
+                    chunk = probe_channel.recv(4096)
+                except Exception:
+                    break  # timeout or channel error: undecided, fail open
+                if not chunk:
+                    answered = True  # the channel is closed: the answer is complete
+                    break
+                data += chunk
+                if probe_token in data:
+                    break
+                if len(data) > 16384:
+                    answered = True
+                    break
+            if probe_token in data:
+                self.exec_channel_posix = True
+                return True
+            if answered:
+                self.exec_channel_posix = False
+                log_error(f"Exec channel on '{self.server_alias}' is not a POSIX shell: {data[:200]!r}")
+                return False
+            log_error(f"Exec channel probe on '{self.server_alias}' was undecided; assuming POSIX")
+            return True
+        except Exception as exc:
+            log_error(f"Exec channel probe on '{self.server_alias}' failed ({exc}); assuming POSIX")
+            return True
+        finally:
+            try:
+                if probe_channel is not None:
+                    probe_channel.close()
+            except Exception:
+                pass
     def _exit_shell(self, timeout: float = 5.5) -> bool:
         # Keenetic NDM quirk: 'exit' from an entered shell is SLOW (~2-4.6s on
         # live probes) and sometimes never redraws the NDM prompt. A short wait
@@ -1554,7 +1655,8 @@ class SSHSession:
                     run_id=run_id, session_id=self.id, command=command, mode=mode,
                     started_at=time.time(), wait_timeout=wait_timeout, startup_wait=startup_wait,
                     hard_timeout=hard_timeout, max_buffer_chars=MAX_BUFFER_CHARS,
-                    run_log_path=self._build_run_log_path(run_id)
+                    run_log_path=self._build_run_log_path(run_id),
+                    internal=internal,
                 )
                 run.completion_hint = completion_hint
                 run.quiet_complete_timeout = quiet_complete_timeout
@@ -1589,6 +1691,25 @@ class SSHSession:
 
         self.last_command = command
         self.last_command_time = datetime.now()
+
+        # Notebook item 4: the exec channel of a host whose exec channel is the
+        # configuration CLI (Keenetic NDM) can never become a POSIX shell - sending
+        # POSIX text there runs nothing and answers 'no such command: ...' (exit 127).
+        # Refuse before anything is sent and name the two recipes that do work.
+        if use_pty is False and shell is True and not self._exec_channel_is_posix():
+            with self.lock:
+                if self.active_run_id == run_id:
+                    self.active_run_id = None
+            run.mark_done("failed", error="exec_channel_not_posix", completion_method="failed")
+            return {"success": False, "error": (
+                f"Session {self.server_alias}/{self.id}: shell=true cannot be honoured on the "
+                "non-PTY exec channel of this host - it is not a POSIX shell (the configuration "
+                "CLI answers POSIX text with 'Command::Base error[...]: no such command: ...' "
+                "and runs nothing). Use use_pty=true for POSIX commands, or shell=false "
+                "for NDM CLI commands."
+            ),
+                "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id,
+                "server": self.server_alias}
 
         if use_pty:
             if shell is True and not self.in_shell:
@@ -1648,6 +1769,15 @@ class SSHSession:
                         f"Session {self.server_alias}/{self.id} has no channel (PTY invalidated or never opened). "
                         "Start fresh with new_session=true."
                     ), "session_id": f"{self.server_alias}/{self.id}", "numeric_session_id": self.id, "server": self.server_alias}
+                # The answer must read like a console: the command is echoed once,
+                # by the gateway, before the remote shell can echo it back (FIX-3).
+                # The filter drops that duplicate at ingest, so a later `read` shows
+                # the same text `run` did.
+                run.echo_filter = CommandEchoFilter(command, wire_command)
+                if not internal:
+                    # Gateway maintenance is not the agent's console: the helper's
+                    # caller reads the run buffer, the canvas stays clean.
+                    self.append_scrollback(f"$ {command}\n")
                 # Reader must be running before send so a large payload cannot fill the window.
                 self._start_reader_thread(run)
                 send_deadline = time.time() + 30.0
@@ -1681,7 +1811,10 @@ class SSHSession:
                         run.exec_stdin_closed = True
                     except Exception as exc:
                         log_error(f"Error closing exec stdin: {exc}")
-                self.append_scrollback(f"$ {command}\n")
+                # Notebook item 1: the exec channel has no terminal echo of its own,
+                # so the gateway must not invent one (README.md: "no PTY, no echo").
+                # The PTY branch above keeps its "$ command" line - a real terminal
+                # types it there.
                 self._start_exec_reader_thread(run)
         except Exception as exc:
             for stream in (run.exec_stdin, run.exec_stdout, run.exec_stderr):

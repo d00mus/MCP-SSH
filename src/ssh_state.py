@@ -261,6 +261,10 @@ class RunState:
     run_log_path: str
     # JSON-RPC id of the request that started this run (notifications/cancelled).
     req_id: Optional[Any] = None
+    # Gateway maintenance (fs.py helpers, internal=True in run_command): its output
+    # lives in this run's own buffer, which the helper's caller parses, and is kept
+    # out of the session tab canvas - the one stream the agent reads.
+    internal: bool = False
 
     lock: threading.Lock = field(default_factory=threading.Lock)
     done_event: threading.Event = field(default_factory=threading.Event)
@@ -282,6 +286,10 @@ class RunState:
     last_stdin_at: Optional[float] = None
     quiet_event: threading.Event = field(default_factory=threading.Event)
     _cleaner: StreamCleaner = field(default_factory=StreamCleaner)
+    # PTY runs only: drops the remote shell's echo of the command we typed, so the
+    # canvas (the agent's single unread stream) carries the command exactly once,
+    # as the synthetic "$ <command>" line (FIX-3). None means no filtering.
+    echo_filter: Optional[Any] = None
 
     exec_channel: Optional[Any] = None
     exec_stdin: Optional[Any] = None
@@ -349,6 +357,21 @@ class RunState:
                 return self.output_end()
             self._buf.append(cleaned)
             return self.output_end()
+
+    def canvas_chunk(self, chunk: str) -> str:
+        """The part of one raw chunk that belongs in the session tab canvas.
+
+        The run buffer keeps the raw text (the marker parser reads it); the canvas
+        gets the agent's view, without the shell's duplicate of the command (FIX-3)."""
+        if self.echo_filter is None:
+            return chunk
+        return self.echo_filter.feed(chunk)
+
+    def flush_canvas_echo(self) -> str:
+        """Release text a finished run's echo filter still held back (may be empty)."""
+        if self.echo_filter is None:
+            return ""
+        return self.echo_filter.flush()
 
     def mark_done(
         self,
