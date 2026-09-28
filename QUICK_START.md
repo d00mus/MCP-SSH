@@ -50,8 +50,10 @@ Create `servers.json` at the absolute path you will pass with `--servers-config`
 ### Path A: Python (Fastest)
 
 ```bash
-pip install -r requirements.txt
+pip install mcp-ssh-gateway
 ```
+
+Then run `mcp-ssh-gateway --servers-config servers.json`. To work on the project itself, clone it and use `pip install -r requirements.txt` instead.
 
 ### Path B: Docker
 
@@ -70,9 +72,8 @@ docker build -t mcp-ssh-server .
 {
   "mcpServers": {
     "ssh-gateway": {
-      "command": "python",
+      "command": "mcp-ssh-gateway",
       "args": [
-        "C:\\tools\\ssh-gateway\\mcp-server.py",
         "--servers-config", "C:\\tools\\ssh-gateway\\servers.json",
         "--project-root", "C:\\work"
       ],
@@ -83,6 +84,8 @@ docker build -t mcp-ssh-server .
   }
 }
 ```
+
+If the client cannot find `mcp-ssh-gateway` on `PATH`, use the full path to `mcp-ssh-gateway.exe` in your Python `Scripts` folder.
 
 **With Docker:**
 

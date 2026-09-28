@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "ssh-gateway": {
-      "command": "python",
+      "command": "mcp-ssh-gateway",
       "args": [
-        "C:\\tools\\ssh-gateway\\mcp-server.py",
         "--servers-config", "C:\\tools\\ssh-gateway\\servers.json",
         "--project-root", "C:\\work",
         "--cache-dir", "C:\\tools\\ssh-gateway\\.ssh-cache"
