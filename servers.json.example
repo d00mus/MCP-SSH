@@ -6,7 +6,7 @@
       "user": "admin",
       "password": "${KEENETIC_PASSWORD}",
       "description": "Keenetic Ultra router (gateway & Entware)",
-      "verify_host": false,
+      "verify_host": true,
       "extra_path": "/opt/bin:/opt/sbin"
     },
     "nas": {

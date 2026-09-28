@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.1] — 2026-09-28
+
+### Changed
+- Rewrite the README around practical SSH fleet workflows, with a verified quickstart and clearer setup and security boundaries.
+- Correct quickstart and security guidance; default the example host configuration to SSH host-key verification.
+
 ## [6.0.0] — 2026-09-28
 
 ### Changed

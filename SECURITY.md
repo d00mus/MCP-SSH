@@ -7,20 +7,21 @@ agent as an untrusted caller that you have given SSH credentials to.
 
 ## What the guardrails do (and do not) protect
 
-The built-in guardrails are **regex checks over the submitted command text**, plus
-local directory containment for file transfers:
+The built-in guardrails check the submitted command text (including literal
+blacklist entries), plus local-path containment for file transfers:
 
 - per-host `read_only` mode blocks file-tool writes and obvious write patterns in
   commands (redirections, package installs, disk formatting);
 - `command_blacklist` entries merge per-host and global lists into one set;
 - `server_add` is append-only — existing targets cannot be edited or deleted
   through a tool call;
-- file transfers are confined to the project root and the gateway cache dir, and
-  the gateway's own code and config are not writable through the file tool.
+- local transfer paths are confined to the project root and gateway cache dir;
+  this does not restrict remote command execution or remote paths. The gateway's
+  own code and config are not writable through the file tool.
 
 These are **mistake guards, not a security boundary**. Shell quoting, expansion,
 `base64`, or an interpreter (`python3 -c`, `perl -e`, `busybox sh`) defeat a
-command-text regex. A compromised agent has the same reach as the SSH account you
+command-text check. A compromised agent has the same reach as the SSH account you
 configured.
 
 ## If you need a real boundary

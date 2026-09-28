@@ -41,12 +41,15 @@ git push origin master --tags
 
 ## 4. Publish to PyPI
 
+Prefer Trusted Publishing (OIDC) over a long-lived API token. Configure the GitHub Actions workflow and PyPI trusted publisher to match the repository, workflow filename, and `pypi` environment exactly. The workflow should build from the release tag, then publish using `pypa/gh-action-pypi-publish` with `id-token: write`. See the [PyPI setup guide](https://docs.pypi.org/trusted-publishers/adding-a-publisher/) and [publishing guide](https://docs.pypi.org/trusted-publishers/using-a-publisher/). Do not paste PyPI tokens into chat or commit them.
+
+For a manual upload, use a newly created project-scoped token through a secure local secret mechanism; do not put it directly in command arguments or source control. Upload only the intended version:
+
 ```bash
-python -m twine upload dist/*
+python -m twine upload dist/mcp_ssh_gateway-<version>*
 ```
 
-Use a [PyPI API token](https://pypi.org/manage/account/token/) as `__token__`;
-password upload is disabled. Verify:
+Verify:
 
 ```bash
 pip install mcp-ssh-gateway

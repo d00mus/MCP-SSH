@@ -1,12 +1,12 @@
 # Quick Start: Multi-Server SSH MCP Gateway
 
-Control all your SSH infrastructure (routers, NAS, VPS, staging clusters) through a **single, unified MCP server instance**.
+Connect an MCP client to your SSH hosts through one locally running gateway. Start with the simpler [README setup](README.md#try-it-with-one-host); the examples below cover more options.
 
 ---
 
 ## 1. Prepare Configuration (`servers.json`)
 
-Create `servers.json` in your workspace root (or copy from `servers.json.example`):
+Create `servers.json` at the absolute path you will pass with `--servers-config` (or copy [servers.json.example](servers.json.example)):
 
 ```json
 {
@@ -17,7 +17,7 @@ Create `servers.json` in your workspace root (or copy from `servers.json.example
       "user": "admin",
       "password": "${KEENETIC_PASSWORD}",
       "description": "Keenetic Ultra router",
-      "verify_host": false,
+      "verify_host": true,
       "extra_path": "/opt/bin:/opt/sbin"
     },
     "nas": {
@@ -41,7 +41,7 @@ Create `servers.json` in your workspace root (or copy from `servers.json.example
 }
 ```
 
-> **Feature Highlight:** Supports environment variable interpolation (e.g. `${KEENETIC_PASSWORD}`), `~` home expansion, up to 10 concurrent sessions per server by default, and zero-downtime hot-reload when edited.
+> **Before connecting:** verify and add the SSH host key to the system host-key store on the machine running the gateway. `verify_host: true` rejects unknown host keys. `${KEENETIC_PASSWORD}` must be set in the MCP process environment. `read_only` and command blacklists are mistake guards, not a security boundary; use restricted SSH accounts. See [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -132,10 +132,10 @@ docker build -t mcp-ssh-server .
 2. **Execute Commands (`run`):**
    - Explicit target: `run(server="keenetic", command="show interface", shell=false)`
    - Composite session ID: `run(session_id="nas/1", command="zpool status")`
-   - **Direct Output:** For commands completing within 5.0s, output is returned directly in the response. Do NOT call `read` after a completed command! The first 200 lines (`line_limit`) come back directly; if the output was cut by `line_limit` or left unread, the response reports `has_more` (the number of unread LINES still left) - read again for the rest.
+   - **Direct Output:** Commands that complete within 5.0s return their first output window directly. Call `read` only if `has_more` reports unread lines, or if a command is still running; a completed command with `has_more: 0` needs no extra read.
    - **Long-Running Commands:** Commands taking longer than 5.0s return `still_running: true` without failing. Read their remaining output via `read(session_id="...")`. `status` may also be `completed_nonzero`, `interrupted` (e.g. when `hard_timeout` fired; partial output kept) or `stalled` (quiet idle with no end-of-command marker; adds `unconfirmed_completion: true`).
    - **Sequential vs Concurrent:** Pass `session_id` to run sequential commands in the same session. Omit `session_id` to reuse an idle session (or pass `new_session: true` for a clean one).
-   - **Async Execution:** Pass `wait_timeout: 0` (or `background: true`) for immediate confirmed start in background.
+   - **Async Execution:** Pass `wait_timeout: 0` for immediate return while the command continues in its session.
    - **Standard Shell Pipelines:** Use standard `| grep`, `| awk`, `| head` inside the command string for filtering.
    - **Single non-interactive commands:** Pass `use_pty: false` for pure single exec commands with closed `stdin` (bypasses terminal echoes and PTY line limits; note: interactive heredocs are not supported when `use_pty: false`).
 3. **Session Management (1 Session = 1 Terminal):**
@@ -152,7 +152,7 @@ docker build -t mcp-ssh-server .
    - Call `signal(action="ctrl_c")` to immediately terminate a hanging command and free the session.
 6. **Remote Files (`file`):**
    - Inspect or download files with `action: "read"`. Supports line-based pagination (`offset_line: 1`, `limit_lines: 200`, returning `next_offset_line`).
-   - Modify remote files using atomic `action: "edit"` with search-and-replace (`edits: [{"old_text": "...", "new_text": "..."}]`, optional private `0600` backup `.mcp.bak` with `create_backup: true`; new files are always written with mode `0600`).
+   - Modify remote files with `action: "edit"` and search-and-replace (`edits: [{"old_text": "...", "new_text": "..."}]`); `create_backup: true` requests a `.mcp.bak` backup. Do not assume every remote filesystem or shell fallback guarantees atomic replacement or private permissions.
 7. **Register New Servers On The Fly:**
    - In full profile, the AI can call `server_add(alias="staging-app", host="10.0.0.5", user="deploy")` without restarting the server.
 8. **Live Hot-Reload:**
