@@ -1,0 +1,47 @@
+name: Bug report
+description: Something behaves differently from what the README promises.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the returned JSON, not a terminal screenshot.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: dropdown
+    id: host-type
+    attributes:
+      label: Host type
+      options:
+        - Linux / POSIX shell
+        - Vendor CLI (Keenetic NDM, Cisco-style, other)
+        - NAS / appliance
+        - VPS / cloud
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: Claude Desktop, Continue.dev, Cursor, ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: The `version` from the initialize response, or the git tag.
+    validations:
+      required: true
+  - type: textarea
+    id: call
+    attributes:
+      label: Exact tool call
+      description: The tools/call payload you sent.

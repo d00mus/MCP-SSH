@@ -1,0 +1,35 @@
+name: Feature request
+description: A capability the gateway is missing.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the workflow, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+    validations:
+      required: true
+  - type: dropdown
+    id: host-type
+    attributes:
+      label: Which host type does this target?
+      options:
+        - Linux / POSIX shell
+        - Vendor CLI (Keenetic NDM, Cisco-style, other)
+        - NAS / appliance
+        - VPS / cloud
+        - Fleet-wide (all of the above)
+    validations:
+      required: true
+  - type: checkboxes
+    id: prompt-tokens
+    attributes:
+      label: Tool catalog
+      options:
+        - label: This needs a new tool (I accept the prompt-token cost for every user)

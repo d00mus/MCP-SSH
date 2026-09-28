@@ -1,0 +1,14 @@
+include README.md
+include LICENSE
+include QUICK_START.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include requirements.txt
+include servers.json.example
+include mcp.json.example
+include server.json
+include mcp-server.py
+recursive-include src *.py
+recursive-include tests *.py
+recursive-include .github *.yml *.md

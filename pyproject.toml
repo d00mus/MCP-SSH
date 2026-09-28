@@ -1,0 +1,70 @@
+# Packaging metadata for the multi-server SSH MCP gateway.
+#
+# Distribution name: mcp-ssh-gateway
+# MCP Registry name: io.github.d00mus/mcp-ssh-gateway
+#
+# NOTE: `version` below MUST stay equal to SERVER_VERSION in src/server.py, because
+# the version the client sees at runtime comes from that constant, not from here.
+# NOTE: the importable package is the top-level `src` module (all 12 files import
+# `from src.config import ...`), so it is shipped as-is. Do not rename it without
+# refactoring those imports.
+version = "6.0.0"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-ssh-gateway"
+version = "6.0.0"
+description = "MCP server for a whole fleet of SSH hosts: persistent sessions with scrollback, explicit exit statuses, pager- and router-CLI-aware (Keenetic NDM), hot-reloaded config, honest output paging."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Constantine Shklyarov", email = "d00mus@users.noreply.github.com" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "ssh",
+    "ssh-gateway",
+    "ai-agents",
+    "ai-devops",
+    "multi-server",
+    "keenetic",
+    "router",
+    "paramiko",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = ["paramiko>=3.0.0"]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "twine>=5.1"]
+
+[project.urls]
+Homepage = "https://github.com/d00mus/MCP-SSH"
+Repository = "https://github.com/d00mus/MCP-SSH"
+Issues = "https://github.com/d00mus/MCP-SSH/issues"
+Changelog = "https://github.com/d00mus/MCP-SSH/blob/master/CHANGELOG.md"
+
+[project.scripts]
+mcp-ssh-gateway = "src.main:main"
+
+[tool.setuptools]
+packages = ["src"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+src = ["py.typed"]

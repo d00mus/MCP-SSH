@@ -1,0 +1,56 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.d00mus/mcp-ssh-gateway",
+  "title": "MCP SSH Gateway",
+  "description": "One MCP server for a whole fleet of SSH hosts: persistent sessions with 2M-character scrollback, explicit exit statuses, line-addressed output paging, hot-reloaded servers.json, and router/appliance CLI support with --More-- pager handling.",
+  "version": "6.0.0",
+  "repository": {
+    "url": "https://github.com/d00mus/MCP-SSH",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/d00mus/MCP-SSH",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-ssh-gateway",
+      "version": "6.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SSH_SERVERS_CONFIG",
+          "description": "Path to the JSON file with SSH server targets, or an inline JSON string. Overridden by --servers-config.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SSH_MCP_CACHE_DIR",
+          "description": "Storage root for session logs, run buffers and recovery state. Default .ssh-cache.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SSH_READ_ONLY",
+          "description": "Set to true/1 to force the global read-only guardrail.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SSH_COMMAND_BLACKLIST",
+          "description": "Comma-separated global prohibited command patterns.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "tool": "mcp-publisher",
+      "com.github": {
+        "serverDisplayName": "MCP SSH Gateway"
+      }
+    }
+  }
+}
