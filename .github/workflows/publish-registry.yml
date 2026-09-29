@@ -1,0 +1,36 @@
+name: Publish to the MCP registry
+
+# The registry holds metadata only and resolves the package on PyPI, so this runs after the
+# upload: publish-pypi.yml calls it. It can also be started by hand from the Actions tab,
+# for instance to repeat it.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # the registry accepts the identity of this repository, so no token is stored
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz \
+            | tar xz mcp-publisher
+      - run: ./mcp-publisher validate
+      - name: PyPI serves the version that server.json names
+        run: |
+          version="$(jq -r .version server.json)"
+          for _ in $(seq 1 30); do
+            if curl -fsS "https://pypi.org/pypi/mcp-ssh-gateway/$version/json" > /dev/null; then exit 0; fi
+            sleep 10
+          done
+          echo "PyPI does not serve mcp-ssh-gateway $version" >&2
+          exit 1
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish

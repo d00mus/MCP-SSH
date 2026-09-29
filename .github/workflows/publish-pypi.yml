@@ -36,3 +36,11 @@ jobs:
       - run: python -m pip install build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  registry:
+    # The registry resolves the package on PyPI, so it comes after the upload.
+    needs: publish
+    uses: ./.github/workflows/publish-registry.yml
+    permissions:
+      id-token: write
+      contents: read

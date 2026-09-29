@@ -65,6 +65,12 @@ uvx --from mcp-ssh-gateway mcp-ssh-gateway --help
 
 ## 5. Publish to the MCP Registry
 
+The tag workflow does this for you: `publish-pypi.yml` calls `publish-registry.yml` after the PyPI
+upload. It runs `mcp-publisher login github-oidc` (the registry accepts the identity of this
+repository, so there is no token to keep), waits until PyPI serves the version and runs
+`mcp-publisher publish`. To repeat it, open Actions, choose "Publish to the MCP registry" and
+press "Run workflow". The steps below are the same thing by hand.
+
 Install the CLI (Windows shown):
 
 ```powershell
