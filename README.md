@@ -6,7 +6,7 @@
 
 Six tools, real shells that keep their state, the exit code the moment a command ends, and answers a small model can act on. One direct dependency (`paramiko`), no daemon, nothing in the cloud.
 
-[![CI](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml/badge.svg)](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/) [![PyPI](https://img.shields.io/pypi/v/mcp-ssh-gateway.svg)](https://pypi.org/project/mcp-ssh-gateway/) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/d00mus/MCP-SSH/blob/master/LICENSE)
+[![CI](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml/badge.svg)](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/) [![PyPI](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fmcp-ssh-gateway%2Fjson&query=%24.info.version&label=pypi&prefix=v&cacheSeconds=300)](https://pypi.org/project/mcp-ssh-gateway/) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/d00mus/MCP-SSH/blob/master/LICENSE)
 
 English · [Русский](https://github.com/d00mus/MCP-SSH/blob/master/README.ru.md)
 

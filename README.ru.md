@@ -4,7 +4,7 @@
 
 Шесть инструментов, настоящие оболочки с состоянием, код возврата в ту же секунду, когда команда завершилась, и ответы, по которым может действовать даже небольшая модель. Одна прямая зависимость (`paramiko`), никаких демонов, ничего в облаке.
 
-[![CI](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml/badge.svg)](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/) [![PyPI](https://img.shields.io/pypi/v/mcp-ssh-gateway.svg)](https://pypi.org/project/mcp-ssh-gateway/) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml/badge.svg)](https://github.com/d00mus/MCP-SSH/actions/workflows/ci.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/) [![PyPI](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fpypi.org%2Fpypi%2Fmcp-ssh-gateway%2Fjson&query=%24.info.version&label=pypi&prefix=v&cacheSeconds=300)](https://pypi.org/project/mcp-ssh-gateway/) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [English](README.md) · Русский
 
