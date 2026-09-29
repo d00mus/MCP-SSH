@@ -15,7 +15,7 @@
       "user": "storage",
       "key_path": "~/.ssh/id_rsa",
       "description": "TrueNAS storage server",
-      "max_sessions": 10
+      "max_sessions": 4
     },
     "vps-prod": {
       "host": "203.0.113.5",

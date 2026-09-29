@@ -1,64 +1,77 @@
 # Contributing
 
-Thanks for looking at this. The project is small and self-contained, and PRs are welcome.
+Thanks for looking at this. The project is small and PRs are welcome.
 
-## Ground rules that are not negotiable
+## Rules that keep the agent's view stable
 
-- **Do not break the output contract.** `has_more` is the number of unread *lines*.
-  `line_limit` counts lines, not characters. `offset` never consumes. Output reaching
-  the agent must contain no internal markers, no shell prompt, and no double-echoed
-  commands. The tests in `tests/test_server.py`, `tests/test_ssh.py`,
-  `tests/test_multiserver.py` and `tests/test_fs.py` enforce this.
-- **Non-zero exit is a result, not an error.** `completed_nonzero` + `exit_status`
-  must never become a tool error. Only `failed`/`dead` are errors.
-- **Every tool keeps its annotations.** `TOOL_ANNOTATIONS` in `src/server.py` must
-  cover the whole catalog, and the `lean` profile must keep annotations.
-- **Initialize is a contract.** `protocolVersion` is negotiated against
-  `SUPPORTED_PROTOCOL_VERSIONS`, and `serverInfo` must use the public name
-  (`mcp-ssh`), never an internal codename.
+- **Output is lines.** `has_more` is the number of unread *lines*; `lines` counts lines;
+  `offset` never moves the unread position; the output reaching the agent contains no
+  prompt markers and no doubled echo of the command. `tests/test_stream.py`,
+  `tests/test_terminal.py` and `tests/test_session.py` pin this.
+- **The shape of an answer is a decision.** The keys of every answer are listed in
+  `tests/test_contract.py` (and, for the `file` tool, in `tests/integration/test_linux_hosts.py`),
+  because the answers are what the agent reads and pays for in tokens. Adding a key means
+  changing that test on purpose.
+- **A non-zero exit code is a result, not an error.** Only `status: failed` (lost connection)
+  and exceptions raised for bad requests become tool errors.
+- **The tool catalogue is small and self-explanatory.** Every parameter has a description
+  (a test checks it) and `tests/test_server.py` limits the size of `tools/list`, because
+  every session pays for it. A new tool needs a good reason.
+- **No test hacks in production code.** Code must not know it is being tested. Use the
+  fakes in `tests/fakes.py` or the Docker images in `tests/integration/images`.
 
 ## Setup
 
 ```bash
 git clone https://github.com/d00mus/MCP-SSH.git
 cd MCP-SSH
-pip install -r requirements.txt
+pip install -r requirements.txt ruff mypy
 ```
 
 Python 3.11+ (CI also runs 3.13).
 
-## Run the tests
+## Tests
 
 ```bash
-python -m unittest discover -s tests -t .
+python -m unittest discover -s tests -t .                 # everything (integration needs Docker)
+MCP_SSH_IT=0 python -m unittest discover -s tests -t .    # unit tests only
+python -m unittest tests.test_session -v                  # one module
+ruff check .
+mypy
 ```
 
-For one module:
+Unit tests use scripted fakes of an SSH channel (`tests/fakes.py`) and never open a socket.
+Integration tests build and start `sshd` containers (Debian/bash, Alpine/BusyBox ash,
+Debian without SFTP, and one account per login shell: zsh, dash, fish, tcsh) and talk to the
+gateway through the JSON-RPC entry point.
 
-```bash
-python -m unittest tests.test_server -v
-```
+Bugs are fixed test first: write the test that fails, then the fix.
 
-The suite uses only `unittest` and `unittest.mock`, so no test dependencies are
-needed. Most tests mock paramiko and never open a socket; if you add a test that
-touches the network, mark it clearly and keep it out of the default path.
+## Layout
 
-## Style
-
-- Plain `unittest`, no pytest-only constructs.
-- Comments explain *why*, especially around output framing and concurrency.
-- Keep the tool catalog small. A new tool needs a good reason: it is prompt tokens
-  in every session for every user.
+| Module | Responsibility |
+| --- | --- |
+| `stream.py` | Line-based buffer with an unread position (`Canvas`), ANSI cleanup. |
+| `terminal.py` | Prompt-marker protocol for POSIX shells, router CLI prompt/echo/pager handling. |
+| `session.py` | One terminal: runs, waiting, signals, status. |
+| `transport.py` | The SSH connection (paramiko), host keys, error messages. |
+| `manager.py` | Servers, sessions per server, hot reload, cancellation. |
+| `files.py` | The `file` tool (SFTP and shell backends, edits, local sandbox). |
+| `server.py` | MCP tool catalogue and JSON-RPC dispatch. |
+| `main.py` | Command line, stdio loop. |
+| `logs.py` | Per-session and per-command log files. |
 
 ## Opening a change
 
 1. Branch from `master`.
-2. Add or update tests alongside the behaviour change.
+2. Add or update tests with the behaviour change.
 3. Update `CHANGELOG.md` under `[Unreleased]`.
-4. Open a pull request describing the user-visible effect, not just the diff.
+4. If a tool, an option or an answer changes, change `README.md` and `README.ru.md` too.
+   `tests/test_readme.py` checks that their examples, the options table and the links still
+   match the code.
+5. Describe the user-visible effect in the pull request, not only the diff.
 
 ## Reporting bugs
 
-Use the issue templates. A useful report includes the MCP client, the host type
-(POSIX shell vs vendor CLI), the exact tool call, and the returned JSON — not a
-screenshot of the terminal.
+Use the issue templates. A useful report has the MCP client, the host type (POSIX shell or
+vendor CLI), the exact tool call and the returned JSON.

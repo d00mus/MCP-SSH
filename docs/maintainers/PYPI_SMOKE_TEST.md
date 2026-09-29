@@ -1,6 +1,6 @@
 # Verify the published package in a clean directory
 
-Use this procedure when checking that the current PyPI release installs independently of the repository checkout. Run it from a new directory (not the cloned source tree) so Python cannot accidentally import the local `src` package.
+Use this procedure when checking that the current PyPI release installs independently of the repository checkout. Run it from a new directory (not the cloned source tree) so Python cannot accidentally import the local `mcp_ssh_gateway` package.
 
 ## Windows PowerShell
 
@@ -31,4 +31,4 @@ python3 -m venv .venv
 .venv/bin/python -c 'import importlib.metadata as m; print(m.version("mcp-ssh-gateway"))'
 ```
 
-See [README.md](README.md#try-it-with-one-host) for an MCP client config and [QUICK_START.md](QUICK_START.md) for more configuration examples.
+See the [README](../../README.md#quick-start) for an MCP client config.

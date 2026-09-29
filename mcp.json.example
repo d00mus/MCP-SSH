@@ -1,31 +1,24 @@
 {
   "mcpServers": {
-    "ssh-gateway": {
-      "command": "mcp-ssh-gateway",
-      "args": [
-        "--servers-config", "C:\\tools\\ssh-gateway\\servers.json",
-        "--project-root", "C:\\work",
-        "--cache-dir", "C:\\tools\\ssh-gateway\\.ssh-cache"
-      ],
+    "ssh": {
+      "command": "uvx",
+      "args": ["mcp-ssh-gateway", "--servers-config", "/absolute/path/to/servers.json"],
       "env": {
-        "KEENETIC_PASSWORD": "<replace-with-a-secret; do-not-commit>"
+        "WEB_PASSWORD": "<only if servers.json refers to ${WEB_PASSWORD}; do not commit>"
       }
     },
 
-    "ssh-gateway-docker": {
+    "ssh-docker": {
       "command": "docker",
       "args": [
         "run", "-i", "--rm",
-        "-v", "C:/tools/ssh-gateway/servers.json:/app/servers.json:ro",
-        "-v", "C:/Users/username/.ssh:/root/.ssh:ro",
-        "-v", "C:/tools/ssh-gateway/.ssh-cache:/app/.ssh-cache",
-        "mcp-ssh-server",
+        "-v", "/absolute/path/to/servers.json:/app/servers.json:ro",
+        "-v", "/absolute/path/to/.ssh:/root/.ssh:ro",
+        "-v", "/absolute/path/to/ssh-gateway-cache:/app/.ssh-cache",
+        "mcp-ssh-gateway",
         "--servers-config", "/app/servers.json",
         "--cache-dir", "/app/.ssh-cache"
-      ],
-      "env": {
-        "KEENETIC_PASSWORD": "<replace-with-a-secret; do-not-commit>"
-      }
+      ]
     }
   }
 }

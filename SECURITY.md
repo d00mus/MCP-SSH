@@ -13,9 +13,11 @@ blacklist entries), plus local-path containment for file transfers:
 - per-host `read_only` mode blocks file-tool writes and obvious write patterns in
   commands (redirections, package installs, disk formatting);
 - `command_blacklist` entries merge per-host and global lists into one set;
-- `server_add` is append-only — existing targets cannot be edited or deleted
-  through a tool call;
-- local transfer paths are confined to the project root and gateway cache dir;
+- `server_add` does not exist unless the gateway is started with `--allow-add-server`,
+  and even then it only appends: existing targets cannot be edited or deleted through a
+  tool call;
+- local transfer (`local_path`) is off unless the gateway starts with `--project-root`; then paths are
+  confined to that folder and the gateway cache dir;
   this does not restrict remote command execution or remote paths. The gateway's
   own code and config are not writable through the file tool.
 
@@ -33,6 +35,15 @@ configured.
   for production;
 - mark production hosts `read_only: true` in `servers.json`;
 - keep secrets in environment variables referenced as `${VAR}`, not in the JSON.
+
+## Host keys and logs
+
+- A host seen for the first time is trusted and its key is saved to `known_hosts` in the
+  cache directory (like OpenSSH `accept-new`); a key that later changes is refused. To
+  verify the first key, connect once with `ssh` and compare the fingerprint, or put the
+  host into `~/.ssh/known_hosts` beforehand. `verify_host: false` disables the check.
+- Logs (`--log-output meta`, the default) contain commands with password-like values
+  masked. `full` also stores raw output; `off` writes nothing.
 
 ## Reporting a vulnerability
 

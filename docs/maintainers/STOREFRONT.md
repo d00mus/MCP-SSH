@@ -6,8 +6,7 @@ checkout without a token, so it is a hand-run list.
 ## Repository description (Settings → General → Description)
 
 ```
-One MCP server for a whole fleet of SSH hosts: persistent sessions, honest exit
-statuses, and router-CLI/pager-aware output. No single-host duplication.
+SSH terminals for AI agents that know when a command is done: six tools, stateful shells, exit codes, router CLIs.
 ```
 
 ## Homepage
@@ -38,17 +37,18 @@ sysadmin
 devtools
 ```
 
-Also consider a repository logo — the competitor with 909 stars leads with an
-image, and the repo currently has none.
+## Social preview (Settings → General → Social preview)
 
-## First issues (so the tracker is not empty)
+A 1280×640 image is what a link to the repository shows in chats and on social networks.
+The repository has none yet. The tagline of the README and a short answer of the gateway
+(`"status":"completed","exit_code":0`) make a good picture.
 
-Seed it with real, answerable questions rather than placeholders:
+## Issues
 
-1. `Add support for Cisco IOS / Junos CLI profiles`
-2. `Support jump hosts / ProxyJump for bastion setups`
-3. `Parallel command execution across sessions`
-4. `Secret rotation without editing servers.json`
+Issues #1 to #4 exist and carry the `enhancement` label. #3 and #4 were written against the
+6.x tools (`new_session`, `session_list`, the 30-second health loop), which 7.0.0 removed:
+reword or close them when the release is out. The README links to #1 (other router CLIs)
+and #2 (jump hosts) as the known gaps.
 
 ## Discussions
 
@@ -61,5 +61,3 @@ surface for search and links.
 - `awesome-mcp-servers` and the `modelcontextprotocol` org
 - MCP-focused newsletters and aggregators (a registry entry is what most client
   directories index)
-- The repo is currently not in the official registry; step 5 of
-  `docs/PUBLISHING.md` is what fixes that.

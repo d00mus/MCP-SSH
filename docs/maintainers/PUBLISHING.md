@@ -5,9 +5,9 @@ wheel must exist first.
 
 ## 0. Version discipline
 
-The version the client sees at runtime comes from `SERVER_VERSION` in
-`src/server.py`. It must equal `version` in `pyproject.toml` and the git tag.
-Change all three in one commit.
+The version lives in one place: `__version__` in `mcp_ssh_gateway/__init__.py`
+(`pyproject.toml` reads it). `server.json` (top-level and package `version`) and
+the git tag must equal it. Change them in one commit.
 
 ## 1. Preconditions
 
@@ -18,11 +18,17 @@ that `publish` only reports after the login round-trip:
 mcp-publisher validate
 ```
 
-- `SERVER_VERSION` == `pyproject.toml` version.
-- `README.md` starts with the line `<!-- mcp-name: io.github.d00mus/mcp-ssh-gateway -->`.
+- `__version__` == `server.json` versions == the tag you are about to push.
+  `tests/test_release.py` checks the first two (and the `CHANGELOG.md` section) on every
+  push; the publish workflow refuses a tag that differs from `__version__`.
+- `README.md` starts with the line `<!-- mcp-name: io.github.d00mus/mcp-ssh-gateway -->`
+  (also checked by `tests/test_release.py`).
   The token must be followed by a boundary (newline, whitespace, or `-->`); do not
   put a period directly after it, or the validator will not match.
-- Full tracked suite green: `python -m unittest discover -s tests -t .`
+- Full suite green: `python -m unittest discover -s tests -t .` (Docker for the integration
+  tests). Pushing a `v*` tag runs the whole CI first (ruff, mypy, unit tests on Linux, macOS
+  and Windows, the real-sshd integration tests, the package build), and the PyPI upload waits
+  for it.
 
 ## 2. Build and check the wheel
 
@@ -94,7 +100,7 @@ Two constraints bite in practice and are worth knowing before you run `publish`:
 
 ## 6. Finish the storefront
 
-- Uncomment the MCP Registry badge in `README.md` once `publish` succeeds.
-- Confirm topics and the description are set (see `STOREFRONT.md`).
+- Add the MCP Registry link to `README.md` and `README.ru.md` once `publish` succeeds.
+- Confirm topics and the description are set (see `STOREFRONT.md` next to this file).
 - Announce the release; the registry entry and the PyPI page are the durable
   listings that search and agent clients actually read.
