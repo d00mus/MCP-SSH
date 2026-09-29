@@ -9,7 +9,12 @@ permissions:
   contents: read
 
 jobs:
+  checks:
+    # The whole CI (lint, types, unit tests on three systems, real-sshd integration tests, package build).
+    uses: ./.github/workflows/ci.yml
+
   publish:
+    needs: checks
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -21,6 +26,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: The tag is the version of the code
+        run: |
+          version="$(python -c 'import mcp_ssh_gateway; print(mcp_ssh_gateway.__version__)')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match __version__ $version" >&2
+            exit 1
+          fi
       - run: python -m pip install build
       - run: python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1

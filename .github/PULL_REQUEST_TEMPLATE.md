@@ -1,24 +1,20 @@
-name: Pull request
-description: A change to code, tests or documentation.
-labels: ["change"]
-body:
-  - type: textarea
-    id: summary
-    attributes:
-      label: User-visible effect
-      description: What changes for someone running this server.
-    validations:
-      required: true
-  - type: textarea
-    id: contract
-    attributes:
-      label: Output contract
-      description: Confirm none of these regress: `has_more` counts unread lines; `line_limit` counts lines; `offset` never consumes; no internal markers or prompts reach the agent; non-zero exit stays `completed_nonzero`; every tool keeps its annotations.
-  - type: checkboxes
-    id: checks
-    attributes:
-      label: Checks
-      options:
-        - label: python -m unittest discover -s tests -t . passes
-        - label: Tests added or updated
-        - label: CHANGELOG.md updated under [Unreleased]
+## What changes for someone running this server
+
+<!-- The user-visible effect, not the diff. -->
+
+## The agent's view
+
+<!-- Delete this section for changes that do not touch what the agent gets back. -->
+
+- [ ] The shape of the answers is unchanged, or `tests/test_contract.py` was updated on purpose
+- [ ] `has_more` still counts unread lines and `offset` never moves the unread position
+- [ ] No prompt markers or setup commands reach the output
+- [ ] A non-zero exit code is still a result (`status: completed`), not a tool error
+- [ ] The tool catalogue did not grow, or the new tool is worth its tokens in every session
+
+## Checks
+
+- [ ] `python -m unittest discover -s tests -t .` passes (integration tests need Docker)
+- [ ] `ruff check .` and `mypy` are clean
+- [ ] Tests were added or updated (a bug fix starts with the test that fails)
+- [ ] `CHANGELOG.md` is updated under `[Unreleased]`

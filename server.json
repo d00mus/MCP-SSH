@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.d00mus/mcp-ssh-gateway",
   "title": "MCP SSH Gateway",
-  "description": "One MCP server for a whole SSH fleet: persistent sessions, honest exit status, pager-aware output.",
-  "version": "6.0.2",
+  "description": "SSH terminals for AI agents: stateful shells, exit codes the moment a command ends, router CLIs.",
+  "version": "7.0.0",
   "repository": {
     "url": "https://github.com/d00mus/MCP-SSH",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "mcp-ssh-gateway",
-      "version": "6.0.2",
+      "version": "7.0.0",
       "transport": {
         "type": "stdio"
       },
@@ -26,7 +26,7 @@
         },
         {
           "name": "SSH_MCP_CACHE_DIR",
-          "description": "Storage root for session logs, run buffers and recovery state. Default .ssh-cache.",
+          "description": "Where logs and known_hosts are kept. Default: the user cache directory.",
           "isRequired": false,
           "isSecret": false
         },
@@ -54,3 +54,4 @@
     }
   }
 }
+

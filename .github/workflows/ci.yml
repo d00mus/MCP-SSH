@@ -1,14 +1,39 @@
 name: CI
 
-on: [push, pull_request]
+# Tags are not built here: the publish workflow calls this one first, so a release
+# only goes out after everything below (real-sshd integration tests included) passed.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff mypy
+      - run: ruff check .
+      - run: mypy
+
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        include:
+          - {os: ubuntu-latest, python-version: "3.11"}
+          - {os: ubuntu-latest, python-version: "3.13"}
+          - {os: macos-latest, python-version: "3.13"}
+          - {os: windows-latest, python-version: "3.13"}
+    env:
+      # Linux runners have Docker, so the real-sshd integration tests run there.
+      MCP_SSH_IT: ${{ startsWith(matrix.os, 'ubuntu') && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -16,3 +41,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -t . -v
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Installed wheel starts
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/mcp-ssh-gateway --version
