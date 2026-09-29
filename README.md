@@ -78,6 +78,8 @@ args = ["mcp-ssh-gateway", "--import-ssh-config"]
 startup_timeout_sec = 30   # the first uvx run downloads the package
 ```
 
+The gateway is also listed in the [official MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers/io.github.d00mus%2Fmcp-ssh-gateway/versions/latest) as `io.github.d00mus/mcp-ssh-gateway`, for the clients and directories that read it.
+
 ## What the agent sees
 
 Answers as a client receives them, captured from the test suite's Debian container (the host address and the disk figures are replaced with example values):

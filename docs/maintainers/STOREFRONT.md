@@ -45,10 +45,11 @@ The repository has none yet. The tagline of the README and a short answer of the
 
 ## Issues
 
-Issues #1 to #4 exist and carry the `enhancement` label. #3 and #4 were written against the
-6.x tools (`new_session`, `session_list`, the 30-second health loop), which 7.0.0 removed:
-reword or close them when the release is out. The README links to #1 (other router CLIs)
-and #2 (jump hosts) as the known gaps.
+Issues #1 to #4 carry the `enhancement` label. The README links to #1 (other router CLIs) and
+#2 (jump hosts) as the known gaps. #3 (parallel commands) was written against the 6.x tools
+and closed as not planned after 7.0.0: parallel `run` calls, each in its own shell, do the
+job. #4 (secret rotation) stays open with two asks left, `password_file` and `secret_command`;
+the rest of it is answered by the reload of `servers.json` on demand.
 
 ## Discussions
 

@@ -76,6 +76,8 @@ args = ["mcp-ssh-gateway", "--import-ssh-config"]
 startup_timeout_sec = 30   # при первом запуске uvx скачивает пакет
 ```
 
+Шлюз есть и в [официальном реестре MCP](https://registry.modelcontextprotocol.io/v0.1/servers/io.github.d00mus%2Fmcp-ssh-gateway/versions/latest) под именем `io.github.d00mus/mcp-ssh-gateway`: его читают клиенты и каталоги.
+
 ## Что видит агент
 
 Ответы в том виде, в каком их получает клиент; сняты в Debian-контейнере из набора тестов (адрес хоста и цифры диска заменены примерами):
