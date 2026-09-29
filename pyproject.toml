@@ -1,25 +1,14 @@
-# Packaging metadata for the multi-server SSH MCP gateway.
-#
-# Distribution name: mcp-ssh-gateway
-# MCP Registry name: io.github.d00mus/mcp-ssh-gateway
-#
-# NOTE: `version` below MUST stay equal to SERVER_VERSION in src/server.py, because
-# the version the client sees at runtime comes from that constant, not from here.
-# NOTE: the importable package is the top-level `src` module (all 12 files import
-# `from src.config import ...`), so it is shipped as-is. Do not rename it without
-# refactoring those imports.
-version = "6.0.2"
-
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-ssh-gateway"
-version = "6.0.2"
-description = "MCP server for a whole fleet of SSH hosts: persistent sessions with scrollback, explicit exit statuses, pager- and router-CLI-aware (Keenetic NDM), hot-reloaded config, honest output paging."
+dynamic = ["version"]
+description = "MCP server that gives an AI agent real SSH terminals: sessions that return the moment a command ends, scrollable output, prompt and question detection, Keenetic router CLI support."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Constantine Shklyarov", email = "d00mus@users.noreply.github.com" }]
 keywords = [
@@ -38,7 +27,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -51,7 +39,7 @@ classifiers = [
 dependencies = ["paramiko>=3.0.0"]
 
 [project.optional-dependencies]
-dev = ["build>=1.2", "twine>=5.1"]
+dev = ["build>=1.2", "twine>=5.1", "ruff>=0.6", "mypy>=1.10"]
 
 [project.urls]
 Homepage = "https://github.com/d00mus/MCP-SSH"
@@ -60,11 +48,35 @@ Issues = "https://github.com/d00mus/MCP-SSH/issues"
 Changelog = "https://github.com/d00mus/MCP-SSH/blob/master/CHANGELOG.md"
 
 [project.scripts]
-mcp-ssh-gateway = "src.main:main"
+mcp-ssh-gateway = "mcp_ssh_gateway.main:main"
 
 [tool.setuptools]
-packages = ["src"]
+packages = ["mcp_ssh_gateway"]
 include-package-data = true
 
+[tool.setuptools.dynamic]
+version = { attr = "mcp_ssh_gateway.__version__" }
+
 [tool.setuptools.package-data]
-src = ["py.typed"]
+mcp_ssh_gateway = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["mcp_ssh_gateway"]
+
+[[tool.mypy.overrides]]
+module = "paramiko.*"
+ignore_missing_imports = true  # paramiko ships neither stubs nor py.typed
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["UP006", "UP007", "UP035", "UP045"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+"mcp_ssh_gateway/server.py" = ["E501"]  # tool descriptions are prose
+

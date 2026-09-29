@@ -1,4 +1,4 @@
-# Multi-Server SSH MCP Gateway Dockerfile
+# MCP SSH Gateway
 FROM python:3.11-slim
 
 # Force unbuffered Python stdout/stderr for responsive JSON-RPC stream
@@ -11,13 +11,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create cache directory and SSH config directory
+# Cache (logs, known_hosts) and the SSH config directory
 RUN mkdir -p /app/.ssh-cache /root/.ssh && chmod 700 /root/.ssh
 
 # Copy source code and entrypoint
-COPY src/ ./src/
+COPY mcp_ssh_gateway/ ./mcp_ssh_gateway/
 COPY mcp-server.py .
 
 # Default entrypoint runs the MCP gateway
 ENTRYPOINT ["python", "mcp-server.py"]
 CMD ["--servers-config", "/app/servers.json", "--cache-dir", "/app/.ssh-cache"]
+

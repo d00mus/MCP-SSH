@@ -1,6 +1,5 @@
 include README.md
 include LICENSE
-include QUICK_START.md
 include CHANGELOG.md
 include CONTRIBUTING.md
 include SECURITY.md
@@ -9,6 +8,7 @@ include servers.json.example
 include mcp.json.example
 include server.json
 include mcp-server.py
-recursive-include src *.py
-recursive-include tests *.py
+recursive-include mcp_ssh_gateway *.py py.typed
+recursive-include tests *.py Dockerfile
 recursive-include .github *.yml *.md
+
